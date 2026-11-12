@@ -4,9 +4,83 @@ A fast, cross-platform command-line music player with a background playback daem
 
 ## Prerequisites
 
-- **Rust toolchain** (edition 2024) to build from source (`cargo build --release`).
-- **`yt-dlp`** in `PATH` for `termusic search` and `termusic download`.
+- **Rust toolchain** (edition 2024) if building from source (`cargo install` / `cargo build`).
+- **`yt-dlp`** in `PATH` (or `~/.local/bin`) for `termusic search` and `termusic download`.
 - **`ffmpeg` / `ffprobe`** in `PATH` for audio extraction, format conversion, metadata tagging, and thumbnail embedding.
+
+## Installation
+
+### Option 1: Install from Source (Cargo)
+
+Clone the repository and install `termusic` into `~/.cargo/bin` (ensure `~/.cargo/bin` is on your `PATH`):
+
+```bash
+git clone https://github.com/patrickcortez/Termusic.git
+cd Termusic
+cargo install --path . --locked
+```
+
+Alternatively, install directly from Git without cloning first:
+
+```bash
+cargo install --git https://github.com/patrickcortez/Termusic.git --locked
+```
+
+If you have [`just`](https://github.com/casey/just) or `make` installed, you can also manage source builds with the repository recipes:
+
+```bash
+just install    # or: make install
+just update     # rebuild and overwrite existing install (`--force`)
+just uninstall  # uninstall `termusic`
+```
+
+To build locally without installing globally:
+
+```bash
+cargo build --release --locked
+# Binary output: target/release/termusic (target/release/termusic.exe on Windows)
+```
+
+### Option 2: Prebuilt Release Binaries
+
+Download the archive for your platform from [GitHub Releases](https://github.com/patrickcortez/Termusic/releases):
+
+- **Linux (`x86_64`)**: `termusic-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- **Windows (`x86_64`)**: `termusic-<version>-x86_64-pc-windows-msvc.zip`
+- **macOS (Apple Silicon)**: `termusic-<version>-aarch64-apple-darwin.tar.gz`
+- **macOS (Intel)**: `termusic-<version>-x86_64-apple-darwin.tar.gz`
+- **Android (`aarch64` / Termux)**: `termusic-<version>-aarch64-linux-android.tar.gz`
+
+Extract the binary and place it in a directory on your `PATH`:
+
+```bash
+# Linux / macOS / Termux
+tar -xzf termusic-<version>-<target>.tar.gz
+install -m 755 termusic ~/.local/bin/termusic
+```
+
+```powershell
+# Windows (PowerShell)
+Expand-Archive termusic-<version>-x86_64-pc-windows-msvc.zip -DestinationPath "$env:LOCALAPPDATA\Programs\termusic"
+# Add "$env:LOCALAPPDATA\Programs\termusic" to your User PATH
+```
+
+Verify checksums with `SHA256SUMS` from the release assets (`sha256sum -c SHA256SUMS --ignore-missing`).
+
+### Installing `yt-dlp` and `ffmpeg`
+
+```bash
+# macOS (Homebrew)
+brew install yt-dlp ffmpeg
+
+# Windows (WinGet)
+winget install yt-dlp.yt-dlp Gyan.FFmpeg
+
+# Android (Termux)
+pkg install rust yt-dlp ffmpeg pulseaudio
+```
+
+On Linux, install `yt-dlp` and `ffmpeg` via your distribution package manager (for example, `apt`, `dnf`, or `pacman`) or `~/.local/bin`, and verify with `termusic --version` and `yt-dlp --version`.
 
 ## Quick Start
 
