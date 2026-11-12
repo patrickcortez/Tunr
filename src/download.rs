@@ -1,10 +1,17 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::Arc;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::error::{Result, TermusicError};
 use crate::library::{AddSummary, Library};
@@ -63,6 +70,63 @@ pub struct DownloadOptions {
     pub embed_thumbnail: bool,
     pub auto_add: bool,
     pub playlist_name: Option<String>,
+    pub jobs: usize,
+    pub no_tui: bool,
+}
+
+/// Lifecycle phase for an individual URL inside `termusic download`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadPhase {
+    Queued,
+    Starting,
+    Downloading {
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        speed_bytes_per_sec: Option<u64>,
+        eta_secs: Option<u64>,
+    },
+    PostProcessing {
+        stage: String,
+    },
+    Finalizing,
+    Completed {
+        files: Vec<PathBuf>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+/// Real-time batch and per-track progress events emitted by [`run_download_with_progress`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadProgressEvent {
+    BatchStarted {
+        urls: Vec<String>,
+        dest_dir: PathBuf,
+        format: DownloadFormat,
+        jobs: usize,
+    },
+    Notice(String),
+    ItemUpdate {
+        index: usize,
+        title: Option<String>,
+        phase: DownloadPhase,
+    },
+    IndexingStarted {
+        track_count: usize,
+    },
+    BatchFinished,
+}
+
+const PROGRESS_TEMPLATE_DOWNLOAD: &str = "download:TERMUSIC_PROG\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress.speed)s\t%(progress.eta)s\t%(info.title)s";
+const PROGRESS_TEMPLATE_POSTPROCESS: &str = "postprocess:TERMUSIC_POST\t%(progress.status)s\t%(progress.postprocessor)s\t%(info.title)s";
+const MAX_CAPTURE_BYTES: usize = 512 * 1024;
+
+/// Failure details captured for an individual URL during `termusic download`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadFailure {
+    pub url: String,
+    pub error: String,
 }
 
 /// Result returned by [`run_download`].
@@ -70,6 +134,7 @@ pub struct DownloadOptions {
 pub struct DownloadOutcome {
     pub saved_dest: Option<PathBuf>,
     pub downloaded_files: Vec<PathBuf>,
+    pub failed: Vec<DownloadFailure>,
     pub add_summary: Option<AddSummary>,
 }
 
@@ -94,31 +159,149 @@ impl DownloadEnv {
     }
 }
 
-/// Download tracks with `yt-dlp` and optionally index them into the workspace library.
-pub fn run_download(paths: &AppPaths, opts: &DownloadOptions) -> Result<DownloadOutcome> {
-    let env = DownloadEnv::from_system();
-    run_download_with_env(paths, opts, &env)
+/// Shared immutable tool/destination context plus destination finalizer lock for one download run.
+struct DownloadContext {
+    yt_dlp_bin: PathBuf,
+    dest_dir: PathBuf,
+    staging_root: PathBuf,
+    format: DownloadFormat,
+    playlist: bool,
+    js_runtime: Option<String>,
+    embed_thumbnail: bool,
+    env: DownloadEnv,
+    finalizer_lock: Mutex<()>,
+    progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
 }
 
-fn run_download_with_env(
+impl DownloadContext {
+    fn emit(&self, event: DownloadProgressEvent) {
+        emit_progress(self.progress_tx.as_ref(), event);
+    }
+}
+
+fn emit_progress(
+    tx: Option<&mpsc::UnboundedSender<DownloadProgressEvent>>,
+    event: DownloadProgressEvent,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(event);
+    }
+}
+
+/// RAII staging directory guard that cleans up `<dest>/.termusic-dl-tmp/<uuid>` on drop or explicit cleanup.
+struct StageDirGuard {
+    path: PathBuf,
+    cleaned: bool,
+}
+
+impl StageDirGuard {
+    async fn create(root: &Path) -> Result<Self> {
+        let path = root.join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&path).await?;
+        Ok(Self {
+            path,
+            cleaned: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn cleanup(mut self) {
+        self.cleaned = true;
+        let _ = tokio::fs::remove_dir_all(&self.path).await;
+    }
+}
+
+impl Drop for StageDirGuard {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Validate non-empty URL arguments, split whitespace-delimited tokens within each argument,
+/// and deduplicate while preserving first-seen order.
+pub fn normalize_urls(raw_urls: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for raw in raw_urls {
+        if raw.trim().is_empty() {
+            return Err(TermusicError::InvalidArg(
+                "URL cannot be empty".to_string(),
+            ));
+        }
+        for token in raw.split_whitespace() {
+            if seen.insert(token.to_string()) {
+                normalized.push(token.to_string());
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+async fn run_blocking<T, F>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+}
+
+/// Download tracks concurrently with `yt-dlp` and optionally index them into the workspace library.
+pub async fn run_download(paths: &AppPaths, opts: &DownloadOptions) -> Result<DownloadOutcome> {
+    run_download_with_progress(paths, opts, None).await
+}
+
+/// Download tracks concurrently with `yt-dlp` while streaming batch/per-item progress events.
+pub async fn run_download_with_progress(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
+) -> Result<DownloadOutcome> {
+    let env = DownloadEnv::from_system();
+    run_download_with_env_and_progress(paths, opts, &env, progress_tx).await
+}
+
+#[cfg(test)]
+async fn run_download_with_env(
     paths: &AppPaths,
     opts: &DownloadOptions,
     env: &DownloadEnv,
 ) -> Result<DownloadOutcome> {
+    run_download_with_env_and_progress(paths, opts, env, None).await
+}
+
+async fn run_download_with_env_and_progress(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    env: &DownloadEnv,
+    progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
+) -> Result<DownloadOutcome> {
     let saved_dest = match opts.set_dest.as_deref() {
         Some(dir) => {
             validate_non_empty_path(dir, "--set-dest")?;
-            Some(set_workspace_download_dest(paths, dir)?)
+            let paths_cloned = paths.clone();
+            let dir_owned = dir.to_path_buf();
+            let saved = run_blocking(move || set_workspace_download_dest(&paths_cloned, &dir_owned))
+                .await?;
+            Some(saved)
         }
         None => None,
     };
 
-    if opts.urls.is_empty() {
+    let urls = normalize_urls(&opts.urls)?;
+    if urls.is_empty() {
         if saved_dest.is_some() {
             return Ok(DownloadOutcome {
                 saved_dest,
-                downloaded_files: Vec::new(),
-                add_summary: None,
+                ..DownloadOutcome::default()
             });
         }
         return Err(TermusicError::InvalidArg(
@@ -126,38 +309,203 @@ fn run_download_with_env(
         ));
     }
 
-    for url in &opts.urls {
-        if url.trim().is_empty() {
-            return Err(TermusicError::InvalidArg(
-                "download URL cannot be empty".into(),
-            ));
+    let paths_cloned = paths.clone();
+    let opts_cloned = opts.clone();
+    let saved_cloned = saved_dest.clone();
+    let env_cloned = env.clone();
+    let (dest_dir, yt_dlp_bin, js_runtime) = run_blocking(move || {
+        let dest_dir = resolve_destination(
+            &paths_cloned,
+            &opts_cloned,
+            saved_cloned.as_deref(),
+            &env_cloned,
+        )?;
+        let yt_dlp_bin = find_yt_dlp(&env_cloned)?;
+        let _ffmpeg = find_ffmpeg(&env_cloned)?;
+        let js_runtime = detect_js_runtime(&env_cloned);
+        Ok((dest_dir, yt_dlp_bin, js_runtime))
+    })
+    .await?;
+
+    let embed_thumbnail = should_embed_thumbnail_with_progress(opts, env, progress_tx.as_ref()).await;
+    let staging_root = dest_dir.join(".termusic-dl-tmp");
+    let effective_jobs = opts.jobs.max(1);
+    emit_progress(
+        progress_tx.as_ref(),
+        DownloadProgressEvent::BatchStarted {
+            urls: urls.clone(),
+            dest_dir: dest_dir.clone(),
+            format: opts.format,
+            jobs: effective_jobs,
+        },
+    );
+
+    let ctx = Arc::new(DownloadContext {
+        yt_dlp_bin,
+        dest_dir,
+        staging_root,
+        format: opts.format,
+        playlist: opts.playlist,
+        js_runtime,
+        embed_thumbnail,
+        env: env.clone(),
+        finalizer_lock: Mutex::new(()),
+        progress_tx: progress_tx.clone(),
+    });
+
+    let semaphore = Arc::new(Semaphore::new(effective_jobs));
+    let mut join_set = JoinSet::new();
+
+    for (idx, url) in urls.iter().cloned().enumerate() {
+        let ctx = Arc::clone(&ctx);
+        let semaphore = Arc::clone(&semaphore);
+        join_set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.map_err(|_| {
+                TermusicError::Async("download concurrency semaphore closed".to_string())
+            })?;
+            ctx.emit(DownloadProgressEvent::ItemUpdate {
+                index: idx,
+                title: None,
+                phase: DownloadPhase::Starting,
+            });
+            let outcome = download_single_url(&ctx, idx, &url).await;
+            match &outcome {
+                Ok(files) => ctx.emit(DownloadProgressEvent::ItemUpdate {
+                    index: idx,
+                    title: files
+                        .first()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string),
+                    phase: DownloadPhase::Completed {
+                        files: files.clone(),
+                    },
+                }),
+                Err(err) => ctx.emit(DownloadProgressEvent::ItemUpdate {
+                    index: idx,
+                    title: None,
+                    phase: DownloadPhase::Failed {
+                        error: err.to_string(),
+                    },
+                }),
+            }
+            Ok::<_, TermusicError>((idx, outcome))
+        });
+    }
+
+    let mut slots: Vec<Option<std::result::Result<Vec<PathBuf>, String>>> = vec![None; urls.len()];
+    while let Some(joined) = join_set.join_next().await {
+        let (idx, outcome) = joined.map_err(|err| {
+            TermusicError::Async(format!("download worker task failed: {err}"))
+        })??;
+        slots[idx] = Some(outcome.map_err(|err| err.to_string()));
+    }
+
+    let _ = tokio::fs::remove_dir(&ctx.staging_root).await;
+
+    let mut downloaded_files = Vec::new();
+    let mut failed = Vec::new();
+    for (idx, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(Ok(files)) => downloaded_files.extend(files),
+            Some(Err(error)) => failed.push(DownloadFailure {
+                url: urls[idx].clone(),
+                error,
+            }),
+            None => failed.push(DownloadFailure {
+                url: urls[idx].clone(),
+                error: "download worker exited without a result".to_string(),
+            }),
         }
     }
 
-    let dest_dir = resolve_destination(paths, opts, saved_dest.as_deref(), env)?;
-    let yt_dlp = find_yt_dlp(env)?;
-    let _ffmpeg = find_ffmpeg(env)?;
-    let js_runtime = detect_js_runtime(env);
-    let embed_thumbnail = should_embed_thumbnail(opts, env);
-
-    let args = build_yt_dlp_args(opts, &dest_dir, js_runtime.as_deref(), embed_thumbnail);
-    let downloaded_files = execute_yt_dlp(&yt_dlp, &args, &dest_dir, env)?;
-
     let add_summary = if opts.auto_add && !downloaded_files.is_empty() {
-        Some(index_downloaded_files(
-            paths,
-            &downloaded_files,
-            opts.playlist_name.as_deref(),
-        )?)
+        emit_progress(
+            progress_tx.as_ref(),
+            DownloadProgressEvent::IndexingStarted {
+                track_count: downloaded_files.len(),
+            },
+        );
+        let paths_cloned = paths.clone();
+        let files_cloned = downloaded_files.clone();
+        let playlist_cloned = opts.playlist_name.clone();
+        Some(
+            run_blocking(move || {
+                index_downloaded_files(
+                    &paths_cloned,
+                    &files_cloned,
+                    playlist_cloned.as_deref(),
+                )
+            })
+            .await?,
+        )
     } else {
         None
     };
 
+    emit_progress(progress_tx.as_ref(), DownloadProgressEvent::BatchFinished);
+
     Ok(DownloadOutcome {
         saved_dest,
         downloaded_files,
+        failed,
         add_summary,
     })
+}
+
+async fn download_single_url(
+    ctx: &DownloadContext,
+    index: usize,
+    url: &str,
+) -> Result<Vec<PathBuf>> {
+    let guard = StageDirGuard::create(&ctx.staging_root).await?;
+    let res = download_into_stage_and_finalize(ctx, index, guard.path(), url).await;
+    guard.cleanup().await;
+    res
+}
+
+async fn download_into_stage_and_finalize(
+    ctx: &DownloadContext,
+    index: usize,
+    stage_dir: &Path,
+    url: &str,
+) -> Result<Vec<PathBuf>> {
+    let args = build_yt_dlp_args(
+        ctx.format,
+        ctx.playlist,
+        stage_dir,
+        ctx.js_runtime.as_deref(),
+        ctx.embed_thumbnail,
+        url,
+    );
+    let staged_files = execute_yt_dlp(
+        &ctx.yt_dlp_bin,
+        &args,
+        stage_dir,
+        &ctx.env,
+        index,
+        ctx.progress_tx.as_ref(),
+    )
+    .await?;
+    if staged_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    ctx.emit(DownloadProgressEvent::ItemUpdate {
+        index,
+        title: None,
+        phase: DownloadPhase::Finalizing,
+    });
+    let _finalize_guard = ctx.finalizer_lock.lock().await;
+    let dest_dir = ctx.dest_dir.clone();
+    run_blocking(move || {
+        let mut final_paths = Vec::with_capacity(staged_files.len());
+        for staged in staged_files {
+            final_paths.push(move_staged_file(&staged, &dest_dir)?);
+        }
+        Ok(final_paths)
+    })
+    .await
 }
 
 fn validate_non_empty_path(path: &Path, label: &str) -> Result<()> {
@@ -267,7 +615,7 @@ fn detect_js_runtime(env: &DownloadEnv) -> Option<String> {
     }
 }
 
-fn has_python_mutagen(env: &DownloadEnv) -> bool {
+async fn has_python_mutagen(env: &DownloadEnv) -> bool {
     let Some(python) = find_on_path("python3", env.path_var.as_deref()) else {
         return false;
     };
@@ -276,34 +624,53 @@ fn has_python_mutagen(env: &DownloadEnv) -> bool {
     cmd.args(["-c", "import mutagen"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     if let Some(path_var) = env.path_var.as_deref() {
         cmd.env("PATH", path_var);
     }
 
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    cmd.status().await.map(|s| s.success()).unwrap_or(false)
 }
 
-fn should_embed_thumbnail(opts: &DownloadOptions, env: &DownloadEnv) -> bool {
+#[cfg(test)]
+async fn should_embed_thumbnail(opts: &DownloadOptions, env: &DownloadEnv) -> bool {
+    should_embed_thumbnail_with_progress(opts, env, None).await
+}
+
+async fn should_embed_thumbnail_with_progress(
+    opts: &DownloadOptions,
+    env: &DownloadEnv,
+    progress_tx: Option<&mpsc::UnboundedSender<DownloadProgressEvent>>,
+) -> bool {
     if !opts.embed_thumbnail {
         return false;
     }
 
     match opts.format {
         DownloadFormat::Wav | DownloadFormat::Aac => {
-            eprintln!(
-                "note: skipping thumbnail embedding for {} format",
+            let msg = format!(
+                "skipping thumbnail embedding for {} format",
                 opts.format
             );
+            if let Some(tx) = progress_tx {
+                let _ = tx.send(DownloadProgressEvent::Notice(msg));
+            } else {
+                eprintln!("note: {msg}");
+            }
             false
         }
         DownloadFormat::Ogg => {
-            if has_python_mutagen(env) {
+            if has_python_mutagen(env).await {
                 true
             } else {
-                eprintln!(
-                    "note: skipping thumbnail embedding for ogg (python3 mutagen not available)"
-                );
+                let msg = "skipping thumbnail embedding for ogg (python3 mutagen not available)"
+                    .to_string();
+                if let Some(tx) = progress_tx {
+                    let _ = tx.send(DownloadProgressEvent::Notice(msg));
+                } else {
+                    eprintln!("note: {msg}");
+                }
                 false
             }
         }
@@ -312,17 +679,22 @@ fn should_embed_thumbnail(opts: &DownloadOptions, env: &DownloadEnv) -> bool {
 }
 
 fn build_yt_dlp_args(
-    opts: &DownloadOptions,
-    dest_dir: &Path,
+    format: DownloadFormat,
+    playlist: bool,
+    stage_dir: &Path,
     js_runtime: Option<&str>,
     embed_thumbnail: bool,
+    url: &str,
 ) -> Vec<OsString> {
+    let mut temp_paths = OsString::from("temp:");
+    temp_paths.push(stage_dir.as_os_str());
+
     let mut args = vec![
         OsString::from("-f"),
         OsString::from("bestaudio/best"),
         OsString::from("-x"),
         OsString::from("--audio-format"),
-        OsString::from(opts.format.yt_dlp_format()),
+        OsString::from(format.yt_dlp_format()),
         OsString::from("--audio-quality"),
         OsString::from("0"),
         OsString::from("--add-metadata"),
@@ -332,7 +704,7 @@ fn build_yt_dlp_args(
         args.push(OsString::from("--embed-thumbnail"));
     }
 
-    args.push(OsString::from(if opts.playlist {
+    args.push(OsString::from(if playlist {
         "--yes-playlist"
     } else {
         "--no-playlist"
@@ -343,31 +715,165 @@ fn build_yt_dlp_args(
         args.push(OsString::from(runtime));
     }
 
+    args.push(OsString::from("--newline"));
+    args.push(OsString::from("--progress"));
+    args.push(OsString::from("--progress-template"));
+    args.push(OsString::from(PROGRESS_TEMPLATE_DOWNLOAD));
+    args.push(OsString::from("--progress-template"));
+    args.push(OsString::from(PROGRESS_TEMPLATE_POSTPROCESS));
+    args.push(OsString::from("--paths"));
+    args.push(temp_paths);
     args.push(OsString::from("-P"));
-    args.push(dest_dir.as_os_str().to_os_string());
+    args.push(stage_dir.as_os_str().to_os_string());
     args.push(OsString::from("-o"));
     args.push(OsString::from("%(title)s.%(ext)s"));
     args.push(OsString::from("--print"));
     args.push(OsString::from("after_move:filepath"));
-
-    for url in &opts.urls {
-        args.push(OsString::from(url));
-    }
+    args.push(OsString::from("--"));
+    args.push(OsString::from(url));
 
     args
 }
 
-fn execute_yt_dlp(
+async fn read_stream_lines<R, F>(mut reader: R, mut on_line: F) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(String),
+{
+    let mut buf = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::with_capacity(512);
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            if byte == b'\n' || byte == b'\r' {
+                if !pending.is_empty() {
+                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    pending.clear();
+                    on_line(line);
+                }
+            } else if pending.len() < MAX_LINE_BYTES {
+                pending.push(byte);
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        on_line(String::from_utf8_lossy(&pending).into_owned());
+    }
+    Ok(())
+}
+
+fn clean_template_field(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "NA" || trimmed == "None" {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn parse_template_u64(raw: &str) -> Option<u64> {
+    let trimmed = clean_template_field(raw)?;
+    if let Ok(v) = trimmed.parse::<u64>() {
+        return Some(v);
+    }
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.round() as u64)
+}
+
+fn friendly_postprocessor_name(raw: &str) -> String {
+    match raw.trim() {
+        "ExtractAudio" => "Extracting audio".to_string(),
+        "Metadata" | "FFmpegMetadata" => "Writing metadata".to_string(),
+        "EmbedThumbnail" => "Embedding artwork".to_string(),
+        "MoveFiles" => "Finalizing file".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "Post-processing".to_string(),
+    }
+}
+
+fn parse_yt_dlp_progress_line(line: &str, index: usize) -> Option<DownloadProgressEvent> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("TERMUSIC_PROG\t") {
+        let mut parts = rest.splitn(7, '\t');
+        let status = parts.next()?.trim();
+        let downloaded_s = parts.next().unwrap_or("");
+        let total_s = parts.next().unwrap_or("");
+        let estimate_s = parts.next().unwrap_or("");
+        let speed_s = parts.next().unwrap_or("");
+        let eta_s = parts.next().unwrap_or("");
+        let title_s = parts.next().unwrap_or("");
+
+        let title = clean_template_field(title_s).map(str::to_string);
+        let phase = if status == "finished" {
+            DownloadPhase::PostProcessing {
+                stage: "Finishing download".to_string(),
+            }
+        } else {
+            DownloadPhase::Downloading {
+                downloaded_bytes: parse_template_u64(downloaded_s),
+                total_bytes: parse_template_u64(total_s).or_else(|| parse_template_u64(estimate_s)),
+                speed_bytes_per_sec: parse_template_u64(speed_s),
+                eta_secs: parse_template_u64(eta_s),
+            }
+        };
+        return Some(DownloadProgressEvent::ItemUpdate {
+            index,
+            title,
+            phase,
+        });
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("TERMUSIC_POST\t") {
+        let mut parts = rest.splitn(3, '\t');
+        let _status = parts.next()?;
+        let postprocessor = parts.next().unwrap_or("");
+        let title_s = parts.next().unwrap_or("");
+        let title = clean_template_field(title_s).map(str::to_string);
+        return Some(DownloadProgressEvent::ItemUpdate {
+            index,
+            title,
+            phase: DownloadPhase::PostProcessing {
+                stage: friendly_postprocessor_name(postprocessor),
+            },
+        });
+    }
+
+    None
+}
+
+fn is_yt_dlp_progress_or_status_line(trimmed: &str) -> bool {
+    trimmed.starts_with("TERMUSIC_PROG\t")
+        || trimmed.starts_with("TERMUSIC_POST\t")
+        || trimmed.starts_with("[download]")
+        || trimmed.starts_with("[ExtractAudio]")
+        || trimmed.starts_with("[Metadata]")
+        || trimmed.starts_with("[EmbedThumbnail]")
+        || trimmed.starts_with("[MoveFiles]")
+}
+
+async fn execute_yt_dlp(
     yt_dlp_bin: &Path,
     args: &[OsString],
-    dest_dir: &Path,
+    stage_dir: &Path,
     env: &DownloadEnv,
+    index: usize,
+    progress_tx: Option<&mpsc::UnboundedSender<DownloadProgressEvent>>,
 ) -> Result<Vec<PathBuf>> {
     let mut cmd = Command::new(yt_dlp_bin);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(path_var) = env.path_var.as_deref() {
         cmd.env("PATH", path_var);
     }
@@ -375,35 +881,108 @@ fn execute_yt_dlp(
         cmd.env("HOME", home);
     }
 
-    let child = cmd.spawn()?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let code_info = output
-            .status
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| TermusicError::Download("yt-dlp stdout pipe missing".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| TermusicError::Download("yt-dlp stderr pipe missing".to_string()))?;
+
+    let tx_out = progress_tx.cloned();
+    let tx_err = progress_tx.cloned();
+
+    let read_out = async move {
+        let mut stdout_paths = Vec::new();
+        let mut total_bytes = 0usize;
+        read_stream_lines(stdout, |line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some(ev) = parse_yt_dlp_progress_line(trimmed, index) {
+                emit_progress(tx_out.as_ref(), ev);
+                return;
+            }
+            if is_yt_dlp_progress_or_status_line(trimmed) {
+                return;
+            }
+            if total_bytes < MAX_CAPTURE_BYTES {
+                total_bytes += trimmed.len() + 1;
+                stdout_paths.push(trimmed.to_string());
+            }
+        })
+        .await?;
+        Ok::<Vec<String>, io::Error>(stdout_paths)
+    };
+
+    let read_err = async move {
+        let mut stderr_lines = Vec::new();
+        let mut total_bytes = 0usize;
+        read_stream_lines(stderr, |line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some(ev) = parse_yt_dlp_progress_line(trimmed, index) {
+                emit_progress(tx_err.as_ref(), ev);
+                return;
+            }
+            if total_bytes < MAX_CAPTURE_BYTES {
+                total_bytes += trimmed.len() + 1;
+                stderr_lines.push(trimmed.to_string());
+            } else if stderr_lines.len() >= 64 {
+                stderr_lines.remove(0);
+                stderr_lines.push(trimmed.to_string());
+            }
+        })
+        .await?;
+        Ok::<Vec<String>, io::Error>(stderr_lines)
+    };
+
+    let (out_res, err_res, status_res) = tokio::join!(read_out, read_err, child.wait());
+    let stdout_lines = out_res?;
+    let stderr_lines = err_res?;
+    let status = status_res?;
+
+    if !status.success() {
+        let code_info = status
             .code()
             .map(|c| format!("exit code {c}"))
             .unwrap_or_else(|| "terminated by signal".into());
-        return Err(TermusicError::Audio(format!(
-            "yt-dlp failed ({code_info})"
-        )));
+        let detail = match extract_diagnostic_line(&stderr_lines) {
+            Some(line) => format!("yt-dlp failed ({code_info}): {line}"),
+            None => format!("yt-dlp failed ({code_info})"),
+        };
+        return Err(TermusicError::Download(detail));
     }
 
-    Ok(parse_printed_filepaths(&output.stdout, dest_dir))
+    Ok(resolve_printed_filepaths(&stdout_lines, stage_dir))
 }
 
-fn parse_printed_filepaths(stdout: &[u8], dest_dir: &Path) -> Vec<PathBuf> {
-    let text = String::from_utf8_lossy(stdout);
+fn extract_diagnostic_line(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("ERROR:"))
+        .or_else(|| lines.last())
+        .cloned()
+}
+
+fn resolve_printed_filepaths(lines: &[String], stage_dir: &Path) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut files = Vec::new();
 
-    for line in text.lines() {
+    for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_yt_dlp_progress_or_status_line(trimmed) {
             continue;
         }
         let raw_path = PathBuf::from(trimmed);
         let resolved = if raw_path.is_relative() {
-            dest_dir.join(raw_path)
+            stage_dir.join(raw_path)
         } else {
             raw_path
         };
@@ -415,37 +994,133 @@ fn parse_printed_filepaths(stdout: &[u8], dest_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn disambiguated_candidate(dest_dir: &Path, file_name: &OsStr, attempt: usize) -> PathBuf {
+    if attempt <= 1 {
+        return dest_dir.join(file_name);
+    }
+
+    let path = Path::new(file_name);
+    let mut new_name = match path.file_stem() {
+        Some(stem) => stem.to_os_string(),
+        None => file_name.to_os_string(),
+    };
+    new_name.push(format!(" ({attempt})"));
+    if let Some(ext) = path.extension() {
+        new_name.push(".");
+        new_name.push(ext);
+    }
+    dest_dir.join(new_name)
+}
+
+fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    if !staged_file.exists() {
+        return Err(TermusicError::Download(format!(
+            "downloaded file missing from staging directory: {}",
+            staged_file.display()
+        )));
+    }
+
+    if let Some(parent) = staged_file.parent()
+        && fs::canonicalize(parent).ok().as_deref() == Some(dest_dir)
+    {
+        return Ok(staged_file.to_path_buf());
+    }
+
+    let file_name = staged_file.file_name().ok_or_else(|| {
+        TermusicError::Download(format!(
+            "downloaded file has invalid filename: {}",
+            staged_file.display()
+        ))
+    })?;
+
+    for attempt in 1..=10_000 {
+        let candidate = disambiguated_candidate(dest_dir, file_name, attempt);
+        if fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+
+        match fs::hard_link(staged_file, &candidate) {
+            Ok(()) => {
+                fs::remove_file(staged_file)?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
+                copy_file_exclusively(staged_file, &candidate)?;
+                fs::remove_file(staged_file)?;
+                return Ok(candidate);
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::Unsupported
+                    || matches!(
+                        err.raw_os_error(),
+                        Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::EACCES)
+                    ) =>
+            {
+                if fs::symlink_metadata(&candidate).is_ok() {
+                    continue;
+                }
+                match fs::rename(staged_file, &candidate) {
+                    Ok(()) => return Ok(candidate),
+                    Err(ren_err) if ren_err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(ren_err) if ren_err.raw_os_error() == Some(libc::EXDEV) => {
+                        copy_file_exclusively(staged_file, &candidate)?;
+                        fs::remove_file(staged_file)?;
+                        return Ok(candidate);
+                    }
+                    Err(ren_err) => return Err(ren_err.into()),
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(TermusicError::Download(format!(
+        "exhausted disambiguation attempts for {}",
+        staged_file.display()
+    )))
+}
+
+fn copy_file_exclusively(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut reader = fs::File::open(src)?;
+    let mut writer = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let copy_res = (|| -> io::Result<()> {
+        io::copy(&mut reader, &mut writer)?;
+        writer.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = copy_res {
+        let _ = fs::remove_file(dst);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn index_downloaded_files(
     paths: &AppPaths,
     files: &[PathBuf],
     playlist_name: Option<&str>,
 ) -> Result<AddSummary> {
-    if let Some(parent) = paths.library_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    Library::update(&paths.library_path, |library| {
+        let mut combined = AddSummary {
+            playlist_name: playlist_name.map(str::to_string),
+            ..AddSummary::default()
+        };
 
-    let mut library = Library::load(&paths.library_path)?;
-    let mut combined = AddSummary {
-        playlist_name: playlist_name.map(str::to_string),
-        ..AddSummary::default()
-    };
-
-    for file in files {
-        let summary = library.add_files(file, false, playlist_name)?;
-        combined.added_count += summary.added_count;
-        combined.existing_count += summary.existing_count;
-        combined.playlist_added_count += summary.playlist_added_count;
-        combined.added_titles.extend(summary.added_titles);
-        combined.skipped_files.extend(summary.skipped_files);
-        if combined.playlist_name.is_none() {
-            combined.playlist_name = summary.playlist_name;
+        for file in files {
+            let summary = library.add_files(file, false, playlist_name)?;
+            combined.added_count += summary.added_count;
+            combined.existing_count += summary.existing_count;
+            combined.playlist_added_count += summary.playlist_added_count;
+            combined.added_titles.extend(summary.added_titles);
+            combined.skipped_files.extend(summary.skipped_files);
+            if combined.playlist_name.is_none() {
+                combined.playlist_name = summary.playlist_name;
+            }
         }
-    }
 
-    library.save(&paths.library_path)?;
-    Ok(combined)
+        Ok(combined)
+    })
 }
 
 #[cfg(test)]
@@ -586,41 +1261,57 @@ mod tests {
             embed_thumbnail: true,
             auto_add: true,
             playlist_name: None,
+            jobs: 4,
+            no_tui: false,
         }
     }
 
-    #[test]
-    fn missing_urls_without_set_dest_fails() {
+    /// Generate a WAV payload using the test binary helper script (or copy prebuilt template).
+    /// Note: in shell mock scripts we copy a pre-generated valid WAV template file from `$root/template.wav`
+    /// so every concurrent mock run finishes cleanly without needing python/sox inside shell.
+    fn write_wav_template(path: &Path) -> PathBuf {
+        write_synthetic_wav(path, 0.25);
+        path.to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn missing_urls_without_set_dest_fails() {
         let ws = TestWorkspace::new();
         let env = ws.env(None);
         let opts = base_options(vec![]);
 
-        let err = run_download_with_env(&ws.paths, &opts, &env).unwrap_err();
+        let err = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TermusicError::InvalidArg(_)));
     }
 
-    #[test]
-    fn empty_dest_or_set_dest_is_rejected() {
+    #[tokio::test]
+    async fn empty_dest_or_set_dest_is_rejected() {
         let ws = TestWorkspace::new();
         let env = ws.env(None);
 
         let mut opts = base_options(vec!["https://example.com/a"]);
         opts.dest = Some(PathBuf::from("   "));
         assert!(matches!(
-            run_download_with_env(&ws.paths, &opts, &env).unwrap_err(),
+            run_download_with_env(&ws.paths, &opts, &env)
+                .await
+                .unwrap_err(),
             TermusicError::InvalidArg(_)
         ));
 
         let mut set_only = base_options(vec![]);
         set_only.set_dest = Some(PathBuf::from(""));
         assert!(matches!(
-            run_download_with_env(&ws.paths, &set_only, &env).unwrap_err(),
+            run_download_with_env(&ws.paths, &set_only, &env)
+                .await
+                .unwrap_err(),
             TermusicError::InvalidArg(_)
         ));
     }
 
-    #[test]
-    fn set_dest_without_urls_persists_canonical_destination() {
+    #[tokio::test]
+    async fn set_dest_without_urls_persists_canonical_destination() {
         let ws = TestWorkspace::new();
         let env = ws.env(None);
         let target = ws.root.join("my_downloads");
@@ -628,10 +1319,13 @@ mod tests {
         let mut opts = base_options(vec![]);
         opts.set_dest = Some(target.clone());
 
-        let outcome = run_download_with_env(&ws.paths, &opts, &env).expect("set_dest");
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("set_dest");
         let canonical = fs::canonicalize(&target).expect("canonical");
         assert_eq!(outcome.saved_dest.as_ref(), Some(&canonical));
         assert!(outcome.downloaded_files.is_empty());
+        assert!(outcome.failed.is_empty());
         assert!(outcome.add_summary.is_none());
 
         let cfg = load_workspace_config(&ws.paths).expect("reload config");
@@ -733,32 +1427,39 @@ mod tests {
         assert_eq!(detect_js_runtime(&env_wsl).as_deref(), Some("deno"));
     }
 
-    #[test]
-    fn argument_mapping_and_thumbnail_guards() {
+    #[tokio::test]
+    async fn argument_mapping_and_thumbnail_guards() {
         let ws = TestWorkspace::new();
         let env = ws.env(None);
-        let dest = ws.root.join("out");
-        fs::create_dir_all(&dest).unwrap();
+        let stage = ws.root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
 
         // wav and aac never embed thumbnails; ogg checks python3 mutagen
         let mut wav_opts = base_options(vec!["https://example.com/1"]);
         wav_opts.format = DownloadFormat::Wav;
-        assert!(!should_embed_thumbnail(&wav_opts, &env));
+        assert!(!should_embed_thumbnail(&wav_opts, &env).await);
 
         let mut aac_opts = wav_opts.clone();
         aac_opts.format = DownloadFormat::Aac;
-        assert!(!should_embed_thumbnail(&aac_opts, &env));
+        assert!(!should_embed_thumbnail(&aac_opts, &env).await);
 
         let mut ogg_opts = wav_opts.clone();
         ogg_opts.format = DownloadFormat::Ogg;
-        assert!(!should_embed_thumbnail(&ogg_opts, &env));
+        assert!(!should_embed_thumbnail(&ogg_opts, &env).await);
 
         // Mock python3 returning success for `import mutagen`
         let fake_py = ws.bin_dir.join("python3");
         write_executable(&fake_py, "#!/bin/sh\nexit 0\n");
-        assert!(should_embed_thumbnail(&ogg_opts, &env));
+        assert!(should_embed_thumbnail(&ogg_opts, &env).await);
 
-        let args = build_yt_dlp_args(&ogg_opts, &dest, Some("node"), false);
+        let args = build_yt_dlp_args(
+            ogg_opts.format,
+            ogg_opts.playlist,
+            &stage,
+            Some("node"),
+            false,
+            "https://example.com/1",
+        );
         let str_args: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -766,53 +1467,88 @@ mod tests {
 
         assert!(str_args.windows(2).any(|w| w == ["--audio-format", "vorbis"]));
         assert!(str_args.contains(&"--no-playlist".to_string()));
+        assert!(str_args.contains(&"--newline".to_string()));
+        assert!(str_args.contains(&"--progress".to_string()));
         assert!(!str_args.contains(&"--embed-thumbnail".to_string()));
         assert!(str_args.windows(2).any(|w| w == ["--js-runtimes", "node"]));
         assert!(
             str_args
                 .windows(2)
+                .any(|w| w == ["--paths", &format!("temp:{}", stage.display())])
+        );
+        assert!(
+            str_args
+                .windows(2)
+                .any(|w| w == ["-P", &stage.display().to_string()])
+        );
+        assert!(
+            str_args
+                .windows(2)
                 .any(|w| w == ["--print", "after_move:filepath"])
         );
+        assert_eq!(
+            &str_args[str_args.len() - 2..],
+            ["--", "https://example.com/1"]
+        );
 
-        let mut pl_opts = base_options(vec!["https://example.com/list"]);
-        pl_opts.playlist = true;
-        let pl_args: Vec<String> = build_yt_dlp_args(&pl_opts, &dest, None, true)
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let pl_args: Vec<String> = build_yt_dlp_args(
+            DownloadFormat::Mp3,
+            true,
+            &stage,
+            None,
+            true,
+            "https://example.com/list",
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
         assert!(pl_args.contains(&"--yes-playlist".to_string()));
         assert!(pl_args.contains(&"--embed-thumbnail".to_string()));
         assert!(!pl_args.contains(&"--js-runtimes".to_string()));
     }
 
-    #[test]
-    fn mock_yt_dlp_downloads_wav_and_respects_auto_add_and_playlist() {
+    fn write_mock_yt_dlp(bin_dir: &Path, body: &str) {
+        let script = format!(
+            "#!/bin/sh\nset -eu\nPATH=\"/bin:/usr/bin:$PATH\"\nstage=\"\"\nprev=\"\"\nlast=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-P\" ]; then\n    stage=\"$a\"\n  fi\n  prev=\"$a\"\n  last=\"$a\"\ndone\n{body}\n"
+        );
+        write_executable(&bin_dir.join("yt-dlp"), &script);
+    }
+
+    #[tokio::test]
+    async fn mock_yt_dlp_downloads_wav_and_respects_auto_add_and_playlist() {
         let ws = TestWorkspace::new();
         let dest = ws.root.join("downloads");
         fs::create_dir_all(&dest).unwrap();
-        let track_path = dest.join("Synthetic Track.wav");
-        write_synthetic_wav(&track_path, 0.25);
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
 
         write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
 
         let args_log = ws.root.join("yt-dlp-args.txt");
-        let fake_yt_dlp = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' \"{}\"\n",
-            args_log.display(),
-            track_path.display()
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                "printf '%s\\n' \"$@\" > \"{args_log}\"\nout=\"$stage/Synthetic Track.wav\"\ncp \"{template}\" \"$out\"\nprintf '%s\\n' \"$out\"",
+                args_log = args_log.display(),
+                template = template_wav.display(),
+            ),
         );
-        write_executable(&ws.bin_dir.join("yt-dlp"), &fake_yt_dlp);
 
         let env = ws.env(None);
+        let expected_dest_track = fs::canonicalize(&dest).unwrap().join("Synthetic Track.wav");
 
-        // First run with auto_add = false does not touch library.json
+        // First run with auto_add = false moves staged track into dest but does not touch library.json
         let mut no_add_opts = base_options(vec!["https://example.com/track"]);
         no_add_opts.dest = Some(dest.clone());
         no_add_opts.format = DownloadFormat::Wav;
         no_add_opts.auto_add = false;
 
-        let no_add_out = run_download_with_env(&ws.paths, &no_add_opts, &env).expect("no-add run");
-        assert_eq!(no_add_out.downloaded_files, vec![track_path.clone()]);
+        let no_add_out = run_download_with_env(&ws.paths, &no_add_opts, &env)
+            .await
+            .expect("no-add run");
+        assert!(no_add_out.failed.is_empty(), "failures: {:?}", no_add_out.failed);
+        assert_eq!(no_add_out.downloaded_files, vec![expected_dest_track.clone()]);
+        assert!(expected_dest_track.exists());
+        assert!(!dest.join(".termusic-dl-tmp").exists());
         assert!(no_add_out.add_summary.is_none());
         let lib_before = Library::load(&ws.paths.library_path).expect("load empty lib");
         assert!(lib_before.songs.is_empty());
@@ -822,14 +1558,20 @@ mod tests {
         assert!(!logged_args.lines().any(|l| l == "--embed-thumbnail"));
         assert!(logged_args.lines().any(|l| l == "--no-playlist"));
 
-        // Second run with auto_add = true and playlist_name creates song + playlist
+        // Second run with auto_add = true and playlist_name creates song + playlist (and disambiguates collision)
         let mut add_opts = base_options(vec!["https://example.com/track"]);
         add_opts.dest = Some(dest.clone());
         add_opts.format = DownloadFormat::Wav;
         add_opts.playlist = true;
         add_opts.playlist_name = Some("Downloaded".into());
 
-        let add_out = run_download_with_env(&ws.paths, &add_opts, &env).expect("auto-add run");
+        let add_out = run_download_with_env(&ws.paths, &add_opts, &env)
+            .await
+            .expect("auto-add run");
+        let second_expected = fs::canonicalize(&dest)
+            .unwrap()
+            .join("Synthetic Track (2).wav");
+        assert_eq!(add_out.downloaded_files, vec![second_expected.clone()]);
         let summary = add_out.add_summary.expect("add summary");
         assert_eq!(summary.added_count, 1);
         assert_eq!(summary.playlist_name.as_deref(), Some("Downloaded"));
@@ -837,7 +1579,7 @@ mod tests {
 
         let lib_after = Library::load(&ws.paths.library_path).expect("load indexed lib");
         assert_eq!(lib_after.songs.len(), 1);
-        assert_eq!(lib_after.songs[0].path, track_path);
+        assert_eq!(lib_after.songs[0].path, second_expected);
         assert_eq!(lib_after.playlists.len(), 1);
         assert_eq!(lib_after.playlists[0].name, "Downloaded");
         assert_eq!(lib_after.playlists[0].song_ids.len(), 1);
@@ -846,18 +1588,408 @@ mod tests {
         assert!(logged_args_2.lines().any(|l| l == "--yes-playlist"));
     }
 
-    #[test]
-    fn yt_dlp_non_zero_exit_returns_error() {
+    #[tokio::test]
+    async fn yt_dlp_non_zero_exit_records_failure_in_outcome() {
         let ws = TestWorkspace::new();
         let dest = ws.root.join("downloads");
         write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
-        write_executable(&ws.bin_dir.join("yt-dlp"), "#!/bin/sh\nexit 2\n");
+        write_executable(
+            &ws.bin_dir.join("yt-dlp"),
+            "#!/bin/sh\necho 'ERROR: video unavailable' >&2\nexit 2\n",
+        );
 
         let env = ws.env(None);
         let mut opts = base_options(vec!["https://example.com/fail"]);
-        opts.dest = Some(dest);
+        opts.dest = Some(dest.clone());
 
-        let err = run_download_with_env(&ws.paths, &opts, &env).unwrap_err();
-        assert!(matches!(err, TermusicError::Audio(_)));
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("per-URL error recorded in outcome");
+        assert!(outcome.downloaded_files.is_empty());
+        assert!(outcome.add_summary.is_none());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].url, "https://example.com/fail");
+        assert!(outcome.failed[0].error.contains("exit code 2"));
+        assert!(outcome.failed[0].error.contains("ERROR: video unavailable"));
+        assert!(!dest.join(".termusic-dl-tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn parallel_downloads_overlap_and_preserve_url_order() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        let active_dir = ws.root.join("active_workers");
+        fs::create_dir_all(&active_dir).unwrap();
+
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
+marker="{active}/running.$$"
+: > "$marker"
+sleep 0.15
+count=$(find "{active}" -maxdepth 1 -name 'running.*' | wc -l)
+printf '%s\n' "$count" >> "{active}/peaks.log"
+rm -f "$marker"
+out="$stage/$name.wav"
+cp "{template}" "$out"
+printf '%s\n' "$out""#,
+                active = active_dir.display(),
+                template = template_wav.display(),
+            ),
+        );
+
+        let env = ws.env(None);
+        let mut opts = base_options(vec![
+            "https://example.com/alpha",
+            "https://example.com/beta",
+            "https://example.com/gamma",
+        ]);
+        opts.dest = Some(dest.clone());
+        opts.format = DownloadFormat::Wav;
+        opts.jobs = 3;
+
+        let started = std::time::Instant::now();
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("parallel download succeeds");
+        let elapsed = started.elapsed();
+
+        assert!(outcome.failed.is_empty(), "failures: {:?}", outcome.failed);
+        assert_eq!(outcome.downloaded_files.len(), 3);
+        let names: Vec<String> = outcome
+            .downloaded_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["alpha.wav", "beta.wav", "gamma.wav"]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(420),
+            "expected concurrent overlap faster than sequential 450ms, took {elapsed:?}"
+        );
+        let peaks = fs::read_to_string(active_dir.join("peaks.log")).unwrap();
+        let max_peak: usize = peaks
+            .lines()
+            .filter_map(|l| l.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(max_peak >= 2, "expected overlapping workers, max_peak={max_peak}");
+    }
+
+    #[tokio::test]
+    async fn jobs_one_bounds_concurrency_to_single_worker() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        let mutex_dir = ws.root.join("mutex.lock");
+
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"if ! mkdir "{mutex}" 2>/dev/null; then
+  echo "ERROR: concurrent execution exceeded jobs=1" >&2
+  exit 99
+fi
+sleep 0.04
+name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
+out="$stage/$name.wav"
+cp "{template}" "$out"
+rmdir "{mutex}"
+printf '%s\n' "$out""#,
+                mutex = mutex_dir.display(),
+                template = template_wav.display(),
+            ),
+        );
+
+        let env = ws.env(None);
+        let mut opts = base_options(vec![
+            "https://example.com/one",
+            "https://example.com/two",
+            "https://example.com/three",
+        ]);
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+        opts.jobs = 1;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("jobs=1 succeeds");
+        assert!(outcome.failed.is_empty(), "failures: {:?}", outcome.failed);
+        assert_eq!(outcome.downloaded_files.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn partial_failure_indexes_healthy_urls_and_reports_failed_url() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"case "$last" in
+  *broken*)
+    echo "ERROR: broken stream" >&2
+    exit 3
+    ;;
+esac
+name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
+out="$stage/$name.wav"
+cp "{template}" "$out"
+printf '%s\n' "$out""#,
+                template = template_wav.display(),
+            ),
+        );
+
+        let env = ws.env(None);
+        let mut opts = base_options(vec![
+            "https://example.com/first",
+            "https://example.com/broken",
+            "https://example.com/third",
+        ]);
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+        opts.playlist_name = Some("Mixed".into());
+        opts.jobs = 3;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("partial failure returns outcome");
+        assert_eq!(outcome.downloaded_files.len(), 2);
+        let titles: Vec<String> = outcome
+            .downloaded_files
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(titles, vec!["first", "third"]);
+
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].url, "https://example.com/broken");
+        assert!(outcome.failed[0].error.contains("ERROR: broken stream"));
+
+        let summary = outcome.add_summary.expect("healthy tracks indexed");
+        assert_eq!(summary.added_count, 2);
+        assert_eq!(summary.playlist_name.as_deref(), Some("Mixed"));
+        assert_eq!(summary.playlist_added_count, 2);
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 2);
+        assert_eq!(lib.playlists.len(), 1);
+        assert_eq!(lib.playlists[0].song_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_titles_disambiguate_without_overwriting() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                "out=\"$stage/Same Title.wav\"\ncp \"{}\" \"$out\"\nprintf '%s\\n' \"$out\"",
+                template_wav.display(),
+            ),
+        );
+
+        let env = ws.env(None);
+        let mut opts = base_options(vec![
+            "https://example.com/source1",
+            "https://example.com/source2",
+        ]);
+        opts.dest = Some(dest.clone());
+        opts.format = DownloadFormat::Wav;
+        opts.jobs = 2;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("concurrent duplicate titles succeed");
+        assert!(outcome.failed.is_empty(), "failures: {:?}", outcome.failed);
+        assert_eq!(outcome.downloaded_files.len(), 2);
+
+        let mut names: Vec<String> = outcome
+            .downloaded_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Same Title (2).wav", "Same Title.wav"]);
+        for path in &outcome.downloaded_files {
+            assert!(path.exists(), "missing finalized track {}", path.display());
+        }
+        assert!(!dest.join(".termusic-dl-tmp").exists());
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn whitespace_split_and_deduplicated_urls_execute_once_each() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        let invocation_log = ws.root.join("invocations.log");
+
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"printf '%s\n' "$last" >> "{log}"
+name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
+out="$stage/$name.wav"
+cp "{template}" "$out"
+printf '%s\n' "$out""#,
+                log = invocation_log.display(),
+                template = template_wav.display(),
+            ),
+        );
+
+        let env = ws.env(None);
+        let mut opts = base_options(vec![
+            "https://example.com/t1   https://example.com/t2",
+            "https://example.com/t1",
+            "https://example.com/t3",
+        ]);
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+        opts.jobs = 4;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &env)
+            .await
+            .expect("split and dedup succeeds");
+        assert!(outcome.failed.is_empty(), "failures: {:?}", outcome.failed);
+        let names: Vec<String> = outcome
+            .downloaded_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["t1.wav", "t2.wav", "t3.wav"]);
+
+        let mut invoked: Vec<String> = fs::read_to_string(&invocation_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        invoked.sort();
+        assert_eq!(
+            invoked,
+            vec![
+                "https://example.com/t1",
+                "https://example.com/t2",
+                "https://example.com/t3",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_yt_dlp_progress_and_postprocess_templates() {
+        let prog = parse_yt_dlp_progress_line(
+            "TERMUSIC_PROG\tdownloading\t524288\tNA\t1048576.0\t262144.4\t2.0\tMy Cool Track",
+            1,
+        )
+        .expect("should parse progress");
+        assert_eq!(
+            prog,
+            DownloadProgressEvent::ItemUpdate {
+                index: 1,
+                title: Some("My Cool Track".to_string()),
+                phase: DownloadPhase::Downloading {
+                    downloaded_bytes: Some(524_288),
+                    total_bytes: Some(1_048_576),
+                    speed_bytes_per_sec: Some(262_144),
+                    eta_secs: Some(2),
+                },
+            }
+        );
+
+        let post = parse_yt_dlp_progress_line(
+            "TERMUSIC_POST\tstarted\tExtractAudio\tMy Cool Track",
+            1,
+        )
+        .expect("should parse postprocess");
+        assert_eq!(
+            post,
+            DownloadProgressEvent::ItemUpdate {
+                index: 1,
+                title: Some("My Cool Track".to_string()),
+                phase: DownloadPhase::PostProcessing {
+                    stage: "Extracting audio".to_string(),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_progress_events_emit_without_treating_templates_as_filepaths() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        fs::create_dir_all(&dest).unwrap();
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"printf 'TERMUSIC_PROG\tdownloading\t500\t1000\tNA\t250\t2\tStreamed Song\n'
+printf 'TERMUSIC_POST\tstarted\tExtractAudio\tStreamed Song\n'
+out="$stage/Streamed Song.wav"
+cp "{template}" "$out"
+printf '%s\n' "$out""#,
+                template = template_wav.display(),
+            ),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut opts = base_options(vec!["https://example.com/stream"]);
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let outcome = run_download_with_env_and_progress(&ws.paths, &opts, &ws.env(None), Some(tx))
+            .await
+            .expect("streaming mock should succeed");
+        assert_eq!(outcome.downloaded_files.len(), 1);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DownloadProgressEvent::BatchStarted { jobs: 4, .. }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DownloadProgressEvent::ItemUpdate {
+                index: 0,
+                phase: DownloadPhase::Downloading {
+                    downloaded_bytes: Some(500),
+                    total_bytes: Some(1000),
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DownloadProgressEvent::ItemUpdate {
+                index: 0,
+                phase: DownloadPhase::PostProcessing { stage },
+                ..
+            } if stage == "Extracting audio"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DownloadProgressEvent::ItemUpdate {
+                index: 0,
+                phase: DownloadPhase::Completed { .. },
+                ..
+            }
+        )));
+        assert!(matches!(events.last(), Some(DownloadProgressEvent::BatchFinished)));
     }
 }

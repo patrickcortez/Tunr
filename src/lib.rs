@@ -2,6 +2,7 @@ pub mod audio;
 pub mod cli;
 pub mod daemon;
 pub mod download;
+pub mod download_tui;
 pub mod error;
 pub mod ipc;
 pub mod library;

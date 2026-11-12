@@ -146,8 +146,20 @@ fn buffer_attr_for_spec(sample_rate: u32, channels: u8) -> PaBufferAttr {
 
 /// PulseAudio playback sink backed by runtime `dlopen` of `libpulse-simple.so.0`.
 ///
-/// Tracks the currently open `(sample_rate, channels)` specification and only reopens
-/// the underlying PulseAudio stream when parameters change or after `close()`.
+/// # Concurrency & Ownership Contract
+/// - `PulseSimpleSink` is [`Send`] (so ownership can move into the dedicated
+///   `termusic-engine` OS thread) and intentionally `!Sync` (due to `NonNull<PaSimple>`).
+/// - `libpulse-simple` owns an internal threaded mainloop whose `pa_simple*` operations are
+///   NOT safe under concurrent shared access; all playback calls require exclusive `&mut self`
+///   access from a single owner thread.
+/// - Tracks the currently open `(sample_rate, channels)` specification and only reopens the
+///   underlying stream when parameters change or after `close()`.
+///
+/// # Shutdown & Drop Order Invariant
+/// `stream` is declared before `api`, and [`Drop::drop`] invokes [`AudioSink::close`] first so
+/// `pa_simple_free` always closes the active stream before `PulseApi` drops and unloads
+/// `libpulse-simple` / `libpulse`. Calling `close()` repeatedly (for example on engine stop
+/// followed by `Drop` during async daemon shutdown) is idempotent.
 pub struct PulseSimpleSink {
     // Declared before `api` so any stream handle is freed before unloading libraries.
     stream: Option<NonNull<PaSimple>>,
@@ -157,8 +169,10 @@ pub struct PulseSimpleSink {
     api: PulseApi,
 }
 
-// `pa_simple` manages its own threaded mainloop internally; exclusive `&mut self` access
-// guarantees the handle is never touched concurrently from multiple threads.
+// SAFETY: `PulseSimpleSink` is moved once to the `termusic-engine` OS thread and never shares
+// `&self` (`!Sync` is preserved via `NonNull<PaSimple>`). `libpulse-simple` manages its internal
+// threaded mainloop per `pa_simple*`, and `&mut self` guarantees serialized single-owner calls
+// with `PulseApi` libraries kept alive strictly longer than `stream`.
 unsafe impl Send for PulseSimpleSink {}
 
 impl PulseSimpleSink {
@@ -316,6 +330,9 @@ impl AudioSink for PulseSimpleSink {
 
     fn close(&mut self) {
         if let Some(stream) = self.stream.take() {
+            // SAFETY: `.take()` clears `self.stream` before `pa_simple_free`, guaranteeing the
+            // non-null stream is freed at most once across repeated `close()` calls and `Drop`,
+            // while `self.api` remains loaded until after `Drop::drop` completes.
             unsafe {
                 (self.api.pa_simple_free)(stream.as_ptr());
             }
@@ -359,6 +376,37 @@ mod tests {
         assert!(!sink.is_open());
         assert_eq!(sink.current_spec(), None);
         assert!(sink.api.pa_strerror.is_some());
+    }
+
+    #[test]
+    fn pulse_sink_is_send_and_not_sync() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PulseSimpleSink>();
+
+        #[allow(dead_code)]
+        trait NotSyncGuard1 {
+            fn assert_not_sync() {}
+        }
+        impl<T: Sync + ?Sized> NotSyncGuard1 for T {}
+
+        trait NotSyncGuard2 {
+            fn assert_not_sync() {}
+        }
+        impl<T: ?Sized> NotSyncGuard2 for T {}
+
+        // Compiles only when `PulseSimpleSink: !Sync` (otherwise `E0034` ambiguity).
+        PulseSimpleSink::assert_not_sync();
+    }
+
+    #[test]
+    fn close_and_idle_controls_are_idempotent() {
+        let mut sink = PulseSimpleSink::new().expect("libpulse-simple.so.0 should load on host");
+        sink.flush().unwrap();
+        sink.drain().unwrap();
+        sink.close();
+        sink.close();
+        assert!(!sink.is_open());
+        assert_eq!(sink.current_spec(), None);
     }
 
     #[test]

@@ -32,6 +32,12 @@ pub enum TermusicError {
 
     #[error("{0}")]
     NotInitialized(String),
+
+    #[error("download error: {0}")]
+    Download(String),
+
+    #[error("async task error: {0}")]
+    Async(String),
 }
 
 pub type Result<T> = std::result::Result<T, TermusicError>;

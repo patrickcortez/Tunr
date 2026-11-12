@@ -4,8 +4,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
+use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +14,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
+use tokio::signal::unix::{Signal, SignalKind, signal as unix_signal};
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 
 use crate::error::{Result, TermusicError};
 use crate::ipc::{self, IpcRequest, PlayMode, PlaybackState, PlaybackStatus, TargetKind};
@@ -22,6 +27,7 @@ use crate::paths::AppPaths;
 const SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const SEEK_STEP_SECS: f64 = 5.0;
 const STATUS_TTL: Duration = Duration::from_secs(5);
+const STOP_ON_QUIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Active UI pane receiving navigation and selection keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,21 +51,55 @@ struct StatusMessage {
     expires_at: Option<Instant>,
 }
 
-trait IpcClient {
-    fn send(&mut self, paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus>;
-    fn ensure_and_send(&mut self, paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus>;
+/// Asynchronous or blocking side effects emitted by [`TuiApp`] for the async runtime driver.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TuiEffect {
+    PollStatus {
+        generation: u64,
+    },
+    EnsureAndSend {
+        generation: u64,
+        request: IpcRequest,
+    },
+    SendControl {
+        generation: u64,
+        request: IpcRequest,
+    },
+    StopOnQuit {
+        generation: u64,
+    },
+    CheckLibraryReload {
+        generation: u64,
+        known_stamp: Option<(SystemTime, u64)>,
+    },
+    DeleteTarget {
+        generation: u64,
+        target: ConfirmDelete,
+    },
 }
 
-struct RealIpcClient;
-
-impl IpcClient for RealIpcClient {
-    fn send(&mut self, paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus> {
-        ipc::send_request(paths, req)
-    }
-
-    fn ensure_and_send(&mut self, paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus> {
-        ipc::ensure_daemon_and_send(paths, req)
-    }
+/// Completion events delivered back into [`TuiApp::apply_event`] from worker tasks.
+#[derive(Debug)]
+pub enum TuiEvent {
+    StatusPolled {
+        generation: u64,
+        result: Result<PlaybackStatus>,
+    },
+    ActionCompleted {
+        generation: u64,
+        is_play: bool,
+        result: Result<PlaybackStatus>,
+    },
+    LibraryChecked {
+        generation: u64,
+        observed_stamp: Option<(SystemTime, u64)>,
+        result: Result<Option<Library>>,
+    },
+    DeleteFinished {
+        generation: u64,
+        result: Result<(Library, Option<(SystemTime, u64)>, DeleteOutcome)>,
+    },
+    WorkerError(String),
 }
 
 struct TerminalGuard;
@@ -71,9 +111,22 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Stateful model and renderer for the interactive Termusic terminal interface.
+struct AbortGuard(JoinHandle<()>);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct QueuedIpcAction {
+    generation: u64,
+    ensure_daemon: bool,
+    request: IpcRequest,
+}
+
+/// Synchronous state machine and renderer for the interactive Termusic terminal interface.
 pub struct TuiApp {
-    paths: AppPaths,
     library: Library,
     library_stamp: Option<(SystemTime, u64)>,
     focus: FocusPane,
@@ -85,23 +138,30 @@ pub struct TuiApp {
     confirm_delete: Option<ConfirmDelete>,
     status_message: Option<StatusMessage>,
     should_quit: bool,
-    ipc: Box<dyn IpcClient>,
+    status_gen: u64,
+    min_status_gen: u64,
+    applied_status_gen: u64,
+    poll_in_flight: bool,
+    action_in_flight: usize,
+    library_gen: u64,
+    reload_in_flight: bool,
+    delete_in_flight: bool,
+    effects: Vec<TuiEffect>,
 }
 
 impl TuiApp {
-    /// Create a new TUI state backed by the real library file and Unix socket IPC client.
+    /// Load library state synchronously and build a [`TuiApp`].
+    ///
+    /// Async callers such as [`run_tui`] should prefer loading off-thread via `spawn_blocking`
+    /// and calling [`TuiApp::from_loaded`].
     pub fn new(paths: AppPaths) -> Result<Self> {
         let library = Library::load(&paths.library_path)?;
         let library_stamp = file_stamp(&paths.library_path);
-        Ok(Self::build(paths, library, library_stamp, Box::new(RealIpcClient)))
+        Ok(Self::from_loaded(library, library_stamp))
     }
 
-    fn build(
-        paths: AppPaths,
-        library: Library,
-        library_stamp: Option<(SystemTime, u64)>,
-        ipc: Box<dyn IpcClient>,
-    ) -> Self {
+    /// Construct a [`TuiApp`] from pre-loaded library contents and file metadata stamp.
+    pub fn from_loaded(library: Library, library_stamp: Option<(SystemTime, u64)>) -> Self {
         let mut playlist_state = ListState::default();
         playlist_state.select(Some(0));
 
@@ -111,7 +171,6 @@ impl TuiApp {
         }
 
         Self {
-            paths,
             library,
             library_stamp,
             focus: FocusPane::Playlists,
@@ -123,7 +182,15 @@ impl TuiApp {
             confirm_delete: None,
             status_message: None,
             should_quit: false,
-            ipc,
+            status_gen: 0,
+            min_status_gen: 0,
+            applied_status_gen: 0,
+            poll_in_flight: false,
+            action_in_flight: 0,
+            library_gen: 0,
+            reload_in_flight: false,
+            delete_in_flight: false,
+            effects: Vec::new(),
         }
     }
 
@@ -174,52 +241,159 @@ impl TuiApp {
         }
     }
 
-    /// Reload `library.json` from disk if its modification timestamp or byte size changed externally.
-    pub fn reload_library_if_changed(&mut self) {
-        let current_stamp = file_stamp(&self.paths.library_path);
-        if current_stamp == self.library_stamp {
-            return;
-        }
-
-        let prev_playlist_name = self.selected_playlist_name();
-        let prev_track_id = self.selected_track().map(|s| s.id);
-        let prev_track_idx = self.track_state.selected();
-
-        match Library::load(&self.paths.library_path) {
-            Ok(new_lib) => {
-                self.library = new_lib;
-                self.library_stamp = current_stamp;
-                self.restore_selection(prev_playlist_name.as_deref(), prev_track_id.as_deref(), prev_track_idx);
-            }
-            Err(err) => {
-                self.library_stamp = current_stamp;
-                self.set_message(format!("Library reload failed: {err}"), true);
-            }
-        }
+    /// Drain all pending outbound side effects queued since the last drain.
+    pub fn take_effects(&mut self) -> Vec<TuiEffect> {
+        std::mem::take(&mut self.effects)
     }
 
-    /// Query daemon playback status, treating an absent daemon cleanly as `Stopped`.
-    pub fn poll_status(&mut self) {
-        match self.ipc.send(&self.paths, &IpcRequest::GetStatus) {
-            Ok(status) => {
-                if !self.mode_locked && status.state != PlaybackState::Stopped {
-                    self.mode = status.mode;
-                    self.mode_locked = true;
+    /// Request exit from the TUI event loop without stopping playback daemon.
+    pub fn request_quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// Schedule a deduplicated background `library.json` metadata check/reload.
+    ///
+    /// Skips emitting an effect if a reload check or delete transaction is already in flight.
+    pub fn request_library_check(&mut self) {
+        if self.reload_in_flight || self.delete_in_flight || self.should_quit {
+            return;
+        }
+        self.reload_in_flight = true;
+        self.library_gen = self.library_gen.saturating_add(1);
+        self.effects.push(TuiEffect::CheckLibraryReload {
+            generation: self.library_gen,
+            known_stamp: self.library_stamp,
+        });
+    }
+
+    /// Schedule a deduplicated background `GetStatus` IPC poll.
+    ///
+    /// Skips emitting an effect while another `GetStatus` poll or playback command is in flight.
+    pub fn request_poll_status(&mut self) {
+        if self.poll_in_flight || self.action_in_flight > 0 || self.should_quit {
+            return;
+        }
+        self.poll_in_flight = true;
+        let generation = self.next_status_gen();
+        self.effects.push(TuiEffect::PollStatus { generation });
+    }
+
+    /// Apply an asynchronous worker completion event to the UI state.
+    pub fn apply_event(&mut self, event: TuiEvent) {
+        match event {
+            TuiEvent::StatusPolled { generation, result } => {
+                self.poll_in_flight = false;
+                if generation < self.min_status_gen
+                    || generation <= self.applied_status_gen
+                    || self.action_in_flight > 0
+                {
+                    return;
                 }
-                self.status = status;
+                self.applied_status_gen = generation;
+                match result {
+                    Ok(status) => self.apply_live_status(status, false),
+                    Err(err) if is_daemon_offline_error(&err) => {
+                        self.reset_status_stopped();
+                    }
+                    Err(err) => {
+                        self.reset_status_stopped();
+                        self.set_message(format!("Status error: {err}"), true);
+                    }
+                }
             }
-            Err(err) if is_daemon_offline_error(&err) => {
-                self.status = PlaybackStatus {
-                    mode: self.mode,
-                    ..PlaybackStatus::default()
-                };
+            TuiEvent::ActionCompleted {
+                generation,
+                is_play,
+                result,
+            } => {
+                self.action_in_flight = self.action_in_flight.saturating_sub(1);
+                if generation <= self.applied_status_gen {
+                    return;
+                }
+                self.applied_status_gen = generation;
+                match result {
+                    Ok(status) => self.apply_live_status(status, true),
+                    Err(err) if !is_play && is_daemon_offline_error(&err) => {
+                        self.reset_status_stopped();
+                        self.set_message("Playback daemon is not running.", false);
+                    }
+                    Err(err) => {
+                        let prefix = if is_play { "Play failed: " } else { "" };
+                        self.set_message(format!("{prefix}{err}"), true);
+                    }
+                }
             }
-            Err(err) => {
-                self.status = PlaybackStatus {
-                    mode: self.mode,
-                    ..PlaybackStatus::default()
-                };
-                self.set_message(format!("Status error: {err}"), true);
+            TuiEvent::LibraryChecked {
+                generation,
+                observed_stamp,
+                result,
+            } => {
+                self.reload_in_flight = false;
+                if self.delete_in_flight || generation < self.library_gen {
+                    return;
+                }
+                match result {
+                    Ok(None) => {}
+                    Ok(Some(new_lib)) => {
+                        let prev_playlist_name = self.selected_playlist_name();
+                        let prev_track_id = self.selected_track().map(|s| s.id);
+                        let prev_track_idx = self.track_state.selected();
+                        self.library = new_lib;
+                        self.library_stamp = observed_stamp;
+                        self.restore_selection(
+                            prev_playlist_name.as_deref(),
+                            prev_track_id.as_deref(),
+                            prev_track_idx,
+                        );
+                    }
+                    Err(err) => {
+                        self.library_stamp = observed_stamp;
+                        self.set_message(format!("Library reload failed: {err}"), true);
+                    }
+                }
+            }
+            TuiEvent::DeleteFinished { generation, result } => {
+                self.delete_in_flight = false;
+                if generation < self.library_gen {
+                    return;
+                }
+                match result {
+                    Ok((new_lib, new_stamp, outcome)) => {
+                        let prev_playlist_name = self.selected_playlist_name();
+                        let prev_track_id = self.selected_track().map(|s| s.id);
+                        let prev_track_idx = self.track_state.selected();
+                        self.library = new_lib;
+                        self.library_stamp = new_stamp;
+                        self.restore_selection(
+                            prev_playlist_name.as_deref(),
+                            prev_track_id.as_deref(),
+                            prev_track_idx,
+                        );
+                        match outcome {
+                            DeleteOutcome::Song(song) => {
+                                self.set_message(
+                                    format!("Removed song '{}' from library.", song.title),
+                                    false,
+                                );
+                            }
+                            DeleteOutcome::Playlist(pl) => {
+                                self.set_message(
+                                    format!("Deleted playlist '{}'.", pl.name),
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.set_message(format!("Delete failed: {err}"), true);
+                    }
+                }
+            }
+            TuiEvent::WorkerError(msg) => {
+                self.poll_in_flight = false;
+                self.reload_in_flight = false;
+                self.delete_in_flight = false;
+                self.set_message(msg, true);
             }
         }
     }
@@ -278,12 +452,10 @@ impl TuiApp {
                 self.should_quit = true;
             }
             KeyCode::Char('Q') => {
-                match self.ipc.send(&self.paths, &IpcRequest::Stop) {
-                    Ok(status) => self.status = status,
-                    Err(err) if is_daemon_offline_error(&err) => {}
-                    Err(_) => {}
-                }
+                let generation = self.next_status_gen();
+                self.min_status_gen = generation;
                 self.should_quit = true;
+                self.effects.push(TuiEffect::StopOnQuit { generation });
             }
             _ => {}
         }
@@ -418,40 +590,29 @@ impl TuiApp {
         start_index: Option<usize>,
         playlist_name: Option<String>,
     ) {
-        let req = IpcRequest::Play {
+        let request = IpcRequest::Play {
             queue,
             start_index,
             mode: self.mode,
             playlist_name,
         };
-        match self.ipc.ensure_and_send(&self.paths, &req) {
-            Ok(status) => {
-                self.status = status;
-                self.status_message = None;
-            }
-            Err(err) => {
-                self.set_message(format!("Play failed: {err}"), true);
-            }
-        }
+        let generation = self.next_status_gen();
+        self.min_status_gen = generation;
+        self.action_in_flight = self.action_in_flight.saturating_add(1);
+        self.effects.push(TuiEffect::EnsureAndSend {
+            generation,
+            request,
+        });
     }
 
-    fn send_control(&mut self, req: IpcRequest) {
-        match self.ipc.send(&self.paths, &req) {
-            Ok(status) => {
-                self.status = status;
-                self.status_message = None;
-            }
-            Err(err) if is_daemon_offline_error(&err) => {
-                self.status = PlaybackStatus {
-                    mode: self.mode,
-                    ..PlaybackStatus::default()
-                };
-                self.set_message("Playback daemon is not running.", false);
-            }
-            Err(err) => {
-                self.set_message(format!("{err}"), true);
-            }
-        }
+    fn send_control(&mut self, request: IpcRequest) {
+        let generation = self.next_status_gen();
+        self.min_status_gen = generation;
+        self.action_in_flight = self.action_in_flight.saturating_add(1);
+        self.effects.push(TuiEffect::SendControl {
+            generation,
+            request,
+        });
     }
 
     fn toggle_mode(&mut self) {
@@ -464,6 +625,10 @@ impl TuiApp {
     }
 
     fn open_delete_modal(&mut self) {
+        if self.delete_in_flight {
+            self.set_message("Delete already in progress.", false);
+            return;
+        }
         match self.focus {
             FocusPane::Tracks => {
                 let Some(song) = self.selected_track() else {
@@ -495,39 +660,44 @@ impl TuiApp {
     }
 
     fn execute_pending_delete(&mut self) {
+        if self.delete_in_flight {
+            return;
+        }
         let Some(pending) = self.confirm_delete.take() else {
             return;
         };
 
-        let prev_playlist_name = self.selected_playlist_name();
-        let prev_track_id = self.selected_track().map(|s| s.id);
-        let prev_track_idx = self.track_state.selected();
+        self.delete_in_flight = true;
+        self.library_gen = self.library_gen.saturating_add(1);
+        let generation = self.library_gen;
+        self.set_message(format!("Deleting '{}'...", pending.label), false);
+        self.effects.push(TuiEffect::DeleteTarget {
+            generation,
+            target: pending,
+        });
+    }
 
-        match self.library.delete_target(&pending.query, pending.kind) {
-            Ok(outcome) => {
-                if let Err(err) = self.library.save(&self.paths.library_path) {
-                    self.set_message(format!("Save failed: {err}"), true);
-                    return;
-                }
-                self.library_stamp = file_stamp(&self.paths.library_path);
-                self.restore_selection(
-                    prev_playlist_name.as_deref(),
-                    prev_track_id.as_deref(),
-                    prev_track_idx,
-                );
-                match outcome {
-                    DeleteOutcome::Song(song) => {
-                        self.set_message(format!("Removed song '{}' from library.", song.title), false);
-                    }
-                    DeleteOutcome::Playlist(pl) => {
-                        self.set_message(format!("Deleted playlist '{}'.", pl.name), false);
-                    }
-                }
-            }
-            Err(err) => {
-                self.set_message(format!("Delete failed: {err}"), true);
-            }
+    fn next_status_gen(&mut self) -> u64 {
+        self.status_gen = self.status_gen.saturating_add(1);
+        self.status_gen
+    }
+
+    fn apply_live_status(&mut self, status: PlaybackStatus, clear_message: bool) {
+        if !self.mode_locked && status.state != PlaybackState::Stopped {
+            self.mode = status.mode;
+            self.mode_locked = true;
         }
+        self.status = status;
+        if clear_message {
+            self.status_message = None;
+        }
+    }
+
+    fn reset_status_stopped(&mut self) {
+        self.status = PlaybackStatus {
+            mode: self.mode,
+            ..PlaybackStatus::default()
+        };
     }
 
     fn playlist_count(&self) -> usize {
@@ -985,9 +1155,18 @@ impl TuiApp {
 }
 
 /// Launch the interactive ratatui TUI on the current terminal.
-pub fn run_tui(paths: &AppPaths) -> Result<()> {
-    let mut app = TuiApp::new(paths.clone())?;
-    app.poll_status();
+pub async fn run_tui(paths: &AppPaths) -> Result<()> {
+    let lib_path = paths.library_path.clone();
+    let (library, library_stamp) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let library = Library::load(&lib_path)?;
+        let stamp = file_stamp(&lib_path);
+        Ok((library, stamp))
+    })
+    .await
+    .map_err(|err| TermusicError::Async(format!("failed to load library: {err}")))??;
+
+    let mut app = TuiApp::from_loaded(library, library_stamp);
+    app.request_poll_status();
 
     let mut terminal = match ratatui::try_init() {
         Ok(term) => term,
@@ -998,32 +1177,292 @@ pub fn run_tui(paths: &AppPaths) -> Result<()> {
     };
     let _guard = TerminalGuard;
 
-    let mut last_sync = Instant::now();
+    let mut sigint = unix_signal(SignalKind::interrupt())?;
+    let mut sigterm = unix_signal(SignalKind::terminate())?;
 
-    while !app.should_quit {
+    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<TuiEvent>();
+    let (action_tx, action_rx) = mpsc::unbounded_channel::<QueuedIpcAction>();
+    let action_worker = tokio::spawn(run_ipc_action_worker(
+        paths.clone(),
+        action_rx,
+        worker_tx.clone(),
+    ));
+    let action_guard = AbortGuard(action_worker);
+    let mut background_tasks = JoinSet::new();
+
+    // Create EventStream after TerminalGuard so EventStream drops before raw mode restores.
+    let mut events = EventStream::new();
+
+    let mut stop_on_quit = dispatch_effects(
+        paths,
+        app.take_effects(),
+        &worker_tx,
+        &action_tx,
+        &mut background_tasks,
+    );
+
+    let first_tick = tokio::time::Instant::now() + SYNC_INTERVAL;
+    let mut sync_interval = tokio::time::interval_at(first_tick, SYNC_INTERVAL);
+    sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    while !app.should_quit() {
         terminal.draw(|frame| app.render(frame))?;
 
-        let timeout = SYNC_INTERVAL.saturating_sub(last_sync.elapsed());
-        if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app.handle_key(key);
+        tokio::select! {
+            maybe_ev = events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        app.handle_key(key);
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {}
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(err.into()),
+                    None => app.request_quit(),
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
+            }
+            _ = sync_interval.tick() => {
+                app.clear_expired_message();
+                app.request_library_check();
+                app.request_poll_status();
+            }
+            Some(worker_ev) = worker_rx.recv() => {
+                app.apply_event(worker_ev);
+                while let Ok(more) = worker_rx.try_recv() {
+                    app.apply_event(more);
+                }
+            }
+            Some(join_res) = background_tasks.join_next(), if !background_tasks.is_empty() => {
+                if let Err(err) = join_res
+                    && !err.is_cancelled()
+                {
+                    app.apply_event(TuiEvent::WorkerError(format!(
+                        "background worker failed: {err}"
+                    )));
+                }
+            }
+            _ = sigint.recv() => {
+                app.request_quit();
+            }
+            _ = sigterm.recv() => {
+                app.request_quit();
             }
         }
 
-        if last_sync.elapsed() >= SYNC_INTERVAL {
-            app.reload_library_if_changed();
-            app.poll_status();
-            app.clear_expired_message();
-            last_sync = Instant::now();
+        if dispatch_effects(
+            paths,
+            app.take_effects(),
+            &worker_tx,
+            &action_tx,
+            &mut background_tasks,
+        ) {
+            stop_on_quit = true;
         }
     }
 
+    drop(events);
+    drop(action_guard);
+    background_tasks.abort_all();
+    while background_tasks.join_next().await.is_some() {}
+
     let _ = terminal.show_cursor();
+    drop(_guard);
+
+    if stop_on_quit {
+        stop_daemon_on_quit(paths, &mut sigint, &mut sigterm).await?;
+    }
+
     Ok(())
+}
+
+fn dispatch_effects(
+    paths: &AppPaths,
+    effects: Vec<TuiEffect>,
+    worker_tx: &mpsc::UnboundedSender<TuiEvent>,
+    action_tx: &mpsc::UnboundedSender<QueuedIpcAction>,
+    background_tasks: &mut JoinSet<()>,
+) -> bool {
+    let mut stop_on_quit = false;
+    for effect in effects {
+        match effect {
+            TuiEffect::PollStatus { generation } => {
+                let paths = paths.clone();
+                let tx = worker_tx.clone();
+                background_tasks.spawn(async move {
+                    let result = ipc::send_request(&paths, &IpcRequest::GetStatus).await;
+                    let _ = tx.send(TuiEvent::StatusPolled { generation, result });
+                });
+            }
+            TuiEffect::EnsureAndSend {
+                generation,
+                request,
+            } => {
+                if action_tx
+                    .send(QueuedIpcAction {
+                        generation,
+                        ensure_daemon: true,
+                        request,
+                    })
+                    .is_err()
+                {
+                    let _ = worker_tx.send(TuiEvent::ActionCompleted {
+                        generation,
+                        is_play: true,
+                        result: Err(TermusicError::Async(
+                            "playback action worker unavailable".to_string(),
+                        )),
+                    });
+                }
+            }
+            TuiEffect::SendControl {
+                generation,
+                request,
+            } => {
+                if action_tx
+                    .send(QueuedIpcAction {
+                        generation,
+                        ensure_daemon: false,
+                        request,
+                    })
+                    .is_err()
+                {
+                    let _ = worker_tx.send(TuiEvent::ActionCompleted {
+                        generation,
+                        is_play: false,
+                        result: Err(TermusicError::Async(
+                            "playback action worker unavailable".to_string(),
+                        )),
+                    });
+                }
+            }
+            TuiEffect::StopOnQuit { .. } => {
+                stop_on_quit = true;
+            }
+            TuiEffect::CheckLibraryReload {
+                generation,
+                known_stamp,
+            } => {
+                let lib_path = paths.library_path.clone();
+                let tx = worker_tx.clone();
+                background_tasks.spawn(async move {
+                    let ev = match tokio::task::spawn_blocking(move || {
+                        check_library_reload_blocking(&lib_path, known_stamp)
+                    })
+                    .await
+                    {
+                        Ok((observed_stamp, result)) => TuiEvent::LibraryChecked {
+                            generation,
+                            observed_stamp,
+                            result,
+                        },
+                        Err(join_err) => TuiEvent::LibraryChecked {
+                            generation,
+                            observed_stamp: known_stamp,
+                            result: Err(TermusicError::Async(format!(
+                                "library reload task failed: {join_err}"
+                            ))),
+                        },
+                    };
+                    let _ = tx.send(ev);
+                });
+            }
+            TuiEffect::DeleteTarget { generation, target } => {
+                let lib_path = paths.library_path.clone();
+                let tx = worker_tx.clone();
+                background_tasks.spawn(async move {
+                    let result = match tokio::task::spawn_blocking(move || {
+                        execute_delete_blocking(&lib_path, &target)
+                    })
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(join_err) => Err(TermusicError::Async(format!(
+                            "delete task failed: {join_err}"
+                        ))),
+                    };
+                    let _ = tx.send(TuiEvent::DeleteFinished { generation, result });
+                });
+            }
+        }
+    }
+    stop_on_quit
+}
+
+async fn run_ipc_action_worker(
+    paths: AppPaths,
+    mut rx: mpsc::UnboundedReceiver<QueuedIpcAction>,
+    worker_tx: mpsc::UnboundedSender<TuiEvent>,
+) {
+    while let Some(action) = rx.recv().await {
+        let result = if action.ensure_daemon {
+            ipc::ensure_daemon_and_send(&paths, &action.request).await
+        } else {
+            ipc::send_request(&paths, &action.request).await
+        };
+        if worker_tx
+            .send(TuiEvent::ActionCompleted {
+                generation: action.generation,
+                is_play: action.ensure_daemon,
+                result,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+async fn stop_daemon_on_quit(
+    paths: &AppPaths,
+    sigint: &mut Signal,
+    sigterm: &mut Signal,
+) -> Result<()> {
+    let stop_fut = tokio::time::timeout(
+        STOP_ON_QUIT_TIMEOUT,
+        ipc::send_request(paths, &IpcRequest::Stop),
+    );
+    tokio::select! {
+        res = stop_fut => match res {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) if is_daemon_offline_error(&err) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(TermusicError::Ipc(
+                "timed out waiting for daemon stop".to_string(),
+            )),
+        },
+        _ = sigint.recv() => Ok(()),
+        _ = sigterm.recv() => Ok(()),
+    }
+}
+
+fn check_library_reload_blocking(
+    lib_path: &Path,
+    known_stamp: Option<(SystemTime, u64)>,
+) -> (Option<(SystemTime, u64)>, Result<Option<Library>>) {
+    let current_stamp = file_stamp(lib_path);
+    if current_stamp == known_stamp {
+        return (current_stamp, Ok(None));
+    }
+    match Library::load(lib_path) {
+        Ok(lib) => (current_stamp, Ok(Some(lib))),
+        Err(err) => (current_stamp, Err(err)),
+    }
+}
+
+fn execute_delete_blocking(
+    lib_path: &Path,
+    target: &ConfirmDelete,
+) -> Result<(Library, Option<(SystemTime, u64)>, DeleteOutcome)> {
+    let mut updated_library = None;
+    let outcome = Library::update(lib_path, |lib| {
+        let outcome = lib.delete_target(&target.query, target.kind)?;
+        updated_library = Some(lib.clone());
+        Ok(outcome)
+    })?;
+    let stamp = file_stamp(lib_path);
+    let library = updated_library.ok_or_else(|| {
+        TermusicError::Async("delete transaction completed without updated library".to_string())
+    })?;
+    Ok((library, stamp, outcome))
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -1050,7 +1489,12 @@ fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
 
 fn is_daemon_offline_error(err: &TermusicError) -> bool {
     match err {
-        TermusicError::Ipc(_) => true,
+        TermusicError::Ipc(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("not running")
+                || lower.contains("no such file")
+                || lower.contains("connection refused")
+        }
         TermusicError::Io(io_err) => matches!(
             io_err.kind(),
             io::ErrorKind::NotFound
@@ -1112,9 +1556,7 @@ fn format_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::rc::Rc;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1130,33 +1572,17 @@ mod tests {
         offline: bool,
     }
 
-    struct MockIpcClient {
-        state: Rc<RefCell<MockState>>,
-    }
-
-    impl MockIpcClient {
-        fn new(state: Rc<RefCell<MockState>>) -> Self {
-            Self { state }
-        }
-    }
-
-    impl IpcClient for MockIpcClient {
-        fn send(&mut self, _paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus> {
-            let mut st = self.state.borrow_mut();
-            st.requests.push(req.clone());
-            if st.offline {
+    impl MockState {
+        fn handle_send(&mut self, req: &IpcRequest) -> Result<PlaybackStatus> {
+            self.requests.push(req.clone());
+            if self.offline {
                 return Err(TermusicError::Ipc("daemon not running".to_string()));
             }
-            Ok(st.next_status.clone().unwrap_or_default())
+            Ok(self.next_status.clone().unwrap_or_default())
         }
 
-        fn ensure_and_send(
-            &mut self,
-            _paths: &AppPaths,
-            req: &IpcRequest,
-        ) -> Result<PlaybackStatus> {
-            let mut st = self.state.borrow_mut();
-            st.requests.push(req.clone());
+        fn handle_ensure(&mut self, req: &IpcRequest) -> Result<PlaybackStatus> {
+            self.requests.push(req.clone());
             if let IpcRequest::Play {
                 queue,
                 start_index,
@@ -1177,10 +1603,62 @@ mod tests {
                     duration_secs: queue.get(idx).and_then(|s| s.duration_secs),
                     queue: queue.clone(),
                 };
-                st.next_status = Some(status.clone());
+                self.next_status = Some(status.clone());
                 return Ok(status);
             }
-            Ok(st.next_status.clone().unwrap_or_default())
+            Ok(self.next_status.clone().unwrap_or_default())
+        }
+    }
+
+    fn drive_effects(app: &mut TuiApp, paths: &AppPaths, mock: &mut MockState) {
+        for effect in app.take_effects() {
+            match effect {
+                TuiEffect::PollStatus { generation } => {
+                    let result = mock.handle_send(&IpcRequest::GetStatus);
+                    app.apply_event(TuiEvent::StatusPolled { generation, result });
+                }
+                TuiEffect::EnsureAndSend {
+                    generation,
+                    request,
+                } => {
+                    let result = mock.handle_ensure(&request);
+                    app.apply_event(TuiEvent::ActionCompleted {
+                        generation,
+                        is_play: true,
+                        result,
+                    });
+                }
+                TuiEffect::SendControl {
+                    generation,
+                    request,
+                } => {
+                    let result = mock.handle_send(&request);
+                    app.apply_event(TuiEvent::ActionCompleted {
+                        generation,
+                        is_play: false,
+                        result,
+                    });
+                }
+                TuiEffect::StopOnQuit { .. } => {
+                    let _ = mock.handle_send(&IpcRequest::Stop);
+                }
+                TuiEffect::CheckLibraryReload {
+                    generation,
+                    known_stamp,
+                } => {
+                    let (observed_stamp, result) =
+                        check_library_reload_blocking(&paths.library_path, known_stamp);
+                    app.apply_event(TuiEvent::LibraryChecked {
+                        generation,
+                        observed_stamp,
+                        result,
+                    });
+                }
+                TuiEffect::DeleteTarget { generation, target } => {
+                    let result = execute_delete_blocking(&paths.library_path, &target);
+                    app.apply_event(TuiEvent::DeleteFinished { generation, result });
+                }
+            }
         }
     }
 
@@ -1233,8 +1711,8 @@ mod tests {
     fn navigation_filtering_and_enter_behavior() {
         let (root, paths) = temp_paths("nav");
         let lib = sample_library();
-        let mock = Rc::new(RefCell::new(MockState::default()));
-        let mut app = TuiApp::build(paths, lib, None, Box::new(MockIpcClient::new(mock.clone())));
+        let mut mock = MockState::default();
+        let mut app = TuiApp::from_loaded(lib, None);
 
         assert_eq!(app.focus(), FocusPane::Playlists);
         assert_eq!(app.selected_playlist_index(), 0);
@@ -1267,24 +1745,22 @@ mod tests {
         assert_eq!(app.focus(), FocusPane::Tracks);
         assert_eq!(app.selected_track_index(), Some(0));
 
-        // Navigate down inside Tracks and press Enter -> sends Play for second song in Chill.
+        // Navigate down inside Tracks and press Enter -> emits Play for second song in Chill.
         app.handle_key(press(KeyCode::Down));
         assert_eq!(app.selected_track_index(), Some(1));
         app.handle_key(press(KeyCode::Enter));
+        drive_effects(&mut app, &paths, &mut mock);
 
-        {
-            let recorded = &mock.borrow().requests;
-            assert_eq!(recorded.len(), 1);
-            assert_eq!(
-                recorded[0],
-                IpcRequest::Play {
-                    queue: chill_tracks,
-                    start_index: Some(1),
-                    mode: PlayMode::Next,
-                    playlist_name: Some("Chill".to_string()),
-                }
-            );
-        }
+        assert_eq!(mock.requests.len(), 1);
+        assert_eq!(
+            mock.requests[0],
+            IpcRequest::Play {
+                queue: chill_tracks,
+                start_index: Some(1),
+                mode: PlayMode::Next,
+                playlist_name: Some("Chill".to_string()),
+            }
+        );
 
         // Left switches focus back to Playlists; Right returns to Tracks.
         app.handle_key(press(KeyCode::Left));
@@ -1309,8 +1785,8 @@ mod tests {
     fn mode_toggle_and_playback_controls() {
         let (root, paths) = temp_paths("controls");
         let lib = sample_library();
-        let mock = Rc::new(RefCell::new(MockState::default()));
-        let mut app = TuiApp::build(paths, lib, None, Box::new(MockIpcClient::new(mock.clone())));
+        let mut mock = MockState::default();
+        let mut app = TuiApp::from_loaded(lib, None);
 
         assert_eq!(app.mode(), PlayMode::Next);
         app.handle_key(press(KeyCode::Char('s')));
@@ -1329,10 +1805,11 @@ mod tests {
         app.handle_key(press(KeyCode::Char('p')));
         app.handle_key(press(KeyCode::Char('Q')));
 
+        drive_effects(&mut app, &paths, &mut mock);
+
         assert!(app.should_quit());
-        let recorded = &mock.borrow().requests;
         assert!(matches!(
-            &recorded[0],
+            &mock.requests[0],
             IpcRequest::Play {
                 start_index: None,
                 mode: PlayMode::Shuffle,
@@ -1340,13 +1817,13 @@ mod tests {
                 queue,
             } if queue.len() == 3
         ));
-        assert_eq!(recorded[1], IpcRequest::TogglePause);
-        assert_eq!(recorded[2], IpcRequest::Next);
-        assert_eq!(recorded[3], IpcRequest::Prev);
-        assert_eq!(recorded[4], IpcRequest::SeekRelative(-5.0));
-        assert_eq!(recorded[5], IpcRequest::SeekRelative(5.0));
+        assert_eq!(mock.requests[1], IpcRequest::TogglePause);
+        assert_eq!(mock.requests[2], IpcRequest::Next);
+        assert_eq!(mock.requests[3], IpcRequest::Prev);
+        assert_eq!(mock.requests[4], IpcRequest::SeekRelative(-5.0));
+        assert_eq!(mock.requests[5], IpcRequest::SeekRelative(5.0));
         assert!(matches!(
-            &recorded[6],
+            &mock.requests[6],
             IpcRequest::Play {
                 start_index: Some(1),
                 mode: PlayMode::Shuffle,
@@ -1354,7 +1831,7 @@ mod tests {
                 queue,
             } if queue.len() == 3
         ));
-        assert_eq!(recorded[7], IpcRequest::Stop);
+        assert_eq!(mock.requests[7], IpcRequest::Stop);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1362,24 +1839,21 @@ mod tests {
     #[test]
     fn offline_daemon_poll_shows_stopped_and_q_quits_without_stop() {
         let (root, paths) = temp_paths("offline");
-        let mock = Rc::new(RefCell::new(MockState {
+        let mut mock = MockState {
             offline: true,
             ..MockState::default()
-        }));
-        let mut app = TuiApp::build(
-            paths,
-            sample_library(),
-            None,
-            Box::new(MockIpcClient::new(mock.clone())),
-        );
+        };
+        let mut app = TuiApp::from_loaded(sample_library(), None);
 
-        app.poll_status();
+        app.request_poll_status();
+        drive_effects(&mut app, &paths, &mut mock);
         assert_eq!(app.status.state, PlaybackState::Stopped);
 
         app.handle_key(press(KeyCode::Char('q')));
+        drive_effects(&mut app, &paths, &mut mock);
         assert!(app.should_quit());
         // Only GetStatus was sent; q must not send Stop or Shutdown.
-        assert_eq!(mock.borrow().requests, vec![IpcRequest::GetStatus]);
+        assert_eq!(mock.requests, vec![IpcRequest::GetStatus]);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1391,13 +1865,8 @@ mod tests {
         lib.save(&paths.library_path).unwrap();
         let stamp = file_stamp(&paths.library_path);
 
-        let mock = Rc::new(RefCell::new(MockState::default()));
-        let mut app = TuiApp::build(
-            paths.clone(),
-            lib,
-            stamp,
-            Box::new(MockIpcClient::new(mock)),
-        );
+        let mut mock = MockState::default();
+        let mut app = TuiApp::from_loaded(lib, stamp);
 
         // 'd' on [All Songs] does not open modal.
         app.handle_key(press(KeyCode::Char('d')));
@@ -1418,22 +1887,26 @@ mod tests {
         assert!(app.confirm_delete.is_none());
         assert_eq!(app.library.playlists.len(), 2);
 
-        // Confirm delete playlist with 'y' -> removes playlist and saves library.json.
+        // Confirm delete playlist with 'y' -> emits DeleteTarget, removes playlist via Library::update.
         app.handle_key(press(KeyCode::Char('d')));
         app.handle_key(press(KeyCode::Char('y')));
         assert!(app.confirm_delete.is_none());
+        drive_effects(&mut app, &paths, &mut mock);
         assert_eq!(app.library.playlists.len(), 1);
         assert_eq!(Library::load(&paths.library_path).unwrap().playlists.len(), 1);
 
         // Simulate external CLI edit modifying library.json.
         std::thread::sleep(Duration::from_millis(20));
-        let mut external = Library::load(&paths.library_path).unwrap();
-        external
-            .songs
-            .push(sample_song("s4", "Delta Wave", Some("Artist D"), 180.0));
-        external.save(&paths.library_path).unwrap();
+        Library::update(&paths.library_path, |external| {
+            external
+                .songs
+                .push(sample_song("s4", "Delta Wave", Some("Artist D"), 180.0));
+            Ok(())
+        })
+        .unwrap();
 
-        app.reload_library_if_changed();
+        app.request_library_check();
+        drive_effects(&mut app, &paths, &mut mock);
         assert_eq!(app.library.songs.len(), 4);
 
         let _ = fs::remove_dir_all(&root);
@@ -1444,7 +1917,7 @@ mod tests {
         let (root, paths) = temp_paths("render");
         let lib = sample_library();
         let active_song = lib.songs[1].clone();
-        let mock = Rc::new(RefCell::new(MockState {
+        let mut mock = MockState {
             next_status: Some(PlaybackStatus {
                 state: PlaybackState::Playing,
                 mode: PlayMode::Next,
@@ -1457,10 +1930,11 @@ mod tests {
                 queue: vec![active_song, lib.songs[2].clone()],
             }),
             ..MockState::default()
-        }));
+        };
 
-        let mut app = TuiApp::build(paths, lib, None, Box::new(MockIpcClient::new(mock)));
-        app.poll_status();
+        let mut app = TuiApp::from_loaded(lib, None);
+        app.request_poll_status();
+        drive_effects(&mut app, &paths, &mut mock);
         app.handle_key(press(KeyCode::Char('s'))); // toggle mode to Shuffle
         app.handle_key(press(KeyCode::Right)); // focus Tracks
 
@@ -1486,5 +1960,198 @@ mod tests {
         assert!(modal_screen.contains("Alpha Dawn"), "missing delete target:\n{modal_screen}");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn emits_effects_and_deduplicates_polls_and_reloads() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+
+        // Poll deduplication while in flight.
+        app.request_poll_status();
+        app.request_poll_status();
+        let first_effects = app.take_effects();
+        assert_eq!(first_effects, vec![TuiEffect::PollStatus { generation: 1 }]);
+
+        // Reload check deduplication while in flight.
+        app.request_library_check();
+        app.request_library_check();
+        let reload_effects = app.take_effects();
+        assert_eq!(
+            reload_effects,
+            vec![TuiEffect::CheckLibraryReload {
+                generation: 1,
+                known_stamp: None,
+            }]
+        );
+
+        // Play action skips subsequent PollStatus while action is in flight.
+        app.handle_key(press(KeyCode::Char('p')));
+        app.request_poll_status();
+        let action_effects = app.take_effects();
+        assert_eq!(action_effects.len(), 1);
+        assert!(matches!(
+            action_effects[0],
+            TuiEffect::EnsureAndSend {
+                generation: 2,
+                request: IpcRequest::Play { .. },
+            }
+        ));
+
+        // Delete skips subsequent library reload check while delete is in flight.
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('y')));
+        app.request_library_check();
+        let delete_effects = app.take_effects();
+        assert_eq!(
+            delete_effects,
+            vec![TuiEffect::DeleteTarget {
+                generation: 2,
+                target: ConfirmDelete {
+                    label: "Chill".to_string(),
+                    query: "Chill".to_string(),
+                    kind: TargetKind::Playlist,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_stale_get_status_responses_across_generations() {
+        let lib = sample_library();
+        let track = lib.songs[0].clone();
+        let mut app = TuiApp::from_loaded(lib, None);
+
+        // 1. Poll starts at generation 1.
+        app.request_poll_status();
+        assert_eq!(app.take_effects(), vec![TuiEffect::PollStatus { generation: 1 }]);
+
+        // 2. Play starts at generation 2 (advancing min_status_gen = 2).
+        app.handle_key(press(KeyCode::Char('p')));
+        let effects = app.take_effects();
+        assert!(matches!(effects[0], TuiEffect::EnsureAndSend { generation: 2, .. }));
+
+        // 3. Play finishes first with Playing state.
+        let playing_status = PlaybackStatus {
+            state: PlaybackState::Playing,
+            mode: PlayMode::Next,
+            playlist_name: None,
+            current_track: Some(track.clone()),
+            queue_index: 0,
+            queue_len: 3,
+            position_secs: 1.0,
+            duration_secs: track.duration_secs,
+            queue: vec![track],
+        };
+        app.apply_event(TuiEvent::ActionCompleted {
+            generation: 2,
+            is_play: true,
+            result: Ok(playing_status),
+        });
+        assert_eq!(app.status.state, PlaybackState::Playing);
+
+        // 4. Stale GetStatus (gen 1) arrives later with Stopped -> must be rejected!
+        app.apply_event(TuiEvent::StatusPolled {
+            generation: 1,
+            result: Ok(PlaybackStatus::default()),
+        });
+        assert_eq!(app.status.state, PlaybackState::Playing);
+        assert!(app.status.current_track.is_some());
+
+        // 5. Next poll at generation 3 succeeds and updates cleanly to Paused.
+        app.request_poll_status();
+        assert_eq!(app.take_effects(), vec![TuiEffect::PollStatus { generation: 3 }]);
+        app.apply_event(TuiEvent::StatusPolled {
+            generation: 3,
+            result: Ok(PlaybackStatus {
+                state: PlaybackState::Paused,
+                ..PlaybackStatus::default()
+            }),
+        });
+        assert_eq!(app.status.state, PlaybackState::Paused);
+
+        // 6. Also reject stale poll arriving *before* an in-flight control finishes.
+        app.request_poll_status();
+        assert_eq!(app.take_effects(), vec![TuiEffect::PollStatus { generation: 4 }]);
+        app.handle_key(press(KeyCode::Char(' '))); // generation 5
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [TuiEffect::SendControl { generation: 5, request: IpcRequest::TogglePause }]
+        ));
+        app.apply_event(TuiEvent::StatusPolled {
+            generation: 4,
+            result: Ok(PlaybackStatus::default()),
+        });
+        assert_eq!(app.status.state, PlaybackState::Paused);
+
+        app.apply_event(TuiEvent::ActionCompleted {
+            generation: 5,
+            is_play: false,
+            result: Ok(PlaybackStatus {
+                state: PlaybackState::Playing,
+                ..PlaybackStatus::default()
+            }),
+        });
+        assert_eq!(app.status.state, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn rejects_stale_library_reload_when_delete_starts() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+
+        app.request_library_check();
+        assert_eq!(
+            app.take_effects(),
+            vec![TuiEffect::CheckLibraryReload {
+                generation: 1,
+                known_stamp: None,
+            }]
+        );
+
+        // Start delete (library_gen advances to 2).
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('y')));
+        let _ = app.take_effects();
+
+        // Stale reload from generation 1 tries to restore extra songs -> must be ignored!
+        let mut bloated = sample_library();
+        bloated
+            .songs
+            .push(sample_song("s99", "Stale Ghost", None, 42.0));
+        app.apply_event(TuiEvent::LibraryChecked {
+            generation: 1,
+            observed_stamp: None,
+            result: Ok(Some(bloated)),
+        });
+        assert_eq!(app.library.songs.len(), 3);
+
+        // Delete completes cleanly.
+        let mut after_delete = sample_library();
+        let outcome = after_delete.delete_target("Chill", TargetKind::Playlist).unwrap();
+        app.apply_event(TuiEvent::DeleteFinished {
+            generation: 2,
+            result: Ok((after_delete, None, outcome)),
+        });
+        assert_eq!(app.library.playlists.len(), 1);
+    }
+
+    #[test]
+    fn offline_error_classification_keeps_real_ipc_failures_visible() {
+        assert!(is_daemon_offline_error(&TermusicError::Ipc(
+            "playback daemon is not running at /tmp/x.sock".to_string()
+        )));
+        assert!(is_daemon_offline_error(&TermusicError::Io(
+            io::Error::from(io::ErrorKind::ConnectionRefused)
+        )));
+        assert!(!is_daemon_offline_error(&TermusicError::Ipc(
+            "timed out waiting for daemon stop".to_string()
+        )));
+        assert!(!is_daemon_offline_error(&TermusicError::Daemon(
+            "engine failed".to_string()
+        )));
+        assert!(!is_daemon_offline_error(&TermusicError::Io(
+            io::Error::from(io::ErrorKind::TimedOut)
+        )));
     }
 }

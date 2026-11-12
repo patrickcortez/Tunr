@@ -1,19 +1,26 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::audio::AudioSink;
 use crate::error::{Result, TermusicError};
 
+#[derive(Debug, Default)]
+struct NullSinkSpecState {
+    is_open: bool,
+    current_spec: Option<(u32, u8)>,
+    opened_specs: Vec<(u32, u8)>,
+}
+
 /// Shared thread-safe instrumentation counters for [`NullSink`].
 ///
 /// Tests can clone this `Arc<NullSinkStats>` via [`NullSink::stats`] before moving
 /// the sink into a playback thread and inspect opened stream specs, written sample
-/// counts, flushes, drains, and closes.
+/// counts, flushes, drains, and closes. Poisoned mutex guards recover via
+/// `into_inner()` rather than panicking across threads.
 #[derive(Debug, Default)]
 pub struct NullSinkStats {
-    opened_specs: Mutex<Vec<(u32, u8)>>,
-    current_spec: Mutex<Option<(u32, u8)>>,
+    state: Mutex<NullSinkSpecState>,
     is_open: AtomicBool,
     open_calls: AtomicU64,
     written_samples: AtomicU64,
@@ -29,17 +36,18 @@ impl NullSinkStats {
         Self::default()
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, NullSinkSpecState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Return all `(sample_rate, channels)` specs for which the sink opened or reopened.
     pub fn opened_specs(&self) -> Vec<(u32, u8)> {
-        self.opened_specs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.lock_state().opened_specs.clone()
     }
 
     /// Return the currently open `(sample_rate, channels)` spec, if any.
     pub fn current_spec(&self) -> Option<(u32, u8)> {
-        *self.current_spec.lock().unwrap_or_else(|e| e.into_inner())
+        self.lock_state().current_spec
     }
 
     /// Return whether the sink is currently open.
@@ -79,10 +87,8 @@ impl NullSinkStats {
 
     /// Clear recorded counters and spec history while preserving current open state.
     pub fn reset(&self) {
-        self.opened_specs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut state = self.lock_state();
+        state.opened_specs.clear();
         self.open_calls.store(0, Ordering::SeqCst);
         self.written_samples.store(0, Ordering::SeqCst);
         self.write_calls.store(0, Ordering::SeqCst);
@@ -198,25 +204,14 @@ impl AudioSink for NullSink {
         }
 
         self.stats.open_calls.fetch_add(1, Ordering::SeqCst);
-        let already_matching =
-            self.stats.is_open() && self.stats.current_spec() == Some((sample_rate, channels));
-        if already_matching {
+        let mut state = self.stats.lock_state();
+        if state.is_open && state.current_spec == Some((sample_rate, channels)) {
             return Ok(());
         }
 
-        {
-            let mut cur = self
-                .stats
-                .current_spec
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cur = Some((sample_rate, channels));
-        }
-        self.stats
-            .opened_specs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((sample_rate, channels));
+        state.current_spec = Some((sample_rate, channels));
+        state.opened_specs.push((sample_rate, channels));
+        state.is_open = true;
         self.stats.is_open.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -231,9 +226,10 @@ impl AudioSink for NullSink {
             return Ok(());
         }
 
+        let sample_count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
         self.stats
             .written_samples
-            .fetch_add(samples.len() as u64, Ordering::SeqCst);
+            .fetch_add(sample_count, Ordering::SeqCst);
         self.stats.write_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(delay) = self.pacing {
             std::thread::sleep(delay);
@@ -252,15 +248,13 @@ impl AudioSink for NullSink {
     }
 
     fn close(&mut self) {
-        if self.stats.is_open.swap(false, Ordering::SeqCst) {
+        let mut state = self.stats.lock_state();
+        self.stats.is_open.store(false, Ordering::SeqCst);
+        if state.is_open {
+            state.is_open = false;
             self.stats.close_count.fetch_add(1, Ordering::SeqCst);
         }
-        let mut cur = self
-            .stats
-            .current_spec
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *cur = None;
+        state.current_spec = None;
     }
 }
 
@@ -318,5 +312,29 @@ mod tests {
         let start = std::time::Instant::now();
         sink.write_f32(&[0.0; 16]).unwrap();
         assert!(start.elapsed() >= Duration::from_millis(4));
+    }
+
+    #[test]
+    fn poisoned_stats_mutex_does_not_panic() {
+        let mut sink = NullSink::new();
+        let stats = sink.stats();
+        let stats_for_panic = Arc::clone(&stats);
+
+        let handle = std::thread::spawn(move || {
+            let _guard = stats_for_panic.lock_state();
+            panic!("intentional mutex poison");
+        });
+        assert!(handle.join().is_err());
+
+        sink.open(44_100, 2).unwrap();
+        sink.write_f32(&[0.25; 8]).unwrap();
+        assert_eq!(stats.current_spec(), Some((44_100, 2)));
+        assert_eq!(stats.opened_specs(), vec![(44_100, 2)]);
+        sink.close();
+        sink.close();
+        assert!(!stats.is_open());
+        assert_eq!(stats.close_count(), 1);
+        stats.reset();
+        assert!(stats.opened_specs().is_empty());
     }
 }

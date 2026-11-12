@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::download::{DownloadFormat, DownloadOptions};
+use crate::download::{DownloadFormat, DownloadOptions, normalize_urls};
 use crate::error::{Result, TermusicError};
 use crate::ipc::{PlayMode, TargetKind};
 use crate::paths::AppPaths;
@@ -217,6 +217,12 @@ pub enum RawCommand {
             conflicts_with = "no_add"
         )]
         playlist_name: Option<String>,
+        /// Maximum concurrent download workers
+        #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = 4)]
+        jobs: usize,
+        /// Disable interactive TUI loading screen and print line progress
+        #[arg(long = "no-tui")]
+        no_tui: bool,
         /// One or more media URLs to download
         #[arg(value_name = "URL")]
         urls: Vec<String>,
@@ -459,8 +465,15 @@ fn validate_cli(cli: Cli) -> Result<Command> {
             no_embed_thumbnail,
             no_add,
             playlist_name,
+            jobs,
+            no_tui,
             urls,
         } => {
+            if jobs == 0 {
+                return Err(TermusicError::InvalidArg(
+                    "--jobs must be at least 1".to_string(),
+                ));
+            }
             if let Some(ref d) = dest
                 && (d.as_os_str().is_empty() || d.to_str().is_some_and(|s| s.trim().is_empty()))
             {
@@ -487,18 +500,14 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 }
                 None => None,
             };
-            if urls.iter().any(|u| u.trim().is_empty()) {
-                return Err(TermusicError::InvalidArg(
-                    "URL cannot be empty".to_string(),
-                ));
-            }
-            if urls.is_empty() && set_dest.is_none() {
+            let normalized_urls = normalize_urls(&urls)?;
+            if normalized_urls.is_empty() && set_dest.is_none() {
                 return Err(TermusicError::InvalidArg(
                     "missing URL (pass <URL...> or --set-dest <DIR>)".to_string(),
                 ));
             }
             Ok(Command::Download(DownloadOptions {
-                urls,
+                urls: normalized_urls,
                 dest,
                 set_dest,
                 format,
@@ -506,6 +515,8 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 embed_thumbnail: !no_embed_thumbnail,
                 auto_add: !no_add,
                 playlist_name: clean_playlist,
+                jobs,
+                no_tui,
             }))
         }
         RawCommand::Daemon(overrides) => Ok(Command::Daemon(overrides)),
@@ -843,6 +854,8 @@ mod tests {
                 embed_thumbnail: true,
                 auto_add: true,
                 playlist_name: None,
+                jobs: 4,
+                no_tui: false,
             })
         );
 
@@ -858,6 +871,9 @@ mod tests {
                 "--no-embed-thumbnail",
                 "-p",
                 "Favorites",
+                "--jobs",
+                "8",
+                "--no-tui",
                 "https://example.com/list",
             ])
             .unwrap(),
@@ -870,6 +886,8 @@ mod tests {
                 embed_thumbnail: false,
                 auto_add: true,
                 playlist_name: Some("Favorites".to_string()),
+                jobs: 8,
+                no_tui: true,
             })
         );
 
@@ -884,6 +902,8 @@ mod tests {
                 embed_thumbnail: true,
                 auto_add: true,
                 playlist_name: None,
+                jobs: 4,
+                no_tui: false,
             })
         );
 
@@ -894,14 +914,18 @@ mod tests {
                 "--set-dest",
                 "/tmp/saved",
                 "--no-add",
+                "-j",
+                "2",
+                "https://example.com/a https://example.com/b",
                 "https://example.com/a",
-                "https://example.com/b",
+                "https://example.com/c",
             ])
             .unwrap(),
             Command::Download(DownloadOptions {
                 urls: vec![
                     "https://example.com/a".to_string(),
                     "https://example.com/b".to_string(),
+                    "https://example.com/c".to_string(),
                 ],
                 dest: None,
                 set_dest: Some(PathBuf::from("/tmp/saved")),
@@ -910,12 +934,36 @@ mod tests {
                 embed_thumbnail: true,
                 auto_add: false,
                 playlist_name: None,
+                jobs: 2,
+                no_tui: false,
             })
         );
 
         // Missing URL without --set-dest fails.
         assert!(matches!(
             parse_cli_from(["termusic", "download"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        // --jobs 0 fails.
+        assert!(matches!(
+            parse_cli_from(["termusic", "download", "-j", "0", "https://example.com/a"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from([
+                "termusic",
+                "download",
+                "--jobs",
+                "0",
+                "https://example.com/a"
+            ]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        // Empty URL arg fails.
+        assert!(matches!(
+            parse_cli_from(["termusic", "download", "   "]),
             Err(TermusicError::InvalidArg(_))
         ));
 

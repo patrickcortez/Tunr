@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -78,25 +78,28 @@ impl AppPaths {
         uid: libc::uid_t,
     ) -> Result<Self> {
         let pointer_path = resolve_workspace_pointer_path(xdg_config_home, home_dir)?;
-        if !pointer_path.exists() {
-            return Err(TermusicError::NotInitialized(
-                NOT_INITIALIZED_MSG.to_string(),
-            ));
-        }
-
-        let pointer_raw = fs::read_to_string(&pointer_path)?;
-        let pointer: WorkspacePointer = serde_json::from_str(&pointer_raw)?;
-        let config_path = pointer.working_dir.join("config").join("config.json");
-        if !config_path.exists() {
-            return Err(TermusicError::NotInitialized(
-                NOT_INITIALIZED_MSG.to_string(),
-            ));
-        }
-
-        let cfg_raw = fs::read_to_string(&config_path)?;
-        let cfg: WorkspaceConfig = serde_json::from_str(&cfg_raw)?;
-
         let (socket_path, pid_path, log_path) = resolve_runtime_paths(xdg_runtime_dir, uid);
+        let cfg = with_file_lock(&lock_path_for(&pointer_path), false, || {
+            if !pointer_path.exists() {
+                return Err(TermusicError::NotInitialized(
+                    NOT_INITIALIZED_MSG.to_string(),
+                ));
+            }
+
+            let pointer_raw = fs::read_to_string(&pointer_path)?;
+            let pointer: WorkspacePointer = serde_json::from_str(&pointer_raw)?;
+            let config_path = pointer.working_dir.join("config").join("config.json");
+            if !config_path.exists() {
+                return Err(TermusicError::NotInitialized(
+                    NOT_INITIALIZED_MSG.to_string(),
+                ));
+            }
+
+            with_file_lock(&lock_path_for(&config_path), false, || {
+                load_workspace_config_unlocked(&config_path)
+            })
+        })?;
+
         Ok(Self {
             working_dir: cfg.working_dir,
             config_path: cfg.config_dir.join("config.json"),
@@ -125,6 +128,101 @@ impl AppPaths {
         }
         Ok(())
     }
+
+    /// Lock file guarding single-instance daemon ownership for `socket_path`.
+    pub fn daemon_lock_path(&self) -> PathBuf {
+        suffix_path(&self.socket_path, "daemon.lock")
+    }
+
+    /// Lock file serializing concurrent daemon auto-spawn attempts for `socket_path`.
+    pub fn daemon_spawn_lock_path(&self) -> PathBuf {
+        suffix_path(&self.socket_path, "spawn.lock")
+    }
+}
+
+/// Append `.<suffix>` to the full filename of `target` without replacing existing extensions.
+pub fn suffix_path(target: &Path, suffix: &str) -> PathBuf {
+    let suffix = suffix.trim_start_matches('.');
+    match target.file_name() {
+        Some(name) => {
+            let mut new_name = OsString::from(name);
+            new_name.push(".");
+            new_name.push(suffix);
+            target.with_file_name(new_name)
+        }
+        None => {
+            let mut raw = target.as_os_str().to_os_string();
+            raw.push(".");
+            raw.push(suffix);
+            PathBuf::from(raw)
+        }
+    }
+}
+
+/// Derive the sidecar advisory lock file path (`<target>.lock`) for `target`.
+pub fn lock_path_for(target: &Path) -> PathBuf {
+    suffix_path(target, "lock")
+}
+
+/// Open or create `lock_path` and acquire an OS advisory lock without truncating or unlinking it.
+pub fn acquire_file_lock(
+    lock_path: &Path,
+    exclusive: bool,
+    blocking: bool,
+) -> Result<Option<File>> {
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)?;
+
+    let map_try = |res: std::result::Result<(), std::fs::TryLockError>| -> Result<bool> {
+        match res {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+        }
+    };
+
+    let acquired = match (exclusive, blocking) {
+        (true, true) => {
+            file.lock()?;
+            true
+        }
+        (false, true) => {
+            file.lock_shared()?;
+            true
+        }
+        (true, false) => map_try(file.try_lock())?,
+        (false, false) => map_try(file.try_lock_shared())?,
+    };
+
+    if acquired {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Execute `f` while holding a blocking advisory file lock on `lock_path`.
+pub fn with_file_lock<T>(
+    lock_path: &Path,
+    exclusive: bool,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _guard = acquire_file_lock(lock_path, exclusive, true)?.ok_or_else(|| {
+        TermusicError::Io(io::Error::other(format!(
+            "blocking file lock returned no handle for {}",
+            lock_path.display()
+        )))
+    })?;
+    f()
 }
 
 /// Initialize a Termusic working directory and persist the bootstrap workspace pointer.
@@ -182,20 +280,29 @@ pub fn initialize_workspace_with_env(
     };
 
     let config_file = config_dir.join("config.json");
-    write_json_atomic(&config_file, &workspace_cfg)?;
-
     let pointer_path = resolve_workspace_pointer_path(xdg_config_home, home_dir)?;
-    let pointer = WorkspacePointer { working_dir };
-    write_json_atomic(&pointer_path, &pointer)?;
+    with_file_lock(&lock_path_for(&pointer_path), true, || {
+        with_file_lock(&lock_path_for(&config_file), true, || {
+            write_json_atomic(&config_file, &workspace_cfg)
+        })?;
+        let pointer = WorkspacePointer { working_dir };
+        write_json_atomic(&pointer_path, &pointer)
+    })?;
 
     Ok(workspace_cfg)
 }
 
-/// Load and deserialize `WorkspaceConfig` from `paths.config_path`.
-pub fn load_workspace_config(paths: &AppPaths) -> Result<WorkspaceConfig> {
-    let raw = fs::read_to_string(&paths.config_path)?;
+fn load_workspace_config_unlocked(config_path: &Path) -> Result<WorkspaceConfig> {
+    let raw = fs::read_to_string(config_path)?;
     let cfg: WorkspaceConfig = serde_json::from_str(&raw)?;
     Ok(cfg)
+}
+
+/// Load and deserialize `WorkspaceConfig` from `paths.config_path`.
+pub fn load_workspace_config(paths: &AppPaths) -> Result<WorkspaceConfig> {
+    with_file_lock(&lock_path_for(&paths.config_path), false, || {
+        load_workspace_config_unlocked(&paths.config_path)
+    })
 }
 
 /// Persist `download_dest` inside `paths.config_path` atomically after creating and canonicalizing `dir`.
@@ -231,9 +338,12 @@ fn set_workspace_download_dest_with_cwd(
     fs::create_dir_all(&candidate)?;
     let abs = fs::canonicalize(&candidate)?;
 
-    let mut cfg = load_workspace_config(paths)?;
-    cfg.download_dest = Some(abs.clone());
-    write_json_atomic(&paths.config_path, &cfg)?;
+    with_file_lock(&lock_path_for(&paths.config_path), true, || {
+        let mut cfg = load_workspace_config_unlocked(&paths.config_path)?;
+        cfg.download_dest = Some(abs.clone());
+        write_json_atomic(&paths.config_path, &cfg)?;
+        Ok(())
+    })?;
     Ok(abs)
 }
 
@@ -280,16 +390,27 @@ fn resolve_runtime_paths(
     )
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+/// Serialize `value` as pretty JSON and atomically replace `path` via a unique sibling temp file.
+pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = match path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => path.with_file_name(format!("{name}.tmp")),
-        None => path.with_extension("json.tmp"),
+    let pid = std::process::id();
+    let unique = uuid::Uuid::new_v4();
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = OsString::from(name);
+            tmp_name.push(format!(".{pid}.{unique}.tmp"));
+            path.with_file_name(tmp_name)
+        }
+        None => {
+            let mut raw = path.as_os_str().to_os_string();
+            raw.push(format!(".{pid}.{unique}.tmp"));
+            PathBuf::from(raw)
+        }
     };
 
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -532,6 +653,193 @@ mod tests {
 
         let reloaded = load_workspace_config(&paths).unwrap();
         assert_eq!(reloaded.download_dest, Some(expected));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lock_and_suffix_helpers_support_shared_and_exclusive_modes() {
+        let root = temp_dir("locks");
+        let target = root.join("playlists").join("library.json");
+        assert_eq!(
+            lock_path_for(&target),
+            root.join("playlists").join("library.json.lock")
+        );
+
+        let paths = AppPaths::from_roots(root.join("data"), root.join("run"));
+        assert_eq!(
+            paths.daemon_lock_path(),
+            root.join("run").join("termusic.sock.daemon.lock")
+        );
+        assert_eq!(
+            paths.daemon_spawn_lock_path(),
+            root.join("run").join("termusic.sock.spawn.lock")
+        );
+
+        let lock_path = lock_path_for(&target);
+        let exclusive = acquire_file_lock(&lock_path, true, false).unwrap();
+        assert!(exclusive.is_some());
+        assert!(acquire_file_lock(&lock_path, true, false).unwrap().is_none());
+        assert!(acquire_file_lock(&lock_path, false, false).unwrap().is_none());
+        drop(exclusive);
+
+        let shared_a = acquire_file_lock(&lock_path, false, false).unwrap();
+        let shared_b = acquire_file_lock(&lock_path, false, false).unwrap();
+        assert!(shared_a.is_some());
+        assert!(shared_b.is_some());
+        assert!(acquire_file_lock(&lock_path, true, false).unwrap().is_none());
+        drop(shared_a);
+        assert!(acquire_file_lock(&lock_path, true, false).unwrap().is_none());
+        drop(shared_b);
+
+        assert!(acquire_file_lock(&lock_path, true, false).unwrap().is_some());
+        assert!(lock_path.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_set_workspace_download_dest_preserves_valid_json_and_leaves_no_tmp() {
+        let root = temp_dir("concurrent-dest");
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            1000,
+        )
+        .unwrap();
+
+        let thread_count = 8usize;
+        let expected_dests: Vec<PathBuf> = (0..thread_count)
+            .map(|i| {
+                let d = root.join(format!("dest-{i}"));
+                fs::create_dir_all(&d).unwrap();
+                fs::canonicalize(d).unwrap()
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for i in 0..thread_count {
+                let paths = &paths;
+                let root = &root;
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let res = set_workspace_download_dest_with_cwd(
+                            paths,
+                            Path::new(&format!("dest-{i}")),
+                            root,
+                        );
+                        assert!(res.is_ok(), "writer thread {i} failed: {res:?}");
+                        let cfg = load_workspace_config(paths).unwrap();
+                        assert!(cfg.download_dest.is_some());
+                    }
+                });
+            }
+        });
+
+        let final_cfg = load_workspace_config(&paths).unwrap();
+        assert_eq!(final_cfg.version, WORKSPACE_CONFIG_VERSION);
+        assert!(
+            final_cfg
+                .download_dest
+                .as_ref()
+                .is_some_and(|d| expected_dests.contains(d)),
+            "unexpected download_dest: {:?}",
+            final_cfg.download_dest
+        );
+
+        let config_dir = paths.config_path.parent().unwrap();
+        let leftover_tmps: Vec<PathBuf> = fs::read_dir(config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(leftover_tmps.is_empty(), "leftover tmp files: {leftover_tmps:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_init_and_resolve_never_corrupt_or_leave_tmp() {
+        let root = temp_dir("concurrent-init");
+        let cfg_home = root.join("xdg_config");
+        let home = root.join("home");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(home.clone()),
+        )
+        .unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let ws = &ws;
+                let root = &root;
+                let cfg_home = &cfg_home;
+                let home = &home;
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        initialize_workspace_with_env(
+                            ws,
+                            root,
+                            Some(cfg_home.clone().into_os_string()),
+                            Some(home.clone()),
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+            for _ in 0..4 {
+                let cfg_home = &cfg_home;
+                let home = &home;
+                let run_dir = &run_dir;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let resolved = AppPaths::resolve_from_env(
+                            Some(cfg_home.clone().into_os_string()),
+                            Some(home.clone()),
+                            Some(run_dir.clone().into_os_string()),
+                            1000,
+                        )
+                        .unwrap();
+                        assert_eq!(resolved.config_path, resolved.working_dir.join("config/config.json"));
+                    }
+                });
+            }
+        });
+
+        for dir in [cfg_home.join("termusic"), fs::canonicalize(&ws).unwrap().join("config")] {
+            let leftover_tmps: Vec<PathBuf> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|entry| entry.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".tmp"))
+                })
+                .collect();
+            assert!(leftover_tmps.is_empty(), "leftover tmp files in {dir:?}: {leftover_tmps:?}");
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -1,12 +1,15 @@
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rand::seq::SliceRandom;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::audio::{AudioSink, SymphoniaTrack};
 use crate::error::{Result, TermusicError};
 use crate::ipc::{PlayMode, PlaybackState, PlaybackStatus};
 use crate::library::Song;
+
+const ENGINE_COMMAND_CAPACITY: usize = 64;
 
 /// Control commands accepted by the audio playback engine thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,45 +31,47 @@ pub enum EngineCommand {
     Shutdown,
 }
 
-/// Command envelope paired with a synchronous oneshot acknowledgement channel.
+/// Command envelope paired with a Tokio oneshot acknowledgement channel.
 pub struct EngineRequest {
     pub command: EngineCommand,
-    pub ack: SyncSender<Result<PlaybackStatus>>,
+    pub ack: oneshot::Sender<Result<PlaybackStatus>>,
 }
 
-/// Thread-safe client handle for sending synchronous commands and reading playback status.
+/// Async-safe client handle for dispatching commands and reading wait-free playback snapshots.
 #[derive(Clone)]
 pub struct EngineHandle {
-    cmd_tx: Sender<EngineRequest>,
-    status: Arc<RwLock<PlaybackStatus>>,
+    cmd_tx: mpsc::Sender<EngineRequest>,
+    status_rx: watch::Receiver<Arc<PlaybackStatus>>,
 }
 
 impl EngineHandle {
-    /// Construct a handle from a command sender and shared status lock.
-    pub fn new(cmd_tx: Sender<EngineRequest>, status: Arc<RwLock<PlaybackStatus>>) -> Self {
-        Self { cmd_tx, status }
+    /// Construct a handle from a bounded Tokio command sender and shared status watch receiver.
+    pub fn new(
+        cmd_tx: mpsc::Sender<EngineRequest>,
+        status_rx: watch::Receiver<Arc<PlaybackStatus>>,
+    ) -> Self {
+        Self { cmd_tx, status_rx }
     }
 
-    /// Return the latest published playback snapshot without blocking on audio decoding.
-    pub fn status(&self) -> PlaybackStatus {
-        self.status
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+    /// Return the latest published playback snapshot without blocking on audio decoding or locks.
+    pub fn status(&self) -> Arc<PlaybackStatus> {
+        Arc::clone(&*self.status_rx.borrow())
     }
 
-    /// Send a command to the audio engine thread and wait synchronously for the resulting status.
-    pub fn send(&self, command: EngineCommand) -> Result<PlaybackStatus> {
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+    /// Send a command to the audio engine thread and await the resulting status without blocking
+    /// the calling Tokio worker thread.
+    pub async fn send(&self, command: EngineCommand) -> Result<PlaybackStatus> {
+        let (ack_tx, ack_rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineRequest {
                 command,
                 ack: ack_tx,
             })
+            .await
             .map_err(|_| TermusicError::Daemon("audio engine is not running".to_string()))?;
 
         ack_rx
-            .recv()
+            .await
             .map_err(|_| TermusicError::Daemon("audio engine stopped before responding".to_string()))?
     }
 }
@@ -77,6 +82,7 @@ pub struct PlaybackEngine {
     open_spec: Option<(u32, u8)>,
     original_queue: Vec<Song>,
     active_order: Vec<usize>,
+    cached_ordered_queue: Vec<Song>,
     cursor: usize,
     history: Vec<usize>,
     mode: PlayMode,
@@ -98,6 +104,7 @@ impl PlaybackEngine {
             open_spec: None,
             original_queue: Vec::new(),
             active_order: Vec::new(),
+            cached_ordered_queue: Vec::new(),
             cursor: 0,
             history: Vec::new(),
             mode: PlayMode::Next,
@@ -128,16 +135,7 @@ impl PlaybackEngine {
             };
         }
 
-        let ordered_queue: Vec<Song> = self
-            .active_order
-            .iter()
-            .filter_map(|&idx| self.original_queue.get(idx).cloned())
-            .collect();
-        let current_track = self
-            .active_order
-            .get(self.cursor)
-            .and_then(|&idx| self.original_queue.get(idx))
-            .cloned();
+        let current_track = self.cached_ordered_queue.get(self.cursor).cloned();
 
         PlaybackStatus {
             state: self.state,
@@ -148,7 +146,7 @@ impl PlaybackEngine {
             queue_len: self.active_order.len(),
             position_secs: self.position_secs,
             duration_secs: self.duration_secs,
-            queue: ordered_queue,
+            queue: self.cached_ordered_queue.clone(),
         }
     }
 
@@ -229,6 +227,10 @@ impl PlaybackEngine {
         }
 
         self.duration_secs = track.duration_secs().or(first_song.duration_secs);
+        self.cached_ordered_queue = active_order
+            .iter()
+            .filter_map(|&idx| queue.get(idx).cloned())
+            .collect();
         self.original_queue = queue;
         self.active_order = active_order;
         self.cursor = cursor;
@@ -530,6 +532,7 @@ impl PlaybackEngine {
     fn reset_stopped_state(&mut self) {
         self.original_queue.clear();
         self.active_order.clear();
+        self.cached_ordered_queue.clear();
         self.cursor = 0;
         self.history.clear();
         self.playlist_name = None;
@@ -566,87 +569,88 @@ fn build_active_order(len: usize, start_index: Option<usize>, mode: PlayMode) ->
     }
 }
 
-fn publish_status(shared_status: &Arc<RwLock<PlaybackStatus>>, status: PlaybackStatus) {
-    let mut guard = shared_status.write().unwrap_or_else(|e| e.into_inner());
-    *guard = status;
+fn publish_status(status_tx: &watch::Sender<Arc<PlaybackStatus>>, status: PlaybackStatus) {
+    status_tx.send_replace(Arc::new(status));
 }
 
 fn process_command(
     engine: &mut PlaybackEngine,
-    shared_status: &Arc<RwLock<PlaybackStatus>>,
+    status_tx: &watch::Sender<Arc<PlaybackStatus>>,
     req: EngineRequest,
 ) -> bool {
     let (result, keep_running) = engine.execute(req.command);
-    publish_status(shared_status, engine.status());
+    publish_status(status_tx, engine.status());
     let _ = req.ack.send(result);
     keep_running
 }
 
 fn drain_pending_commands(
     engine: &mut PlaybackEngine,
-    cmd_rx: &Receiver<EngineRequest>,
-    shared_status: &Arc<RwLock<PlaybackStatus>>,
+    cmd_rx: &mut mpsc::Receiver<EngineRequest>,
+    status_tx: &watch::Sender<Arc<PlaybackStatus>>,
 ) -> bool {
     loop {
         match cmd_rx.try_recv() {
             Ok(req) => {
-                if !process_command(engine, shared_status, req) {
+                if !process_command(engine, status_tx, req) {
                     return false;
                 }
             }
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Disconnected) => {
                 let _ = engine.stop();
-                publish_status(shared_status, engine.status());
+                publish_status(status_tx, engine.status());
                 return false;
             }
         }
     }
 }
 
-/// Spawn the audio playback engine on a background thread (`termusic-engine`), returning a
-/// [`EngineHandle`] and thread [`std::thread::JoinHandle`].
+/// Spawn the audio playback engine on a dedicated OS thread (`termusic-engine`), returning an
+/// async [`EngineHandle`] and thread [`std::thread::JoinHandle`].
 pub fn spawn_engine(sink: Box<dyn AudioSink>) -> Result<(EngineHandle, std::thread::JoinHandle<()>)> {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let shared_status = Arc::new(RwLock::new(PlaybackStatus::default()));
-    let status_for_thread = Arc::clone(&shared_status);
+    let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
+    let (status_tx, status_rx) = watch::channel(Arc::new(PlaybackStatus::default()));
 
     let handle = std::thread::Builder::new()
         .name("termusic-engine".to_string())
-        .spawn(move || run_engine(sink, cmd_rx, status_for_thread))
+        .spawn(move || run_engine(sink, cmd_rx, status_tx))
         .map_err(|err| {
             TermusicError::Daemon(format!("failed to spawn audio engine thread: {err}"))
         })?;
 
-    Ok((EngineHandle::new(cmd_tx, shared_status), handle))
+    Ok((EngineHandle::new(cmd_tx, status_rx), handle))
 }
 
-/// Run the audio engine loop on the current thread until [`EngineCommand::Shutdown`] or channel
-/// disconnect.
+/// Run the audio engine loop on the current dedicated OS thread until [`EngineCommand::Shutdown`]
+/// or command channel disconnect.
+///
+/// Must run outside a Tokio runtime thread because it invokes `cmd_rx.blocking_recv()`,
+/// synchronous Symphonia I/O/decoding, and blocking [`AudioSink`] writes.
 ///
 /// While `Playing`, checks `cmd_rx.try_recv()` between every decoded packet BEFORE writing to `sink`
-/// so playback controls respond immediately; while `Paused` or `Stopped`, blocks on `cmd_rx.recv()`
-/// with zero busy-spinning.
+/// so playback controls respond immediately; while `Paused` or `Stopped`, blocks on
+/// `cmd_rx.blocking_recv()` with zero busy-spinning.
 pub fn run_engine(
     sink: Box<dyn AudioSink>,
-    cmd_rx: Receiver<EngineRequest>,
-    shared_status: Arc<RwLock<PlaybackStatus>>,
+    mut cmd_rx: mpsc::Receiver<EngineRequest>,
+    status_tx: watch::Sender<Arc<PlaybackStatus>>,
 ) {
     let mut engine = PlaybackEngine::new(sink);
-    publish_status(&shared_status, engine.status());
+    publish_status(&status_tx, engine.status());
 
     loop {
         if engine.state != PlaybackState::Playing {
-            match cmd_rx.recv() {
-                Ok(req) => {
-                    if !process_command(&mut engine, &shared_status, req) {
+            match cmd_rx.blocking_recv() {
+                Some(req) => {
+                    if !process_command(&mut engine, &status_tx, req) {
                         break;
                     }
                     continue;
                 }
-                Err(_) => {
+                None => {
                     let _ = engine.stop();
-                    publish_status(&shared_status, engine.status());
+                    publish_status(&status_tx, engine.status());
                     break;
                 }
             }
@@ -666,14 +670,14 @@ pub fn run_engine(
                 }
             } else {
                 let _ = engine.stop();
-                publish_status(&shared_status, engine.status());
+                publish_status(&status_tx, engine.status());
                 continue;
             };
 
             match decode_outcome {
                 Ok(Some(())) => {}
                 Ok(None) => {
-                    if !drain_pending_commands(&mut engine, &cmd_rx, &shared_status) {
+                    if !drain_pending_commands(&mut engine, &mut cmd_rx, &status_tx) {
                         break;
                     }
                     if engine.state == PlaybackState::Playing {
@@ -681,21 +685,21 @@ pub fn run_engine(
                             eprintln!("playback auto-advance error: {err}");
                             let _ = engine.stop();
                         }
-                        publish_status(&shared_status, engine.status());
+                        publish_status(&status_tx, engine.status());
                     }
                     continue;
                 }
                 Err(err) => {
                     eprintln!("playback decode error: {err}");
                     let _ = engine.stop();
-                    publish_status(&shared_status, engine.status());
+                    publish_status(&status_tx, engine.status());
                     continue;
                 }
             }
         }
 
         // Always inspect pending control commands BEFORE writing the decoded packet to the sink.
-        if !drain_pending_commands(&mut engine, &cmd_rx, &shared_status) {
+        if !drain_pending_commands(&mut engine, &mut cmd_rx, &status_tx) {
             break;
         }
         if engine.state != PlaybackState::Playing || engine.pending_pcm.is_empty() {
@@ -708,21 +712,21 @@ pub fn run_engine(
             .map(|t| (t.sample_rate(), t.channels()))
         else {
             let _ = engine.stop();
-            publish_status(&shared_status, engine.status());
+            publish_status(&status_tx, engine.status());
             continue;
         };
 
         if let Err(err) = engine.ensure_sink_spec(sample_rate, channels) {
             eprintln!("audio sink open error: {err}");
             engine.stop_clean_on_sink_error();
-            publish_status(&shared_status, engine.status());
+            publish_status(&status_tx, engine.status());
             continue;
         }
 
         if let Err(err) = engine.sink.write_f32(&engine.pending_pcm) {
             eprintln!("audio sink write error: {err}");
             engine.stop_clean_on_sink_error();
-            publish_status(&shared_status, engine.status());
+            publish_status(&status_tx, engine.status());
             continue;
         }
 
@@ -734,7 +738,7 @@ pub fn run_engine(
         }
         engine.position_secs = new_pos;
         engine.pending_pcm.clear();
-        publish_status(&shared_status, engine.status());
+        publish_status(&status_tx, engine.status());
     }
 }
 
@@ -744,7 +748,7 @@ mod tests {
     use std::f32::consts::PI;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
     use crate::audio::null_sink::NullSink;
@@ -837,15 +841,22 @@ mod tests {
         }
     }
 
-    fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+    async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
             if cond() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for playback condition after {timeout:?}");
+    }
+
+    async fn join_engine(join_handle: std::thread::JoinHandle<()>) {
+        tokio::task::spawn_blocking(move || join_handle.join())
+            .await
+            .expect("join blocking task should succeed")
+            .expect("engine thread should exit cleanly");
     }
 
     #[test]
@@ -1147,8 +1158,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn pause_flushes_and_resume_seeks_to_paused_position_without_audio_loss() {
+    #[tokio::test]
+    async fn pause_flushes_and_resume_seeks_to_paused_position_without_audio_loss() {
         let dir = temp_workspace("pause-resume");
         let song = make_song(&dir, "LongTone", 44_100, 1, 1.5);
         let expected_samples = 66_150u64; // 1.5s * 44100Hz * 1ch
@@ -1164,25 +1175,27 @@ mod tests {
                 mode: PlayMode::Next,
                 playlist_name: None,
             })
+            .await
             .unwrap();
         assert_eq!(started.state, PlaybackState::Playing);
 
         wait_until(Duration::from_secs(3), || {
             handle.status().position_secs >= 0.18
-        });
+        })
+        .await;
 
-        let paused = handle.send(EngineCommand::TogglePause).unwrap();
+        let paused = handle.send(EngineCommand::TogglePause).await.unwrap();
         assert_eq!(paused.state, PlaybackState::Paused);
         let paused_pos = paused.position_secs;
         assert!(paused_pos >= 0.15, "expected progress before pause, got {paused_pos}");
         assert!(stats.flush_count() >= 1);
 
         let written_during_pause = stats.written_samples();
-        std::thread::sleep(Duration::from_millis(45));
-        // Engine must block on cmd_rx.recv() while paused: zero extra writes or busy spin.
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        // Engine must block on cmd_rx.blocking_recv() while paused: zero extra writes or busy spin.
         assert_eq!(stats.written_samples(), written_during_pause);
 
-        let resumed = handle.send(EngineCommand::SetPaused(false)).unwrap();
+        let resumed = handle.send(EngineCommand::SetPaused(false)).await.unwrap();
         assert_eq!(resumed.state, PlaybackState::Playing);
         assert!(
             resumed.position_secs <= paused_pos + 0.001,
@@ -1193,7 +1206,8 @@ mod tests {
 
         wait_until(Duration::from_secs(5), || {
             handle.status().state == PlaybackState::Stopped
-        });
+        })
+        .await;
 
         assert!(stats.drain_count() >= 1);
         assert_eq!(stats.close_count(), 1);
@@ -1204,13 +1218,13 @@ mod tests {
             expected_samples
         );
 
-        handle.send(EngineCommand::Shutdown).unwrap();
-        join_handle.join().unwrap();
+        handle.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(join_handle).await;
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn auto_eof_reopens_sink_only_on_spec_change_and_stops_cleanly() {
+    #[tokio::test]
+    async fn auto_eof_reopens_sink_only_on_spec_change_and_stops_cleanly() {
         let dir = temp_workspace("auto-eof");
         let t1 = make_song(&dir, "Mono44k", 44_100, 1, 0.2);
         let t2 = make_song(&dir, "Mono44kAgain", 44_100, 1, 0.2);
@@ -1228,11 +1242,13 @@ mod tests {
                 mode: PlayMode::Next,
                 playlist_name: Some("AutoPlay".to_string()),
             })
+            .await
             .unwrap();
 
         wait_until(Duration::from_secs(3), || {
             handle.status().state == PlaybackState::Stopped
-        });
+        })
+        .await;
 
         let final_status = handle.status();
         assert_eq!(final_status.state, PlaybackState::Stopped);
@@ -1245,13 +1261,13 @@ mod tests {
         assert!(!stats.is_open());
         assert_eq!(stats.written_samples(), expected_samples);
 
-        handle.send(EngineCommand::Shutdown).unwrap();
-        join_handle.join().unwrap();
+        handle.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(join_handle).await;
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn commands_preempt_decoding_immediately_between_packets() {
+    #[tokio::test]
+    async fn commands_preempt_decoding_immediately_between_packets() {
         let dir = temp_workspace("preempt");
         let long_song = make_song(&dir, "ThreeSeconds", 44_100, 1, 3.0);
 
@@ -1266,12 +1282,13 @@ mod tests {
                 mode: PlayMode::Next,
                 playlist_name: None,
             })
+            .await
             .unwrap();
 
-        wait_until(Duration::from_secs(2), || stats.write_calls() >= 2);
+        wait_until(Duration::from_secs(2), || stats.write_calls() >= 2).await;
 
-        let start = Instant::now();
-        let stopped = handle.send(EngineCommand::Stop).unwrap();
+        let start = tokio::time::Instant::now();
+        let stopped = handle.send(EngineCommand::Stop).await.unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -1283,8 +1300,8 @@ mod tests {
         assert_eq!(stats.close_count(), 1);
         assert!(stats.written_samples() < 44_100 * 3);
 
-        handle.send(EngineCommand::Shutdown).unwrap();
-        join_handle.join().unwrap();
+        handle.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(join_handle).await;
         let _ = fs::remove_dir_all(&dir);
     }
 }

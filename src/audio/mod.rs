@@ -38,6 +38,11 @@ pub struct TrackProbe {
 }
 
 /// Sink abstraction for interleaved `f32` PCM audio output.
+///
+/// Sinks are [`Send`] so ownership can be transferred into the dedicated `termusic-engine` OS
+/// thread, where every method is called with exclusive `&mut self` access. Implementations must
+/// treat [`AudioSink::close`] as idempotent so repeated `close()` calls and [`Drop`] teardown
+/// during daemon shutdown are safe.
 pub trait AudioSink: Send {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()>;
     fn write_f32(&mut self, samples: &[f32]) -> Result<()>;
@@ -54,6 +59,9 @@ pub struct DecodedChunk {
 }
 
 /// Demuxer and decoder state for a single audio track opened via Symphonia.
+///
+/// Intended for single-owner `&mut self` decoding on the `termusic-engine` playback thread;
+/// dropping releases the underlying demuxer, decoder, and container file handle cleanly.
 pub struct SymphoniaTrack {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
@@ -283,6 +291,7 @@ impl SymphoniaTrack {
             .map_err(|err| map_symphonia_err("seek failed", err))?;
 
         self.decoder.reset();
+        self.pcm_buf.clear();
 
         let actual_secs = self
             .time_base
@@ -328,6 +337,7 @@ impl SymphoniaTrack {
         self.channels = channels;
         self.duration_secs = duration_secs;
         self.decoder = decoder;
+        self.pcm_buf.clear();
         Ok(())
     }
 }

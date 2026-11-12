@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +9,7 @@ use crate::audio::{is_supported_extension, probe_track};
 use crate::cli::validate_add_path;
 use crate::error::{Result, TermusicError};
 use crate::ipc::TargetKind;
+use crate::paths::{lock_path_for, with_file_lock, write_json_atomic};
 
 pub const LIBRARY_VERSION: u32 = 1;
 
@@ -97,8 +97,7 @@ enum LookupMatch {
 }
 
 impl Library {
-    /// Load library from `path`, or return an empty default `Library` if the file does not exist yet.
-    pub fn load(path: &Path) -> Result<Self> {
+    fn load_unlocked(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -107,38 +106,27 @@ impl Library {
         Ok(lib)
     }
 
-    /// Persist library atomically via a temporary sibling file (`library.json.tmp`) followed by rename.
+    /// Load library from `path` under a shared advisory lock, or return an empty default `Library` if absent.
+    pub fn load(path: &Path) -> Result<Self> {
+        with_file_lock(&lock_path_for(path), false, || Self::load_unlocked(path))
+    }
+
+    /// Persist library atomically via a unique sibling temporary file followed by rename.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        write_json_atomic(path, self)
+    }
 
-        let tmp_path = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => path.with_file_name(format!("{name}.tmp")),
-            None => path.with_extension("json.tmp"),
-        };
-
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let write_result = (|| -> Result<()> {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        if let Err(err) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err.into());
-        }
-
-        Ok(())
+    /// Atomically update `path` under an exclusive advisory lock (`load` -> `mutator` -> atomic save).
+    pub fn update<T>(
+        path: &Path,
+        mutator: impl FnOnce(&mut Library) -> Result<T>,
+    ) -> Result<T> {
+        with_file_lock(&lock_path_for(path), true, || {
+            let mut lib = Self::load_unlocked(path)?;
+            let out = mutator(&mut lib)?;
+            write_json_atomic(path, &lib)?;
+            Ok(out)
+        })
     }
 
     /// Find a song reference by its unique UUID string.
@@ -891,6 +879,85 @@ mod tests {
         // Missing file loads default empty library cleanly.
         let missing = Library::load(&dir.join("absent.json")).unwrap();
         assert_eq!(missing, Library::default());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_library_update_has_zero_lost_updates_and_no_tmp() {
+        let dir = temp_workspace("concurrent-update");
+        let lib_dir = dir.join("playlists");
+        let lib_path = lib_dir.join("library.json");
+
+        let track_count = 8usize;
+        let wav_paths: Vec<PathBuf> = (0..track_count)
+            .map(|i| {
+                let p = dir.join(format!("Track_{i:02}.wav"));
+                write_synthetic_wav(&p, 44_100, 0.1);
+                p
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for (i, wav_path) in wav_paths.iter().enumerate() {
+                let lib_path = &lib_path;
+                scope.spawn(move || {
+                    let summary = Library::update(lib_path, |lib| {
+                        lib.add_files(wav_path, false, Some("Shared"))
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        summary.added_count, 1,
+                        "thread {i} expected to add 1 song, got {summary:?}"
+                    );
+                });
+            }
+
+            for _ in 0..2 {
+                let lib_path = &lib_path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        let snapshot = Library::load(lib_path).unwrap();
+                        assert!(snapshot.songs.len() <= track_count);
+                    }
+                });
+            }
+        });
+
+        let final_lib = Library::load(&lib_path).unwrap();
+        assert_eq!(final_lib.songs.len(), track_count);
+        for i in 0..track_count {
+            let title = format!("Track_{i:02}");
+            assert!(
+                final_lib.songs.iter().any(|s| s.title == title),
+                "missing track {title} after concurrent updates"
+            );
+        }
+
+        assert_eq!(final_lib.playlists.len(), 1);
+        assert_eq!(final_lib.playlists[0].name, "Shared");
+        assert_eq!(final_lib.playlists[0].song_ids.len(), track_count);
+
+        // Mutator errors must not persist partial changes or leave temp files.
+        let err = Library::update(&lib_path, |lib| {
+            lib.songs.clear();
+            Err::<(), _>(TermusicError::InvalidArg("abort update".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, TermusicError::InvalidArg(_)));
+        let after_err = Library::load(&lib_path).unwrap();
+        assert_eq!(after_err.songs.len(), track_count);
+
+        let leftover_tmps: Vec<PathBuf> = fs::read_dir(&lib_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(leftover_tmps.is_empty(), "leftover tmp files: {leftover_tmps:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

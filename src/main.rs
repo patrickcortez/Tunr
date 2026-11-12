@@ -1,28 +1,48 @@
+use std::io::IsTerminal;
+
 use termusic::cli::{Command, ListKind, parse_cli};
 use termusic::error::{Result, TermusicError};
 use termusic::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
 use termusic::library::{DeleteOutcome, Library};
 use termusic::paths::{self, AppPaths};
-use termusic::{daemon, download, tui};
+use termusic::{daemon, download, download_tui, tui};
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(err) = run().await {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run_blocking<T, F>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+}
+
+async fn run() -> Result<()> {
     let command = parse_cli()?;
     match command {
+        Command::Version => {
+            println!("termusic {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Command::Init { path } => {
-            let cfg = paths::initialize_workspace(&path)?;
-            let paths = AppPaths::resolve()?;
-            if !paths.library_path.exists() {
-                let library = Library::load(&paths.library_path)?;
-                library.save(&paths.library_path)?;
-            }
-            let _ = ipc::send_request(&paths, &IpcRequest::Shutdown);
+            let (cfg, paths) = run_blocking(move || {
+                let cfg = paths::initialize_workspace(&path)?;
+                let paths = AppPaths::resolve()?;
+                if !paths.library_path.exists() {
+                    Library::update(&paths.library_path, |_| Ok(()))?;
+                }
+                Ok((cfg, paths))
+            })
+            .await?;
+            let _ = ipc::send_request(&paths, &IpcRequest::Shutdown).await;
             println!(
                 "Initialized Termusic workspace at {}",
                 cfg.working_dir.display()
@@ -34,23 +54,23 @@ fn run() -> Result<()> {
             return Ok(());
         }
         Command::Daemon(overrides) => {
-            let paths = overrides.resolve_paths()?;
-            return daemon::run_daemon(&paths);
+            let paths = run_blocking(move || overrides.resolve_paths()).await?;
+            return daemon::run_daemon(&paths).await;
         }
         _ => {}
     }
 
-    let paths = AppPaths::resolve()?;
+    let paths = run_blocking(AppPaths::resolve).await?;
     match command {
-        Command::Init { .. } | Command::Daemon(_) => unreachable!(),
-        Command::Tui => tui::run_tui(&paths),
-        Command::Version => {
-            println!("termusic {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Command::Version | Command::Init { .. } | Command::Daemon(_) => unreachable!(),
+        Command::Tui => tui::run_tui(&paths).await,
         Command::Play { target, mode, kind } => {
-            let library = Library::load(&paths.library_path)?;
-            let resolved = library.resolve_play_target(&target, kind)?;
+            let lib_path = paths.library_path.clone();
+            let resolved = run_blocking(move || {
+                let library = Library::load(&lib_path)?;
+                library.resolve_play_target(&target, kind)
+            })
+            .await?;
             let (queue, start_index, playlist_name) = resolved.into_play_parts();
             let status = ipc::ensure_daemon_and_send(
                 &paths,
@@ -60,7 +80,8 @@ fn run() -> Result<()> {
                     mode,
                     playlist_name,
                 },
-            )?;
+            )
+            .await?;
             print_playback_status(&status);
             Ok(())
         }
@@ -70,14 +91,18 @@ fn run() -> Result<()> {
             path,
             playlist_name,
         } => {
-            let mut library = Library::load(&paths.library_path)?;
-            let target_pl = if playlist {
-                playlist_name.as_deref()
-            } else {
-                None
-            };
-            let summary = library.add_files(&path, folder, target_pl)?;
-            library.save(&paths.library_path)?;
+            let lib_path = paths.library_path.clone();
+            let summary = run_blocking(move || {
+                Library::update(&lib_path, |library| {
+                    let target_pl = if playlist {
+                        playlist_name.as_deref()
+                    } else {
+                        None
+                    };
+                    library.add_files(&path, folder, target_pl)
+                })
+            })
+            .await?;
 
             println!(
                 "Added {} new song(s) ({} already in library).",
@@ -95,29 +120,31 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Next => {
-            let status = ipc::send_request(&paths, &IpcRequest::Next)?;
+            let status = ipc::send_request(&paths, &IpcRequest::Next).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Prev => {
-            let status = ipc::send_request(&paths, &IpcRequest::Prev)?;
+            let status = ipc::send_request(&paths, &IpcRequest::Prev).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Rewind { seconds } => {
-            let status = ipc::send_request(&paths, &IpcRequest::SeekRelative(-seconds))?;
+            let status = ipc::send_request(&paths, &IpcRequest::SeekRelative(-seconds)).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Advance { seconds } => {
-            let status = ipc::send_request(&paths, &IpcRequest::SeekRelative(seconds))?;
+            let status = ipc::send_request(&paths, &IpcRequest::SeekRelative(seconds)).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Delete { target, kind } => {
-            let mut library = Library::load(&paths.library_path)?;
-            let outcome = library.delete_target(&target, kind)?;
-            library.save(&paths.library_path)?;
+            let lib_path = paths.library_path.clone();
+            let outcome = run_blocking(move || {
+                Library::update(&lib_path, |library| library.delete_target(&target, kind))
+            })
+            .await?;
             match outcome {
                 DeleteOutcome::Song(song) => {
                     println!("Deleted song '{}' from library.", song.title);
@@ -129,9 +156,13 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Create { playlist, songs } => {
-            let mut library = Library::load(&paths.library_path)?;
-            let created = library.create_playlist(&playlist, &songs)?;
-            library.save(&paths.library_path)?;
+            let lib_path = paths.library_path.clone();
+            let created = run_blocking(move || {
+                Library::update(&lib_path, |library| {
+                    library.create_playlist(&playlist, &songs)
+                })
+            })
+            .await?;
             println!(
                 "Created playlist '{}' with {} song(s).",
                 created.name,
@@ -140,21 +171,21 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Pause => {
-            let status = ipc::send_request(&paths, &IpcRequest::SetPaused(true))?;
+            let status = ipc::send_request(&paths, &IpcRequest::SetPaused(true)).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Resume => {
-            let status = ipc::send_request(&paths, &IpcRequest::SetPaused(false))?;
+            let status = ipc::send_request(&paths, &IpcRequest::SetPaused(false)).await?;
             print_playback_status(&status);
             Ok(())
         }
         Command::Stop => {
-            let status = ipc::send_request(&paths, &IpcRequest::Stop)?;
+            let status = ipc::send_request(&paths, &IpcRequest::Stop).await?;
             print_playback_status(&status);
             Ok(())
         }
-        Command::Status => match ipc::send_request(&paths, &IpcRequest::GetStatus) {
+        Command::Status => match ipc::send_request(&paths, &IpcRequest::GetStatus).await {
             Ok(status) => {
                 print_playback_status(&status);
                 Ok(())
@@ -166,12 +197,22 @@ fn run() -> Result<()> {
             Err(err) => Err(err),
         },
         Command::List { kind } => {
-            let library = Library::load(&paths.library_path)?;
+            let lib_path = paths.library_path.clone();
+            let library = run_blocking(move || Library::load(&lib_path)).await?;
             print_library_list(&library, kind);
             Ok(())
         }
         Command::Download(opts) => {
-            let outcome = download::run_download(&paths, &opts)?;
+            let outcome = if opts.urls.is_empty() {
+                download::run_download(&paths, &opts).await?
+            } else if !opts.no_tui
+                && std::io::stdout().is_terminal()
+                && std::io::stdin().is_terminal()
+            {
+                download_tui::run_download_tui(&paths, &opts).await?
+            } else {
+                download_tui::run_download_with_line_progress(&paths, &opts).await?
+            };
             if let Some(saved_dest) = &outcome.saved_dest {
                 println!(
                     "Saved default download destination: {}",
@@ -195,6 +236,16 @@ fn run() -> Result<()> {
                 for skipped in &summary.skipped_files {
                     eprintln!("warning: skipped {skipped}");
                 }
+            }
+            for failure in &outcome.failed {
+                eprintln!("download failed for {}: {}", failure.url, failure.error);
+            }
+            if !outcome.failed.is_empty() {
+                return Err(TermusicError::Download(format!(
+                    "{} download(s) failed ({} succeeded)",
+                    outcome.failed.len(),
+                    outcome.downloaded_files.len()
+                )));
             }
             Ok(())
         }

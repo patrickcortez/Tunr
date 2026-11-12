@@ -1,44 +1,24 @@
-use std::fs;
-use std::io::{self, BufReader};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::Duration;
+
+use tokio::io::BufReader;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 
 use crate::audio::AudioSink;
 use crate::audio::pulse::PulseSimpleSink;
 use crate::error::{Result, TermusicError};
 use crate::ipc::{self, IpcRequest, IpcResponse};
-use crate::paths::AppPaths;
+use crate::paths::{self, AppPaths};
 use crate::player::{self, EngineCommand, EngineHandle};
 
-const ACCEPT_POLL_TIMEOUT_MS: i32 = 100;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
-
-static SIGNAL_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_termination_signal(_sig: libc::c_int) {
-    SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() -> Result<()> {
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_termination_signal as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0;
-
-        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
+const CLIENT_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct CleanupGuard {
     socket_path: PathBuf,
@@ -52,41 +32,92 @@ impl Drop for CleanupGuard {
     }
 }
 
-/// Start the background playback daemon using PulseAudio (`PulseSimpleSink`) and `SIGINT`/`SIGTERM`
-/// shutdown handlers.
-pub fn run_daemon(paths: &AppPaths) -> Result<()> {
-    paths.ensure_dirs()?;
-    prepare_daemon_files(paths)?;
+struct ProcessSignals {
+    sigint: Signal,
+    sigterm: Signal,
+}
 
-    let sink = PulseSimpleSink::new()?;
-    SIGNAL_SHUTDOWN.store(false, Ordering::SeqCst);
-    install_signal_handlers()?;
+impl ProcessSignals {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
 
-    run_daemon_impl(paths, Box::new(sink), None, true)
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.sigint.recv() => {}
+            _ = self.sigterm.recv() => {}
+        }
+    }
+}
+
+/// Start the background playback daemon using PulseAudio (`PulseSimpleSink`) and Tokio Unix
+/// signal handlers (`SIGINT` / `SIGTERM`).
+pub async fn run_daemon(paths: &AppPaths) -> Result<()> {
+    run_daemon_impl(
+        paths,
+        || Ok(Box::new(PulseSimpleSink::new()?)),
+        None,
+        None,
+        true,
+    )
+    .await
 }
 
 /// Start the daemon IPC server and audio engine using a caller-supplied [`AudioSink`].
 ///
-/// If `ready_tx` is provided, signals `()` once the PID file is written and the `UnixListener` is
-/// bound and ready to accept connections.
-pub fn run_daemon_with_sink(
+/// If `ready_tx` is provided, signals `()` once `daemon.lock` is held, the PID file is written,
+/// and the `UnixListener` is bound and ready to accept connections. Optional `shutdown_rx` lets
+/// callers trigger graceful shutdown without modifying process-wide signal handlers.
+pub async fn run_daemon_with_sink(
     paths: &AppPaths,
     sink: Box<dyn AudioSink>,
-    ready_tx: Option<mpsc::Sender<()>>,
+    ready_tx: Option<oneshot::Sender<()>>,
+    shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
-    run_daemon_impl(paths, sink, ready_tx, false)
+    run_daemon_impl(paths, move || Ok(sink), ready_tx, shutdown_rx, false).await
 }
 
-fn run_daemon_impl(
+async fn run_daemon_impl<F>(
     paths: &AppPaths,
-    sink: Box<dyn AudioSink>,
-    ready_tx: Option<mpsc::Sender<()>>,
+    make_sink: F,
+    ready_tx: Option<oneshot::Sender<()>>,
+    ext_shutdown_rx: Option<watch::Receiver<bool>>,
     watch_process_signals: bool,
-) -> Result<()> {
-    paths.ensure_dirs()?;
-    prepare_daemon_files(paths)?;
+) -> Result<()>
+where
+    F: FnOnce() -> Result<Box<dyn AudioSink>> + Send + 'static,
+{
+    let mut proc_signals = if watch_process_signals {
+        Some(ProcessSignals::new()?)
+    } else {
+        None
+    };
 
-    fs::write(&paths.pid_path, format!("{}\n", std::process::id()))?;
+    let startup_paths = paths.clone();
+    let (_daemon_lock, sink): (File, Box<dyn AudioSink>) = tokio::task::spawn_blocking(move || {
+        startup_paths.ensure_dirs()?;
+
+        // Acquire exclusive ownership of `daemon.lock` BEFORE inspecting or deleting any socket/PID
+        // files so concurrent cold-starting daemons never clobber the active owner's files.
+        let Some(daemon_lock) =
+            paths::acquire_file_lock(&startup_paths.daemon_lock_path(), true, false)?
+        else {
+            return Err(TermusicError::Daemon("daemon already running".to_string()));
+        };
+
+        prepare_daemon_files(&startup_paths)?;
+        let sink = make_sink()?;
+        fs::write(
+            &startup_paths.pid_path,
+            format!("{}\n", std::process::id()),
+        )?;
+        Ok((daemon_lock, sink))
+    })
+    .await
+    .map_err(|err| TermusicError::Async(format!("daemon startup task failed: {err}")))??;
 
     let listener = match UnixListener::bind(&paths.socket_path) {
         Ok(listener) => listener,
@@ -99,7 +130,6 @@ fn run_daemon_impl(
         socket_path: paths.socket_path.clone(),
         pid_path: paths.pid_path.clone(),
     };
-    listener.set_nonblocking(true)?;
 
     let (engine, engine_thread) = player::spawn_engine(sink)?;
 
@@ -107,39 +137,52 @@ fn run_daemon_impl(
         let _ = tx.send(());
     }
 
-    let local_shutdown = AtomicBool::new(false);
+    let (shutdown_tx, shutdown_rx_local) = watch::channel(false);
+    let mut client_tasks: JoinSet<()> = JoinSet::new();
+
     let loop_result = run_accept_loop(
-        &listener,
+        listener,
         &engine,
-        &local_shutdown,
-        watch_process_signals,
-    );
+        &shutdown_tx,
+        shutdown_rx_local,
+        ext_shutdown_rx,
+        &mut proc_signals,
+        &mut client_tasks,
+    )
+    .await;
 
-    if !local_shutdown.load(Ordering::SeqCst) {
-        let _ = engine.send(EngineCommand::Shutdown);
+    drain_client_tasks(&mut client_tasks).await;
+
+    if !*shutdown_tx.borrow() {
+        let _ = tokio::time::timeout(
+            ENGINE_SHUTDOWN_TIMEOUT,
+            engine.send(EngineCommand::Shutdown),
+        )
+        .await;
     }
-    let _ = engine_thread.join();
+    drop(engine);
 
-    loop_result
-}
+    let join_res = tokio::task::spawn_blocking(move || engine_thread.join())
+        .await
+        .map_err(|err| TermusicError::Async(format!("engine join task failed: {err}")))
+        .and_then(|res| {
+            res.map_err(|_| TermusicError::Async("audio engine thread panicked".to_string()))
+        });
 
-fn prepare_daemon_files(paths: &AppPaths) -> Result<()> {
-    if paths.socket_path.exists() {
-        if read_live_pid(&paths.pid_path).is_some() {
-            return Err(TermusicError::Daemon("daemon already running".to_string()));
-        }
-        remove_if_exists(&paths.socket_path)?;
-        remove_if_exists(&paths.pid_path)?;
-    } else if paths.pid_path.exists() && read_live_pid(&paths.pid_path).is_none() {
-        remove_if_exists(&paths.pid_path)?;
-    }
+    // Drop socket/PID cleanup guard BEFORE releasing `_daemon_lock` so no racing startup removes
+    // our files or binds out of order.
+    drop(_cleanup);
+    drop(_daemon_lock);
+
+    loop_result?;
+    join_res?;
     Ok(())
 }
 
-fn read_live_pid(pid_path: &Path) -> Option<i32> {
-    let raw = fs::read_to_string(pid_path).ok()?;
-    let pid = raw.trim().parse::<i32>().ok()?;
-    ipc::is_pid_alive(pid).then_some(pid)
+fn prepare_daemon_files(paths: &AppPaths) -> Result<()> {
+    remove_if_exists(&paths.socket_path)?;
+    remove_if_exists(&paths.pid_path)?;
+    Ok(())
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {
@@ -150,109 +193,179 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn run_accept_loop(
-    listener: &UnixListener,
+async fn wait_watch_true(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
+async fn wait_optional_watch_true(rx: &mut Option<watch::Receiver<bool>>) {
+    match rx {
+        Some(rx) => wait_watch_true(rx).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_optional_signals(signals: &mut Option<ProcessSignals>) {
+    match signals {
+        Some(s) => s.recv().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn run_accept_loop(
+    listener: UnixListener,
     engine: &EngineHandle,
-    local_shutdown: &AtomicBool,
-    watch_process_signals: bool,
+    shutdown_tx: &watch::Sender<bool>,
+    mut local_shutdown_rx: watch::Receiver<bool>,
+    mut ext_shutdown_rx: Option<watch::Receiver<bool>>,
+    proc_signals: &mut Option<ProcessSignals>,
+    client_tasks: &mut JoinSet<()>,
 ) -> Result<()> {
     loop {
-        if should_stop(local_shutdown, watch_process_signals) {
-            break;
-        }
+        while client_tasks.try_join_next().is_some() {}
 
-        let mut pfd = libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, ACCEPT_POLL_TIMEOUT_MS) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
+        tokio::select! {
+            biased;
+            _ = wait_watch_true(&mut local_shutdown_rx) => {
+                break;
             }
-            return Err(err.into());
-        }
-        if rc == 0 {
-            continue;
-        }
-
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if let Err(err) = handle_client(stream, engine, local_shutdown) {
-                        eprintln!("daemon client error: {err}");
+            _ = wait_optional_watch_true(&mut ext_shutdown_rx) => {
+                break;
+            }
+            _ = wait_optional_signals(proc_signals) => {
+                break;
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, _)) => {
+                        let engine_clone = engine.clone();
+                        let shutdown_tx_clone = shutdown_tx.clone();
+                        client_tasks.spawn(async move {
+                            if let Err(err) =
+                                handle_client(stream, engine_clone, shutdown_tx_clone).await
+                            {
+                                eprintln!("daemon client error: {err}");
+                            }
+                        });
                     }
-                    if local_shutdown.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    if should_stop(local_shutdown, watch_process_signals) {
-                        return Ok(());
-                    }
-                }
-                Err(err) => return Err(err.into()),
             }
         }
     }
 
+    drop(listener);
     Ok(())
 }
 
-fn should_stop(local_shutdown: &AtomicBool, watch_process_signals: bool) -> bool {
-    local_shutdown.load(Ordering::SeqCst)
-        || (watch_process_signals && SIGNAL_SHUTDOWN.load(Ordering::SeqCst))
+async fn drain_client_tasks(client_tasks: &mut JoinSet<()>) {
+    if client_tasks.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::sleep(CLIENT_SHUTDOWN_GRACE);
+    tokio::pin!(deadline);
+
+    while !client_tasks.is_empty() {
+        tokio::select! {
+            joined = client_tasks.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
+            _ = &mut deadline => {
+                client_tasks.abort_all();
+                while client_tasks.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
 }
 
-fn handle_client(
+async fn handle_client(
     mut stream: UnixStream,
-    engine: &EngineHandle,
-    local_shutdown: &AtomicBool,
+    engine: EngineHandle,
+    shutdown_tx: watch::Sender<bool>,
 ) -> Result<()> {
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
-
     let req = {
-        let mut reader = BufReader::new(&stream);
-        match ipc::read_message::<IpcRequest>(&mut reader) {
-            Ok(Some(req)) => req,
-            Ok(None) => return Ok(()),
-            Err(err) => {
-                let _ = ipc::write_message(&mut stream, &IpcResponse::Err(err.to_string()));
+        let mut reader = BufReader::new(&mut stream);
+        match tokio::time::timeout(
+            CLIENT_IO_TIMEOUT,
+            ipc::read_message::<_, IpcRequest>(&mut reader),
+        )
+        .await
+        {
+            Ok(Ok(Some(req))) => req,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(err)) => {
+                let _ = tokio::time::timeout(
+                    CLIENT_IO_TIMEOUT,
+                    ipc::write_message(&mut stream, &IpcResponse::Err(err.to_string())),
+                )
+                .await;
                 return Ok(());
+            }
+            Err(_) => {
+                return Err(TermusicError::Ipc(
+                    "timed out reading IPC request from client".to_string(),
+                ));
             }
         }
     };
 
+    let is_shutdown = matches!(req, IpcRequest::Shutdown);
     let response = match req {
-        IpcRequest::GetStatus => IpcResponse::Ok(engine.status()),
+        IpcRequest::GetStatus => IpcResponse::Ok((*engine.status()).clone()),
         IpcRequest::Shutdown => {
-            local_shutdown.store(true, Ordering::SeqCst);
-            match engine.send(EngineCommand::Shutdown) {
-                Ok(status) => IpcResponse::Ok(status),
-                Err(err) => IpcResponse::Err(err.to_string()),
+            match tokio::time::timeout(
+                CLIENT_IO_TIMEOUT,
+                engine.send(EngineCommand::Shutdown),
+            )
+            .await
+            {
+                Ok(Ok(status)) => IpcResponse::Ok(status),
+                Ok(Err(err)) => IpcResponse::Err(err.to_string()),
+                Err(_) => {
+                    IpcResponse::Err("timed out waiting for audio engine shutdown".to_string())
+                }
             }
         }
         other => {
             let cmd = map_ipc_to_engine_command(other);
-            match engine.send(cmd) {
-                Ok(status) => IpcResponse::Ok(status),
-                Err(err) => IpcResponse::Err(err.to_string()),
+            match tokio::time::timeout(CLIENT_IO_TIMEOUT, engine.send(cmd)).await {
+                Ok(Ok(status)) => IpcResponse::Ok(status),
+                Ok(Err(err)) => IpcResponse::Err(err.to_string()),
+                Err(_) => {
+                    IpcResponse::Err("timed out waiting for audio engine command".to_string())
+                }
             }
         }
     };
 
-    if let Err(err) = ipc::write_message(&mut stream, &response)
-        && !is_client_disconnect(&err)
-    {
-        return Err(err);
+    let write_res = tokio::time::timeout(
+        CLIENT_IO_TIMEOUT,
+        ipc::write_message(&mut stream, &response),
+    )
+    .await;
+
+    if is_shutdown {
+        let _ = shutdown_tx.send(true);
     }
 
-    Ok(())
+    match write_res {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) if is_client_disconnect(&err) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(TermusicError::Ipc(
+            "timed out writing IPC response to client".to_string(),
+        )),
+    }
 }
 
 fn map_ipc_to_engine_command(req: IpcRequest) -> EngineCommand {
@@ -295,7 +408,8 @@ fn is_client_disconnect(err: &TermusicError) -> bool {
 mod tests {
     use std::f32::consts::PI;
     use std::process::Command;
-    use std::thread;
+
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
     use crate::audio::null_sink::NullSink;
@@ -359,8 +473,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn daemon_ipc_round_trips_playback_controls_and_cleans_up_on_shutdown() {
+    #[tokio::test]
+    async fn daemon_ipc_round_trips_playback_controls_and_cleans_up_on_shutdown() {
         let dir = temp_workspace("roundtrip");
         let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
         let songs = vec![
@@ -370,16 +484,17 @@ mod tests {
 
         let sink = NullSink::with_pacing(Duration::from_millis(8));
         let stats = sink.stats();
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let daemon_paths = paths.clone();
 
-        let daemon_thread = thread::spawn(move || {
-            run_daemon_with_sink(&daemon_paths, Box::new(sink), Some(ready_tx))
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&daemon_paths, Box::new(sink), Some(ready_tx), None).await
         });
 
-        ready_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("daemon should signal readiness");
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("daemon should signal readiness")
+            .unwrap();
 
         assert!(paths.socket_path.exists());
         assert!(paths.pid_path.exists());
@@ -391,12 +506,16 @@ mod tests {
         assert_eq!(recorded_pid, std::process::id());
 
         // Initial GetStatus is Stopped.
-        let initial = ipc::send_request(&paths, &IpcRequest::GetStatus).unwrap();
+        let initial = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
         assert_eq!(initial.state, PlaybackState::Stopped);
         assert!(initial.current_track.is_none());
 
         // Next before Play returns clean Daemon error over IPC.
-        let err = ipc::send_request(&paths, &IpcRequest::Next).unwrap_err();
+        let err = ipc::send_request(&paths, &IpcRequest::Next)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TermusicError::Daemon(_)));
 
         // Play starts queue at Alpha.
@@ -409,6 +528,7 @@ mod tests {
                 playlist_name: Some("DaemonMix".to_string()),
             },
         )
+        .await
         .unwrap();
         assert_eq!(playing.state, PlaybackState::Playing);
         assert_eq!(playing.playlist_name.as_deref(), Some("DaemonMix"));
@@ -417,66 +537,90 @@ mod tests {
         assert_eq!(playing.queue_len, 2);
 
         // GetStatus reports active playback.
-        let polled = ipc::send_request(&paths, &IpcRequest::GetStatus).unwrap();
+        let polled = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
         assert_eq!(polled.state, PlaybackState::Playing);
         assert_eq!(polled.current_track.as_ref().unwrap().title, "Alpha");
 
         // Next advances to Beta; Prev returns to Alpha.
-        let next = ipc::send_request(&paths, &IpcRequest::Next).unwrap();
+        let next = ipc::send_request(&paths, &IpcRequest::Next).await.unwrap();
         assert_eq!(next.current_track.as_ref().unwrap().title, "Beta");
         assert_eq!(next.queue_index, 1);
 
-        let prev = ipc::send_request(&paths, &IpcRequest::Prev).unwrap();
+        let prev = ipc::send_request(&paths, &IpcRequest::Prev).await.unwrap();
         assert_eq!(prev.current_track.as_ref().unwrap().title, "Alpha");
         assert_eq!(prev.queue_index, 0);
         assert_eq!(prev.position_secs, 0.0);
 
         // SeekRelative forward then rewind past 0.
-        let adv = ipc::send_request(&paths, &IpcRequest::SeekRelative(0.5)).unwrap();
+        let adv = ipc::send_request(&paths, &IpcRequest::SeekRelative(0.5))
+            .await
+            .unwrap();
         assert!(adv.position_secs >= 0.4);
-        let rew = ipc::send_request(&paths, &IpcRequest::SeekRelative(-5.0)).unwrap();
+        let rew = ipc::send_request(&paths, &IpcRequest::SeekRelative(-5.0))
+            .await
+            .unwrap();
         assert_eq!(rew.position_secs, 0.0);
 
         // TogglePause -> Paused -> TogglePause -> Playing.
-        let paused = ipc::send_request(&paths, &IpcRequest::TogglePause).unwrap();
+        let paused = ipc::send_request(&paths, &IpcRequest::TogglePause)
+            .await
+            .unwrap();
         assert_eq!(paused.state, PlaybackState::Paused);
-        let resumed = ipc::send_request(&paths, &IpcRequest::TogglePause).unwrap();
+        let resumed = ipc::send_request(&paths, &IpcRequest::TogglePause)
+            .await
+            .unwrap();
         assert_eq!(resumed.state, PlaybackState::Playing);
 
         // Stop -> Stopped.
-        let stopped = ipc::send_request(&paths, &IpcRequest::Stop).unwrap();
+        let stopped = ipc::send_request(&paths, &IpcRequest::Stop).await.unwrap();
         assert_eq!(stopped.state, PlaybackState::Stopped);
         assert_eq!(stopped.position_secs, 0.0);
         assert!(stopped.current_track.is_none());
 
         // Shutdown stops daemon and removes socket/pid files.
-        let bye = ipc::send_request(&paths, &IpcRequest::Shutdown).unwrap();
+        let bye = ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
         assert_eq!(bye.state, PlaybackState::Stopped);
 
-        daemon_thread.join().unwrap().unwrap();
+        daemon_task.await.unwrap().unwrap();
         assert!(!paths.socket_path.exists());
         assert!(!paths.pid_path.exists());
         assert!(!stats.is_open());
         assert!(stats.flush_count() >= 1);
         assert!(stats.close_count() >= 1);
 
+        // Verify daemon.lock was released after CleanupGuard dropped.
+        assert!(
+            paths::acquire_file_lock(&paths.daemon_lock_path(), true, false)
+                .unwrap()
+                .is_some()
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn daemon_rejects_second_instance_when_live_pid_owns_socket() {
+    #[tokio::test]
+    async fn daemon_rejects_second_instance_when_live_pid_owns_socket() {
         let dir = temp_workspace("duplicate");
         let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
 
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let p1 = paths.clone();
-        let t1 = thread::spawn(move || {
-            run_daemon_with_sink(&p1, Box::new(NullSink::new()), Some(ready_tx))
+        let t1 = tokio::spawn(async move {
+            run_daemon_with_sink(&p1, Box::new(NullSink::new()), Some(ready_tx), None).await
         });
 
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
 
-        let dup_err = run_daemon_with_sink(&paths, Box::new(NullSink::new()), None).unwrap_err();
+        let dup_err = run_daemon_with_sink(&paths, Box::new(NullSink::new()), None, None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(dup_err, TermusicError::Daemon(ref msg) if msg.contains("already running")),
             "unexpected duplicate daemon error: {dup_err:?}"
@@ -485,19 +629,23 @@ mod tests {
         // First daemon's socket and PID remain intact and functional.
         assert!(paths.socket_path.exists());
         assert!(paths.pid_path.exists());
-        let status = ipc::send_request(&paths, &IpcRequest::GetStatus).unwrap();
+        let status = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
         assert_eq!(status.state, PlaybackState::Stopped);
 
-        ipc::send_request(&paths, &IpcRequest::Shutdown).unwrap();
-        t1.join().unwrap().unwrap();
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        t1.await.unwrap().unwrap();
         assert!(!paths.socket_path.exists());
         assert!(!paths.pid_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn daemon_cleans_stale_socket_and_pid_for_dead_process() {
+    #[tokio::test]
+    async fn daemon_cleans_stale_socket_and_pid_for_dead_process() {
         let dir = temp_workspace("stale-startup");
         let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
         paths.ensure_dirs().unwrap();
@@ -510,18 +658,109 @@ mod tests {
         fs::write(&paths.pid_path, format!("{dead_pid}\n")).unwrap();
         fs::write(&paths.socket_path, "stale-socket").unwrap();
 
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let p = paths.clone();
-        let daemon_thread = thread::spawn(move || {
-            run_daemon_with_sink(&p, Box::new(NullSink::new()), Some(ready_tx))
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&p, Box::new(NullSink::new()), Some(ready_tx), None).await
         });
 
-        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let status = ipc::send_request(&paths, &IpcRequest::GetStatus).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
         assert_eq!(status.state, PlaybackState::Stopped);
 
-        ipc::send_request(&paths, &IpcRequest::Shutdown).unwrap();
-        daemon_thread.join().unwrap().unwrap();
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
+        assert!(!paths.socket_path.exists());
+        assert!(!paths.pid_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_status_does_not_block_behind_stalled_peer() {
+        let dir = temp_workspace("stalled-peer");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+        let song = make_song(&dir, "Tone", 2.0);
+
+        let sink = NullSink::with_pacing(Duration::from_millis(12));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let p = paths.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&p, Box::new(sink), Some(ready_tx), None).await
+        });
+        ready_rx.await.unwrap();
+
+        ipc::send_request(
+            &paths,
+            &IpcRequest::Play {
+                queue: vec![song],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Connect a stalled peer that sends an incomplete JSON line without `\n`.
+        let mut stalled = UnixStream::connect(&paths.socket_path).await.unwrap();
+        stalled.write_all(b"{\"Get").await.unwrap();
+
+        // Concurrent GetStatus requests must complete quickly rather than stalling on peer 1.
+        let start = tokio::time::Instant::now();
+        let mut readers = JoinSet::new();
+        for _ in 0..8 {
+            let p_clone = paths.clone();
+            readers.spawn(async move { ipc::send_request(&p_clone, &IpcRequest::GetStatus).await });
+        }
+        while let Some(res) = readers.join_next().await {
+            let status = res.unwrap().unwrap();
+            assert_eq!(status.state, PlaybackState::Playing);
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "GetStatus blocked behind stalled peer ({:?})",
+            start.elapsed()
+        );
+
+        drop(stalled);
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn external_watch_shutdown_stops_daemon_cleanly() {
+        let dir = temp_workspace("watch-shutdown");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let p = paths.clone();
+
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(
+                &p,
+                Box::new(NullSink::new()),
+                Some(ready_tx),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        ready_rx.await.unwrap();
+        assert!(paths.socket_path.exists());
+
+        shutdown_tx.send(true).unwrap();
+        daemon_task.await.unwrap().unwrap();
         assert!(!paths.socket_path.exists());
         assert!(!paths.pid_path.exists());
 
