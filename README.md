@@ -112,7 +112,7 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song or playlist by name or 1-based `list` index, or resume paused playback when omitted |
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
 | `termusic next` / `prev` | Skip to next or previous track |
-| `termusic rewind <secs>` / `advance <secs>` | Seek backward or forward |
+| `termusic rewind [secs]` / `advance <secs>` | Seek backward (omitting `<secs>` rewinds to the beginning of the song) or forward |
 | `termusic create <name> songs=<s1,s2,...>` | Create a playlist from existing library songs |
 | `termusic delete <target>` | Remove a song or playlist from the library index (leaves files on disk untouched) |
 | `termusic status` | Show current daemon playback status |
@@ -133,6 +133,7 @@ Play a song or playlist by title/name or by its 1-based index from `termusic lis
 | `--song` | Force interpreting `[TARGET]` / `--index` as a song |
 | `--playlist` | Force interpreting `[TARGET]` / `--index` as a playlist |
 | `--artist <ARTIST>` | Disambiguate song title matches by artist name |
+| `-l`, `--loop <BOOL>` | Loop back to the first song after the last song finishes (`true`/`false`, defaults to `false`) |
 
 ### Index Resolution Rules
 
@@ -153,12 +154,18 @@ termusic play 3 shuffle
 # Play playlist #2 from `termusic list`
 termusic play --playlist 2
 
+# Play a playlist and loop back to the beginning when it finishes
+termusic play MyPlaylist --loop true
+
 # Force strict index lookup
 termusic play -i 3
 termusic play --playlist -i 2 shuffle
 
 # Play by title with artist disambiguation
 termusic play "Echoes" --artist "Artist Two"
+
+# Rewind to the beginning of the current song
+termusic rewind
 ```
 
 ## `termusic search`

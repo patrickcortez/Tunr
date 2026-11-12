@@ -125,6 +125,14 @@ pub enum RawCommand {
             conflicts_with = "artist"
         )]
         index: Option<usize>,
+        /// Loop back to the first song after the last song finishes (true/false)
+        #[arg(
+            short = 'l',
+            long = "loop",
+            action = clap::ArgAction::Set,
+            value_name = "BOOL"
+        )]
+        loop_playback: Option<bool>,
     },
 
     /// Add an audio file or folder of audio files to the library
@@ -147,10 +155,10 @@ pub enum RawCommand {
     /// Return to the previous track
     Prev,
 
-    /// Rewind playback by <seconds>
+    /// Rewind playback by <seconds>, or back to the beginning when omitted
     Rewind {
         #[arg(allow_negative_numbers = true, value_parser = parse_non_negative_secs)]
-        seconds: f64,
+        seconds: Option<f64>,
     },
 
     /// Advance playback by <seconds>
@@ -335,6 +343,7 @@ pub enum Command {
         mode: PlayMode,
         kind: TargetKind,
         artist: Option<String>,
+        loop_playback: bool,
     },
     Add {
         folder: bool,
@@ -345,7 +354,7 @@ pub enum Command {
     Next,
     Prev,
     Rewind {
-        seconds: f64,
+        seconds: Option<f64>,
     },
     Advance {
         seconds: f64,
@@ -471,6 +480,7 @@ fn validate_cli(cli: Cli) -> Result<Command> {
             playlist,
             artist,
             index,
+            loop_playback,
         } => {
             if let Some(idx) = index {
                 if artist.is_some() {
@@ -500,12 +510,13 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                     mode: mode.unwrap_or_default(),
                     kind: resolve_target_kind(song, playlist)?,
                     artist: None,
+                    loop_playback: loop_playback.unwrap_or(false),
                 });
             }
 
             match target {
                 None => {
-                    if song || playlist || mode.is_some() || artist.is_some() {
+                    if song || playlist || mode.is_some() || artist.is_some() || loop_playback.is_some() {
                         return Err(TermusicError::InvalidArg(
                             "play requires a song or playlist name when flags or play mode are specified"
                                 .to_string(),
@@ -536,6 +547,7 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                         mode: mode.unwrap_or_default(),
                         kind: resolve_target_kind(song, playlist)?,
                         artist: clean_artist,
+                        loop_playback: loop_playback.unwrap_or(false),
                     })
                 }
             }
@@ -875,6 +887,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -884,6 +897,7 @@ mod tests {
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -893,6 +907,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Playlist,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -902,6 +917,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Song,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -911,6 +927,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: Some("Artist A".to_string()),
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -929,6 +946,7 @@ mod tests {
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Song,
                 artist: Some("Artist B".to_string()),
+                loop_playback: false,
             }
         );
         assert!(parse_cli_from(["termusic", "play", "--song"]).is_err());
@@ -951,6 +969,88 @@ mod tests {
     }
 
     #[test]
+    fn play_parses_loop_flag_and_rejects_invalid_usage() {
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "My Song", "-l", "true"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("My Song".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: true,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "My Song", "-l", "false"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("My Song".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: false,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyPlaylist", "--loop", "true"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyPlaylist".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: true,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyPlaylist", "--loop", "false"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyPlaylist".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: false,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyPlaylist", "--loop=true"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyPlaylist".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: true,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "--index", "2", "shuffle", "--loop", "true"])
+                .unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(2),
+                mode: PlayMode::Shuffle,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: true,
+            }
+        );
+
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "My Song", "--loop"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "My Song", "--loop", "maybe"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "--loop", "true"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "--loop", "false"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
     fn play_parses_numeric_targets_and_index_flag() {
         assert_eq!(
             parse_cli_from(["termusic", "play", "3"]).unwrap(),
@@ -959,6 +1059,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -968,6 +1069,7 @@ mod tests {
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -977,6 +1079,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -986,6 +1089,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -995,6 +1099,7 @@ mod tests {
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Auto,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -1004,6 +1109,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Playlist,
                 artist: None,
+                loop_playback: false,
             }
         );
         assert_eq!(
@@ -1013,6 +1119,7 @@ mod tests {
                 mode: PlayMode::Next,
                 kind: TargetKind::Song,
                 artist: None,
+                loop_playback: false,
             }
         );
 
@@ -1128,12 +1235,16 @@ mod tests {
         assert_eq!(parse_cli_from(["termusic", "next"]).unwrap(), Command::Next);
         assert_eq!(parse_cli_from(["termusic", "prev"]).unwrap(), Command::Prev);
         assert_eq!(
+            parse_cli_from(["termusic", "rewind"]).unwrap(),
+            Command::Rewind { seconds: None }
+        );
+        assert_eq!(
             parse_cli_from(["termusic", "rewind", "5.5"]).unwrap(),
-            Command::Rewind { seconds: 5.5 }
+            Command::Rewind { seconds: Some(5.5) }
         );
         assert_eq!(
             parse_cli_from(["termusic", "rewind", "0"]).unwrap(),
-            Command::Rewind { seconds: 0.0 }
+            Command::Rewind { seconds: Some(0.0) }
         );
         assert_eq!(
             parse_cli_from(["termusic", "advance", "12"]).unwrap(),

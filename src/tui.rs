@@ -605,6 +605,7 @@ impl TuiApp {
             start_index,
             mode: self.mode,
             playlist_name,
+            loop_playback: false,
         };
         let generation = self.next_status_gen();
         self.min_status_gen = generation;
@@ -831,7 +832,7 @@ impl TuiApp {
             ),
         };
 
-        let title_line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 concat!(" Termusic v", env!("CARGO_PKG_VERSION")),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -841,9 +842,17 @@ impl TuiApp {
                 mode_text,
                 Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   |   ", Style::new().fg(Color::DarkGray)),
-            Span::styled(state_text, state_style),
-        ]);
+        ];
+        if self.status.loop_playback {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "[Loop]",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled("   |   ", Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(state_text, state_style));
+        let title_line = Line::from(spans);
 
         let block = Block::bordered()
             .border_type(border_type(ascii))
@@ -1596,6 +1605,7 @@ mod tests {
                 start_index,
                 mode,
                 playlist_name,
+                loop_playback,
             } = req
             {
                 let idx = start_index.unwrap_or(0);
@@ -1604,6 +1614,7 @@ mod tests {
                     state: PlaybackState::Playing,
                     mode: *mode,
                     playlist_name: playlist_name.clone(),
+                    loop_playback: *loop_playback,
                     current_track,
                     queue_index: idx,
                     queue_len: queue.len(),
@@ -1767,6 +1778,7 @@ mod tests {
                 start_index: Some(1),
                 mode: PlayMode::Next,
                 playlist_name: Some("Chill".to_string()),
+                loop_playback: false,
             }
         );
 
@@ -1822,6 +1834,7 @@ mod tests {
                 start_index: None,
                 mode: PlayMode::Shuffle,
                 playlist_name: None,
+                loop_playback: false,
                 queue,
             } if queue.len() == 3
         ));
@@ -1836,6 +1849,7 @@ mod tests {
                 start_index: Some(1),
                 mode: PlayMode::Shuffle,
                 playlist_name: None,
+                loop_playback: false,
                 queue,
             } if queue.len() == 3
         ));
@@ -1930,6 +1944,7 @@ mod tests {
                 state: PlaybackState::Playing,
                 mode: PlayMode::Next,
                 playlist_name: Some("Chill".to_string()),
+                loop_playback: false,
                 current_track: Some(active_song.clone()),
                 queue_index: 0,
                 queue_len: 2,
@@ -2044,6 +2059,7 @@ mod tests {
             state: PlaybackState::Playing,
             mode: PlayMode::Next,
             playlist_name: None,
+            loop_playback: false,
             current_track: Some(track.clone()),
             queue_index: 0,
             queue_len: 3,
@@ -2272,5 +2288,28 @@ mod tests {
         assert!(screen.contains("|| Alpha Dawn"), "missing ASCII pause icon:\n{screen}");
         assert!(!screen.contains('╭'), "unexpected rounded border in ASCII mode:\n{screen}");
         assert!(!screen.contains('▶'), "unexpected unicode play glyph in ASCII mode:\n{screen}");
+    }
+
+    #[test]
+    fn render_header_displays_loop_badge_only_when_loop_playback_is_enabled() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.status.state = PlaybackState::Playing;
+        app.status.loop_playback = false;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let without_loop = terminal.backend().to_string();
+        assert!(without_loop.contains("[Mode: Next]"), "missing mode:\n{without_loop}");
+        assert!(
+            !without_loop.contains("[Loop]"),
+            "unexpected [Loop] when disabled:\n{without_loop}"
+        );
+
+        app.status.loop_playback = true;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let with_loop = terminal.backend().to_string();
+        assert!(with_loop.contains("[Mode: Next]"), "missing mode:\n{with_loop}");
+        assert!(with_loop.contains("[Loop]"), "missing [Loop] when enabled:\n{with_loop}");
     }
 }

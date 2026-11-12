@@ -198,6 +198,7 @@ async fn run() -> Result<()> {
             mode,
             kind,
             artist,
+            loop_playback,
         } => {
             let lib_path = paths.library_path.clone();
             let (library, resolution) = run_blocking(move || {
@@ -253,6 +254,7 @@ async fn run() -> Result<()> {
                     start_index,
                     mode,
                     playlist_name,
+                    loop_playback,
                 },
             )
             .await?;
@@ -304,7 +306,11 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Rewind { seconds } => {
-            let status = ipc::send_request(&paths, &IpcRequest::SeekRelative(-seconds)).await?;
+            let req = match seconds {
+                Some(seconds) => IpcRequest::SeekRelative(-seconds),
+                None => IpcRequest::SeekAbsolute(0.0),
+            };
+            let status = ipc::send_request(&paths, &req).await?;
             print_playback_status(&status);
             Ok(())
         }
@@ -438,9 +444,13 @@ async fn run() -> Result<()> {
 }
 
 fn print_playback_status(status: &PlaybackStatus) {
+    let text = format_playback_status(status);
+    println!("{text}");
+}
+
+fn format_playback_status(status: &PlaybackStatus) -> String {
     if status.state == PlaybackState::Stopped || status.current_track.is_none() {
-        println!("State: {} [mode: {}]", status.state, status.mode);
-        return;
+        return format!("State: {} [mode: {}]", status.state, status.mode);
     }
 
     let track = status.current_track.as_ref().expect("checked above");
@@ -454,14 +464,19 @@ fn print_playback_status(status: &PlaybackStatus) {
         .as_deref()
         .map(|p| format!(" | playlist: {p}"))
         .unwrap_or_default();
+    let loop_label = if status.loop_playback {
+        " | loop: on"
+    } else {
+        ""
+    };
     let total = status
         .duration_secs
         .or(track.duration_secs)
         .map(format_time)
         .unwrap_or_else(|| "--:--".to_string());
 
-    println!(
-        "[{}] {}{} ({}/{}) {} / {} [mode: {}{}]",
+    format!(
+        "[{}] {}{} ({}/{}) {} / {} [mode: {}{}{}]",
         status.state,
         track.title,
         artist,
@@ -471,7 +486,8 @@ fn print_playback_status(status: &PlaybackStatus) {
         total,
         status.mode,
         playlist,
-    );
+        loop_label,
+    )
 }
 
 fn print_library_list(library: &Library, kind: Option<ListKind>) {
@@ -789,6 +805,78 @@ Songs (0):
 Playlists (0):
   (none)
 "
+        );
+    }
+
+    #[test]
+    fn format_playback_status_renders_loop_flag_with_and_without_playlist() {
+        use termusic::ipc::PlayMode;
+        use termusic::library::Song;
+
+        let track = Song {
+            id: "s1".to_string(),
+            title: "First Track".to_string(),
+            artist: Some("Artist One".to_string()),
+            album: None,
+            path: PathBuf::from("/music/first.mp3"),
+            duration_secs: Some(125.0),
+        };
+        let base = PlaybackStatus {
+            state: PlaybackState::Playing,
+            mode: PlayMode::Next,
+            playlist_name: None,
+            loop_playback: false,
+            current_track: Some(track.clone()),
+            queue_index: 0,
+            queue_len: 2,
+            position_secs: 15.0,
+            duration_secs: Some(125.0),
+            queue: vec![track],
+        };
+
+        assert_eq!(
+            format_playback_status(&base),
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next]"
+        );
+
+        let loop_no_playlist = PlaybackStatus {
+            loop_playback: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            format_playback_status(&loop_no_playlist),
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | loop: on]"
+        );
+
+        let no_loop_with_playlist = PlaybackStatus {
+            playlist_name: Some("Mix".to_string()),
+            loop_playback: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            format_playback_status(&no_loop_with_playlist),
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix]"
+        );
+
+        let loop_with_playlist = PlaybackStatus {
+            playlist_name: Some("Mix".to_string()),
+            loop_playback: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            format_playback_status(&loop_with_playlist),
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix | loop: on]"
+        );
+
+        let stopped = PlaybackStatus {
+            state: PlaybackState::Stopped,
+            loop_playback: true,
+            current_track: None,
+            ..base
+        };
+        assert_eq!(
+            format_playback_status(&stopped),
+            "State: stopped [mode: next]"
         );
     }
 }

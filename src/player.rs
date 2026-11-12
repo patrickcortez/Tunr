@@ -19,6 +19,7 @@ pub enum EngineCommand {
         start_index: Option<usize>,
         mode: PlayMode,
         playlist_name: Option<String>,
+        loop_playback: bool,
     },
     Next,
     Prev,
@@ -87,6 +88,7 @@ pub struct PlaybackEngine {
     history: Vec<usize>,
     mode: PlayMode,
     playlist_name: Option<String>,
+    loop_playback: bool,
     state: PlaybackState,
     track: Option<SymphoniaTrack>,
     position_secs: f64,
@@ -109,6 +111,7 @@ impl PlaybackEngine {
             history: Vec::new(),
             mode: PlayMode::Next,
             playlist_name: None,
+            loop_playback: false,
             state: PlaybackState::Stopped,
             track: None,
             position_secs: 0.0,
@@ -126,6 +129,7 @@ impl PlaybackEngine {
                 state: PlaybackState::Stopped,
                 mode: self.mode,
                 playlist_name: None,
+                loop_playback: false,
                 current_track: None,
                 queue_index: 0,
                 queue_len: 0,
@@ -141,6 +145,7 @@ impl PlaybackEngine {
             state: self.state,
             mode: self.mode,
             playlist_name: self.playlist_name.clone(),
+            loop_playback: self.loop_playback,
             current_track,
             queue_index: self.cursor,
             queue_len: self.active_order.len(),
@@ -180,7 +185,8 @@ impl PlaybackEngine {
                 start_index,
                 mode,
                 playlist_name,
-            } => self.load_queue(queue, start_index, mode, playlist_name),
+                loop_playback,
+            } => self.load_queue(queue, start_index, mode, playlist_name, loop_playback),
             EngineCommand::Next => self.next_track(),
             EngineCommand::Prev => self.prev_track(),
             EngineCommand::SeekRelative(delta) => self.seek_relative(delta),
@@ -205,6 +211,7 @@ impl PlaybackEngine {
         start_index: Option<usize>,
         mode: PlayMode,
         playlist_name: Option<String>,
+        loop_playback: bool,
     ) -> Result<()> {
         if queue.is_empty() {
             return Err(TermusicError::InvalidArg(
@@ -237,6 +244,7 @@ impl PlaybackEngine {
         self.history.clear();
         self.mode = mode;
         self.playlist_name = playlist_name;
+        self.loop_playback = loop_playback;
         self.track = Some(track);
         self.position_secs = 0.0;
         self.paused_position = 0.0;
@@ -491,6 +499,10 @@ impl PlaybackEngine {
     fn advance_or_stop_on_end(&mut self, drain_before_stop: bool) -> Result<()> {
         let next_cursor = self.cursor + 1;
         if next_cursor >= self.active_order.len() {
+            if self.loop_playback {
+                let prev_orig_idx = self.active_order[self.cursor];
+                return self.switch_to_cursor(0, Some(prev_orig_idx), false, drain_before_stop);
+            }
             if self.open_spec.is_some() {
                 if drain_before_stop {
                     let _ = self.sink.drain();
@@ -536,6 +548,7 @@ impl PlaybackEngine {
         self.cursor = 0;
         self.history.clear();
         self.playlist_name = None;
+        self.loop_playback = false;
         self.track = None;
         self.duration_secs = None;
         self.pending_pcm.clear();
@@ -877,6 +890,7 @@ mod tests {
             start_index: Some(1),
             mode: PlayMode::Next,
             playlist_name: Some("Mix".to_string()),
+            loop_playback: false,
         });
         assert!(keep);
         let status = res.unwrap();
@@ -924,6 +938,7 @@ mod tests {
                 start_index: Some(3),
                 mode: PlayMode::Shuffle,
                 playlist_name: None,
+                loop_playback: false,
             });
             let status = res.unwrap();
             assert_eq!(status.mode, PlayMode::Shuffle);
@@ -958,6 +973,7 @@ mod tests {
                 start_index: None,
                 mode: PlayMode::Shuffle,
                 playlist_name: Some("All".to_string()),
+                loop_playback: false,
             });
             let status = res.unwrap();
             assert_eq!(status.mode, PlayMode::Shuffle);
@@ -990,6 +1006,7 @@ mod tests {
                 start_index: Some(2),
                 mode: PlayMode::Shuffle,
                 playlist_name: None,
+                loop_playback: false,
             })
             .0
             .unwrap();
@@ -1029,6 +1046,7 @@ mod tests {
                 start_index: Some(2),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .0
             .unwrap();
@@ -1063,6 +1081,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .0
             .unwrap();
@@ -1112,6 +1131,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .0
             .unwrap();
@@ -1142,6 +1162,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .0
             .unwrap();
@@ -1174,6 +1195,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .await
             .unwrap();
@@ -1241,6 +1263,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: Some("AutoPlay".to_string()),
+                loop_playback: false,
             })
             .await
             .unwrap();
@@ -1281,6 +1304,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             })
             .await
             .unwrap();
@@ -1299,6 +1323,310 @@ mod tests {
         assert!(stats.flush_count() >= 1);
         assert_eq!(stats.close_count(), 1);
         assert!(stats.written_samples() < 44_100 * 3);
+
+        handle.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(join_handle).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seek_absolute_zero_rewinds_while_playing_and_paused_and_errors_when_stopped() {
+        let dir = temp_workspace("seek-abs-zero");
+        let songs = vec![make_song(&dir, "Tone", 44_100, 1, 1.0)];
+        let mut engine = PlaybackEngine::new(Box::new(NullSink::new()));
+
+        let err = engine.execute(EngineCommand::SeekAbsolute(0.0)).0.unwrap_err();
+        assert!(
+            matches!(err, TermusicError::Audio(ref msg) if msg == "cannot seek when playback is stopped"),
+            "unexpected error when seeking stopped engine: {err:?}"
+        );
+
+        engine
+            .execute(EngineCommand::LoadQueue {
+                queue: songs,
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .0
+            .unwrap();
+
+        let seeked = engine.execute(EngineCommand::SeekAbsolute(0.5)).0.unwrap();
+        assert!(seeked.position_secs > 0.35 && seeked.position_secs <= 0.51);
+
+        let rewound_playing = engine.execute(EngineCommand::SeekAbsolute(0.0)).0.unwrap();
+        assert_eq!(rewound_playing.state, PlaybackState::Playing);
+        assert_eq!(rewound_playing.position_secs, 0.0);
+
+        let seeked_again = engine.execute(EngineCommand::SeekAbsolute(0.5)).0.unwrap();
+        assert!(seeked_again.position_secs > 0.35);
+        let paused = engine.execute(EngineCommand::SetPaused(true)).0.unwrap();
+        assert_eq!(paused.state, PlaybackState::Paused);
+        assert!(paused.position_secs > 0.35);
+
+        let rewound_paused = engine.execute(EngineCommand::SeekAbsolute(0.0)).0.unwrap();
+        assert_eq!(rewound_paused.state, PlaybackState::Paused);
+        assert_eq!(rewound_paused.position_secs, 0.0);
+        assert_eq!(engine.paused_position, 0.0);
+
+        let resumed = engine.execute(EngineCommand::SetPaused(false)).0.unwrap();
+        assert_eq!(resumed.state, PlaybackState::Playing);
+        assert_eq!(resumed.position_secs, 0.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loop_playback_wraps_on_seek_relative_past_eof_for_next_shuffle_and_single_song() {
+        let dir = temp_workspace("loop-seek-eof");
+        let songs = vec![
+            make_song(&dir, "First", 44_100, 1, 0.5),
+            make_song(&dir, "Second", 44_100, 1, 0.5),
+            make_song(&dir, "Third", 44_100, 1, 0.5),
+        ];
+
+        let mut engine = PlaybackEngine::new(Box::new(NullSink::new()));
+
+        // 1. Multi-track queue in Next mode.
+        let loaded = engine
+            .execute(EngineCommand::LoadQueue {
+                queue: songs.clone(),
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: Some("LoopMix".to_string()),
+                loop_playback: true,
+            })
+            .0
+            .unwrap();
+        assert!(loaded.loop_playback);
+        assert_eq!(loaded.queue_index, 0);
+
+        let s1 = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(s1.queue_index, 1);
+        assert_eq!(s1.current_track.as_ref().unwrap().title, "Second");
+        assert!(s1.loop_playback);
+
+        let s2 = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(s2.queue_index, 2);
+        assert_eq!(s2.current_track.as_ref().unwrap().title, "Third");
+        assert!(s2.loop_playback);
+
+        // Past EOF at queue end wraps cleanly back to cursor 0.
+        let wrapped = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(wrapped.state, PlaybackState::Playing);
+        assert_eq!(wrapped.queue_index, 0);
+        assert_eq!(wrapped.position_secs, 0.0);
+        assert_eq!(wrapped.current_track.as_ref().unwrap().title, "First");
+        assert!(wrapped.loop_playback);
+
+        // 2. Multi-track queue in Shuffle mode.
+        let shuffled = engine
+            .execute(EngineCommand::LoadQueue {
+                queue: songs.clone(),
+                start_index: Some(1),
+                mode: PlayMode::Shuffle,
+                playlist_name: None,
+                loop_playback: true,
+            })
+            .0
+            .unwrap();
+        assert!(shuffled.loop_playback);
+        let order = engine.active_order().to_vec();
+        assert_eq!(shuffled.current_track.as_ref().unwrap().title, songs[order[0]].title);
+
+        let sh1 = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(sh1.queue_index, 1);
+        assert_eq!(sh1.current_track.as_ref().unwrap().title, songs[order[1]].title);
+
+        let sh2 = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(sh2.queue_index, 2);
+        assert_eq!(sh2.current_track.as_ref().unwrap().title, songs[order[2]].title);
+
+        let sh_wrapped = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(sh_wrapped.state, PlaybackState::Playing);
+        assert_eq!(sh_wrapped.queue_index, 0);
+        assert_eq!(sh_wrapped.position_secs, 0.0);
+        assert_eq!(
+            sh_wrapped.current_track.as_ref().unwrap().title,
+            songs[order[0]].title
+        );
+        assert!(sh_wrapped.loop_playback);
+
+        // 3. Single-song queue.
+        let single_loaded = engine
+            .execute(EngineCommand::LoadQueue {
+                queue: vec![songs[0].clone()],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: true,
+            })
+            .0
+            .unwrap();
+        assert!(single_loaded.loop_playback);
+
+        let single_wrapped = engine.execute(EngineCommand::SeekRelative(2.0)).0.unwrap();
+        assert_eq!(single_wrapped.state, PlaybackState::Playing);
+        assert_eq!(single_wrapped.queue_index, 0);
+        assert_eq!(single_wrapped.position_secs, 0.0);
+        assert_eq!(single_wrapped.current_track.as_ref().unwrap().title, "First");
+        assert!(single_wrapped.loop_playback);
+
+        // Stop clears loop_playback back to false.
+        let stopped = engine.execute(EngineCommand::Stop).0.unwrap();
+        assert_eq!(stopped.state, PlaybackState::Stopped);
+        assert!(!stopped.loop_playback);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn loop_playback_true_wraps_on_auto_eof_for_next_shuffle_and_single_song() {
+        let dir = temp_workspace("loop-auto-eof");
+        let t1 = make_song(&dir, "LoopA", 44_100, 1, 0.15);
+        let t2 = make_song(&dir, "LoopB", 44_100, 1, 0.15);
+        let single = make_song(&dir, "Solo", 44_100, 1, 0.15);
+        let two_track_samples = 6_615u64 * 2;
+        let single_track_samples = 6_615u64;
+
+        // 1. Multi-track Next mode.
+        {
+            let sink = NullSink::new();
+            let stats = sink.stats();
+            let (handle, join_handle) = spawn_engine(Box::new(sink)).unwrap();
+
+            let loaded = handle
+                .send(EngineCommand::LoadQueue {
+                    queue: vec![t1.clone(), t2.clone()],
+                    start_index: Some(0),
+                    mode: PlayMode::Next,
+                    playlist_name: Some("LoopNext".to_string()),
+                    loop_playback: true,
+                })
+                .await
+                .unwrap();
+            assert!(loaded.loop_playback);
+
+            wait_until(Duration::from_secs(3), || {
+                stats.written_samples() >= two_track_samples * 2 + 1_000
+            })
+            .await;
+
+            let status = handle.status();
+            assert_eq!(status.state, PlaybackState::Playing);
+            assert!(status.loop_playback);
+            assert_eq!(stats.close_count(), 0);
+
+            let stopped = handle.send(EngineCommand::Stop).await.unwrap();
+            assert_eq!(stopped.state, PlaybackState::Stopped);
+            assert!(!stopped.loop_playback);
+
+            handle.send(EngineCommand::Shutdown).await.unwrap();
+            join_engine(join_handle).await;
+        }
+
+        // 2. Multi-track Shuffle mode.
+        {
+            let sink = NullSink::new();
+            let stats = sink.stats();
+            let (handle, join_handle) = spawn_engine(Box::new(sink)).unwrap();
+
+            let loaded = handle
+                .send(EngineCommand::LoadQueue {
+                    queue: vec![t1.clone(), t2.clone()],
+                    start_index: Some(0),
+                    mode: PlayMode::Shuffle,
+                    playlist_name: None,
+                    loop_playback: true,
+                })
+                .await
+                .unwrap();
+            assert!(loaded.loop_playback);
+
+            wait_until(Duration::from_secs(3), || {
+                stats.written_samples() >= two_track_samples * 2 + 1_000
+            })
+            .await;
+
+            let status = handle.status();
+            assert_eq!(status.state, PlaybackState::Playing);
+            assert!(status.loop_playback);
+            assert_eq!(stats.close_count(), 0);
+
+            handle.send(EngineCommand::Shutdown).await.unwrap();
+            join_engine(join_handle).await;
+        }
+
+        // 3. Single-song queue.
+        {
+            let sink = NullSink::new();
+            let stats = sink.stats();
+            let (handle, join_handle) = spawn_engine(Box::new(sink)).unwrap();
+
+            let loaded = handle
+                .send(EngineCommand::LoadQueue {
+                    queue: vec![single],
+                    start_index: Some(0),
+                    mode: PlayMode::Next,
+                    playlist_name: None,
+                    loop_playback: true,
+                })
+                .await
+                .unwrap();
+            assert!(loaded.loop_playback);
+
+            wait_until(Duration::from_secs(3), || {
+                stats.written_samples() >= single_track_samples * 3 + 500
+            })
+            .await;
+
+            let status = handle.status();
+            assert_eq!(status.state, PlaybackState::Playing);
+            assert!(status.loop_playback);
+            assert_eq!(status.queue_index, 0);
+            assert_eq!(stats.close_count(), 0);
+
+            handle.send(EngineCommand::Shutdown).await.unwrap();
+            join_engine(join_handle).await;
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn loop_playback_false_stops_at_end_on_auto_eof() {
+        let dir = temp_workspace("no-loop-auto-eof");
+        let t1 = make_song(&dir, "EndA", 44_100, 1, 0.15);
+        let t2 = make_song(&dir, "EndB", 44_100, 1, 0.15);
+        let expected_samples = 6_615u64 * 2;
+
+        let sink = NullSink::new();
+        let stats = sink.stats();
+        let (handle, join_handle) = spawn_engine(Box::new(sink)).unwrap();
+
+        let loaded = handle
+            .send(EngineCommand::LoadQueue {
+                queue: vec![t1, t2],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .await
+            .unwrap();
+        assert!(!loaded.loop_playback);
+
+        wait_until(Duration::from_secs(3), || {
+            handle.status().state == PlaybackState::Stopped
+        })
+        .await;
+
+        let final_status = handle.status();
+        assert_eq!(final_status.state, PlaybackState::Stopped);
+        assert!(!final_status.loop_playback);
+        assert_eq!(stats.close_count(), 1);
+        assert_eq!(stats.written_samples(), expected_samples);
 
         handle.send(EngineCommand::Shutdown).await.unwrap();
         join_engine(join_handle).await;

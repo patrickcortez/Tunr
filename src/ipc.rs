@@ -89,6 +89,8 @@ pub enum IpcRequest {
         start_index: Option<usize>,
         mode: PlayMode,
         playlist_name: Option<String>,
+        #[serde(default)]
+        loop_playback: bool,
     },
     Next,
     Prev,
@@ -113,6 +115,8 @@ pub struct PlaybackStatus {
     pub position_secs: f64,
     pub duration_secs: Option<f64>,
     pub queue: Vec<Song>,
+    #[serde(default)]
+    pub loop_playback: bool,
 }
 
 /// Response returned by the Termusic playback daemon for an `IpcRequest`.
@@ -846,6 +850,7 @@ mod tests {
             start_index: Some(0),
             mode: PlayMode::Shuffle,
             playlist_name: Some("Mix".to_string()),
+            loop_playback: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -856,6 +861,7 @@ mod tests {
             start_index: None,
             mode: PlayMode::Shuffle,
             playlist_name: Some("Mix".to_string()),
+            loop_playback: false,
         };
         let pl_json = serde_json::to_string(&playlist_req).unwrap();
         let pl_decoded: IpcRequest = serde_json::from_str(&pl_json).unwrap();
@@ -871,11 +877,52 @@ mod tests {
             position_secs: 12.25,
             duration_secs: Some(123.5),
             queue: vec![song],
+            loop_playback: false,
         };
         let resp = IpcResponse::Ok(status);
         let resp_json = serde_json::to_string(&resp).unwrap();
         let resp_decoded: IpcResponse = serde_json::from_str(&resp_json).unwrap();
         assert_eq!(resp, resp_decoded);
+    }
+
+    #[test]
+    fn loop_playback_serde_defaults_to_false_and_round_trips_true() {
+        let legacy_req_json = r#"{"Play":{"queue":[],"start_index":null,"mode":"next","playlist_name":null}}"#;
+        let decoded_req: IpcRequest = serde_json::from_str(legacy_req_json).unwrap();
+        assert_eq!(
+            decoded_req,
+            IpcRequest::Play {
+                queue: Vec::new(),
+                start_index: None,
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            }
+        );
+
+        let loop_req = IpcRequest::Play {
+            queue: Vec::new(),
+            start_index: Some(0),
+            mode: PlayMode::Shuffle,
+            playlist_name: Some("Mix".to_string()),
+            loop_playback: true,
+        };
+        let loop_req_json = serde_json::to_string(&loop_req).unwrap();
+        let round_tripped_req: IpcRequest = serde_json::from_str(&loop_req_json).unwrap();
+        assert_eq!(loop_req, round_tripped_req);
+
+        let legacy_status_json = r#"{"state":"playing","mode":"next","playlist_name":null,"current_track":null,"queue_index":0,"queue_len":0,"position_secs":0.0,"duration_secs":null,"queue":[]}"#;
+        let decoded_status: PlaybackStatus = serde_json::from_str(legacy_status_json).unwrap();
+        assert!(!decoded_status.loop_playback);
+
+        let loop_status = PlaybackStatus {
+            state: PlaybackState::Playing,
+            loop_playback: true,
+            ..PlaybackStatus::default()
+        };
+        let loop_status_json = serde_json::to_string(&loop_status).unwrap();
+        let round_tripped_status: PlaybackStatus = serde_json::from_str(&loop_status_json).unwrap();
+        assert_eq!(loop_status, round_tripped_status);
     }
 
     #[tokio::test]

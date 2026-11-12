@@ -358,11 +358,13 @@ fn map_ipc_to_engine_command(req: IpcRequest) -> EngineCommand {
             start_index,
             mode,
             playlist_name,
+            loop_playback,
         } => EngineCommand::LoadQueue {
             queue,
             start_index,
             mode,
             playlist_name,
+            loop_playback,
         },
         IpcRequest::Next => EngineCommand::Next,
         IpcRequest::Prev => EngineCommand::Prev,
@@ -539,11 +541,13 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: Some("DaemonMix".to_string()),
+                loop_playback: false,
             },
         )
         .await
         .unwrap();
         assert_eq!(playing.state, PlaybackState::Playing);
+        assert!(!playing.loop_playback);
         assert_eq!(playing.playlist_name.as_deref(), Some("DaemonMix"));
         assert_eq!(playing.current_track.as_ref().unwrap().title, "Alpha");
         assert_eq!(playing.queue_index, 0);
@@ -737,6 +741,7 @@ mod tests {
                 start_index: Some(0),
                 mode: PlayMode::Next,
                 playlist_name: None,
+                loop_playback: false,
             },
         )
         .await
@@ -806,6 +811,99 @@ mod tests {
         }
         assert!(!paths.pid_path.exists());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_seek_absolute_zero_rewinds_and_loop_playback_flows_to_status() {
+        let dir = temp_workspace("rewind-loop");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+        let song = make_song(&dir, "LoopSong", 2.0);
+
+        let sink = NullSink::with_pacing(Duration::from_millis(8));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let daemon_paths = paths.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&daemon_paths, Box::new(sink), Some(ready_tx), None).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("daemon should signal readiness")
+            .unwrap();
+
+        let initial = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert!(!initial.loop_playback);
+
+        let playing = ipc::send_request(
+            &paths,
+            &IpcRequest::Play {
+                queue: vec![song],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(playing.state, PlaybackState::Playing);
+        assert!(playing.loop_playback);
+
+        let polled = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert!(polled.loop_playback);
+
+        // Advance forward, then rewind to 0.0 while playing.
+        let advanced = ipc::send_request(&paths, &IpcRequest::SeekRelative(0.6))
+            .await
+            .unwrap();
+        assert!(advanced.position_secs > 0.4);
+
+        let rewound_playing = ipc::send_request(&paths, &IpcRequest::SeekAbsolute(0.0))
+            .await
+            .unwrap();
+        assert_eq!(rewound_playing.state, PlaybackState::Playing);
+        assert_eq!(rewound_playing.position_secs, 0.0);
+        assert!(rewound_playing.loop_playback);
+
+        // Advance forward, pause, then rewind to 0.0 while staying paused.
+        let advanced_again = ipc::send_request(&paths, &IpcRequest::SeekAbsolute(0.6))
+            .await
+            .unwrap();
+        assert!(advanced_again.position_secs > 0.4);
+
+        let paused = ipc::send_request(&paths, &IpcRequest::SetPaused(true))
+            .await
+            .unwrap();
+        assert_eq!(paused.state, PlaybackState::Paused);
+        assert!(paused.position_secs > 0.4);
+
+        let rewound_paused = ipc::send_request(&paths, &IpcRequest::SeekAbsolute(0.0))
+            .await
+            .unwrap();
+        assert_eq!(rewound_paused.state, PlaybackState::Paused);
+        assert_eq!(rewound_paused.position_secs, 0.0);
+        assert!(rewound_paused.loop_playback);
+
+        let status_while_paused = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(status_while_paused.state, PlaybackState::Paused);
+        assert_eq!(status_while_paused.position_secs, 0.0);
+        assert!(status_while_paused.loop_playback);
+
+        let stopped = ipc::send_request(&paths, &IpcRequest::Stop).await.unwrap();
+        assert_eq!(stopped.state, PlaybackState::Stopped);
+        assert!(!stopped.loop_playback);
+
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
