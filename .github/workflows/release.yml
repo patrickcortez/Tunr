@@ -79,7 +79,7 @@ jobs:
 
       - name: Build release binary (Android API 24)
         if: matrix.mode == 'android'
-        run: cargo ndk -t aarch64-linux-android -p 24 build --release --locked
+        run: cargo ndk -t aarch64-linux-android --platform 24 build --release --locked
 
       - name: Determine release version label
         shell: bash

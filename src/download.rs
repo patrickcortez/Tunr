@@ -3,8 +3,6 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -20,12 +18,25 @@ use crate::error::{Result, TermusicError};
 use crate::library::{AddSummary, Library};
 use crate::paths::{AppPaths, load_workspace_config, set_workspace_download_dest};
 use crate::platform::canonicalize_clean;
+use crate::ytdlp::{self, ToolEnv};
 
-/// Audio output container/codec format passed to `yt-dlp --audio-format`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+/// Output container/codec format supported by `termusic download` and `termusic search -d`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum DownloadFormat {
     #[default]
     Mp3,
+    Mp4,
     Flac,
     M4a,
     Ogg,
@@ -38,6 +49,7 @@ impl DownloadFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mp3 => "mp3",
+            Self::Mp4 => "mp4",
             Self::Flac => "flac",
             Self::M4a => "m4a",
             Self::Ogg => "ogg",
@@ -46,12 +58,35 @@ impl DownloadFormat {
         }
     }
 
+    /// Return `true` for audio-only formats eligible for music library indexing.
+    pub fn is_audio(self) -> bool {
+        !matches!(self, Self::Mp4)
+    }
+
     /// Format argument expected by `yt-dlp --audio-format` (`ogg` -> `vorbis`).
     pub fn yt_dlp_format(self) -> &'static str {
         match self {
             Self::Ogg => "vorbis",
             other => other.as_str(),
         }
+    }
+}
+
+/// Parse a download format string, allowing an optional leading `.` (e.g. `.mp3`, `mp4`).
+pub fn parse_download_format_str(raw: &str) -> Result<DownloadFormat> {
+    let trimmed = raw.trim();
+    let normalized = trimmed.strip_prefix('.').unwrap_or(trimmed).to_ascii_lowercase();
+    match normalized.as_str() {
+        "mp3" => Ok(DownloadFormat::Mp3),
+        "mp4" => Ok(DownloadFormat::Mp4),
+        "flac" => Ok(DownloadFormat::Flac),
+        "m4a" => Ok(DownloadFormat::M4a),
+        "ogg" => Ok(DownloadFormat::Ogg),
+        "wav" => Ok(DownloadFormat::Wav),
+        "aac" => Ok(DownloadFormat::Aac),
+        _ => Err(TermusicError::InvalidArg(format!(
+            "unsupported format '{raw}' (expected one of: mp3, mp4, flac, m4a, ogg, wav, aac)"
+        ))),
     }
 }
 
@@ -154,30 +189,22 @@ struct DownloadEnv {
 
 impl DownloadEnv {
     fn from_system() -> Self {
-        #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
-        let mut extra_search_dirs = Vec::new();
-        #[cfg(target_os = "macos")]
-        {
-            extra_search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
-            extra_search_dirs.push(PathBuf::from("/usr/local/bin"));
-        }
-        #[cfg(windows)]
-        {
-            if let Some(local_app_data) = dirs::data_local_dir() {
-                extra_search_dirs.push(local_app_data.join("Microsoft").join("WinGet").join("Links"));
-            }
-            extra_search_dirs.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
-        }
-
+        let tool = ToolEnv::from_system();
         Self {
-            home_dir: std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(dirs::home_dir),
-            path_var: std::env::var_os("PATH"),
+            home_dir: tool.home_dir,
+            path_var: tool.path_var,
             termusic_dest: std::env::var("TERMUSIC_DEST").ok(),
-            pathext: std::env::var_os("PATHEXT"),
-            extra_search_dirs,
+            pathext: tool.pathext,
+            extra_search_dirs: tool.extra_search_dirs,
+        }
+    }
+
+    fn to_tool_env(&self) -> ToolEnv {
+        ToolEnv {
+            home_dir: self.home_dir.clone(),
+            path_var: self.path_var.clone(),
+            pathext: self.pathext.clone(),
+            extra_search_dirs: self.extra_search_dirs.clone(),
         }
     }
 }
@@ -446,25 +473,35 @@ async fn run_download_with_env_and_progress(
     }
 
     let add_summary = if opts.auto_add && !downloaded_files.is_empty() {
-        emit_progress(
-            progress_tx.as_ref(),
-            DownloadProgressEvent::IndexingStarted {
-                track_count: downloaded_files.len(),
-            },
-        );
-        let paths_cloned = paths.clone();
-        let files_cloned = downloaded_files.clone();
-        let playlist_cloned = opts.playlist_name.clone();
-        Some(
-            run_blocking(move || {
-                index_downloaded_files(
-                    &paths_cloned,
-                    &files_cloned,
-                    playlist_cloned.as_deref(),
-                )
-            })
-            .await?,
-        )
+        if opts.format.is_audio() {
+            emit_progress(
+                progress_tx.as_ref(),
+                DownloadProgressEvent::IndexingStarted {
+                    track_count: downloaded_files.len(),
+                },
+            );
+            let paths_cloned = paths.clone();
+            let files_cloned = downloaded_files.clone();
+            let playlist_cloned = opts.playlist_name.clone();
+            Some(
+                run_blocking(move || {
+                    index_downloaded_files(
+                        &paths_cloned,
+                        &files_cloned,
+                        playlist_cloned.as_deref(),
+                    )
+                })
+                .await?,
+            )
+        } else {
+            emit_progress(
+                progress_tx.as_ref(),
+                DownloadProgressEvent::Notice(
+                    "skipping library indexing for non-audio mp4 download".to_string(),
+                ),
+            );
+            None
+        }
     } else {
         None
     };
@@ -544,13 +581,32 @@ fn validate_non_empty_path(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate and prepare the effective download destination for `termusic search -d`
+/// (`dest` -> `TERMUSIC_DEST` -> `WorkspaceConfig.download_dest`).
+pub fn validate_search_download_destination(
+    paths: &AppPaths,
+    dest: Option<&Path>,
+) -> Result<PathBuf> {
+    let env = DownloadEnv::from_system();
+    resolve_destination_with_env(paths, dest, None, &env)
+}
+
 fn resolve_destination(
     paths: &AppPaths,
     opts: &DownloadOptions,
     saved_dest: Option<&Path>,
     env: &DownloadEnv,
 ) -> Result<PathBuf> {
-    let raw_dest: PathBuf = if let Some(dest) = opts.dest.as_deref() {
+    resolve_destination_with_env(paths, opts.dest.as_deref(), saved_dest, env)
+}
+
+fn resolve_destination_with_env(
+    paths: &AppPaths,
+    dest_opt: Option<&Path>,
+    saved_dest: Option<&Path>,
+    env: &DownloadEnv,
+) -> Result<PathBuf> {
+    let raw_dest: PathBuf = if let Some(dest) = dest_opt {
         validate_non_empty_path(dest, "--dest")?;
         dest.to_path_buf()
     } else if let Some(saved) = saved_dest {
@@ -592,110 +648,11 @@ fn prepare_directory(dir: &Path) -> Result<PathBuf> {
     Ok(canonicalize_clean(dir)?)
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        fs::metadata(path)
-            .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
-    }
-}
-
-#[cfg(windows)]
-fn windows_executable_extensions(pathext: Option<&OsStr>) -> Vec<String> {
-    const FALLBACK_EXTS: &[&str] = &[".exe", ".cmd", ".bat", ".com"];
-    let mut parsed = Vec::new();
-    if let Some(raw) = pathext {
-        for part in raw.to_string_lossy().split(';') {
-            let trimmed = part.trim().to_ascii_lowercase();
-            if matches!(trimmed.as_str(), ".exe" | ".cmd" | ".bat" | ".com")
-                && !parsed.contains(&trimmed)
-            {
-                parsed.push(trimmed);
-            }
-        }
-    }
-    if parsed.is_empty() {
-        FALLBACK_EXTS.iter().map(|s| (*s).to_string()).collect()
-    } else {
-        // Ensure `.exe` takes precedence over `.cmd`/`.bat` shims if both exist.
-        if let Some(exe_pos) = parsed.iter().position(|ext| ext == ".exe")
-            && exe_pos > 0
-        {
-            let exe = parsed.remove(exe_pos);
-            parsed.insert(0, exe);
-        }
-        parsed
-    }
-}
-
-fn find_in_dir(dir: &Path, binary: &str, pathext: Option<&OsStr>) -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if Path::new(binary).extension().is_some() {
-            let candidate = dir.join(binary);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-            return None;
-        }
-        for ext in windows_executable_extensions(pathext) {
-            let candidate = dir.join(format!("{binary}{ext}"));
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = pathext;
-        let candidate = dir.join(binary);
-        is_executable_file(&candidate).then_some(candidate)
-    }
-}
-
-fn find_on_path_with_pathext(
-    binary: &str,
-    path_var: Option<&OsStr>,
-    pathext: Option<&OsStr>,
-) -> Option<PathBuf> {
-    for dir in std::env::split_paths(path_var?) {
-        if let Some(found) = find_in_dir(&dir, binary, pathext) {
-            return Some(found);
-        }
-    }
-    None
-}
-
 fn find_in_env(binary: &str, env: &DownloadEnv) -> Option<PathBuf> {
-    if let Some(found) =
-        find_on_path_with_pathext(binary, env.path_var.as_deref(), env.pathext.as_deref())
-    {
-        return Some(found);
-    }
-
-    #[cfg(windows)]
-    if let Some(home) = env.home_dir.as_deref() {
-        let scoop_shims = home.join("scoop").join("shims");
-        if let Some(found) = find_in_dir(&scoop_shims, binary, env.pathext.as_deref()) {
-            return Some(found);
-        }
-    }
-
-    for dir in &env.extra_search_dirs {
-        if let Some(found) = find_in_dir(dir, binary, env.pathext.as_deref()) {
-            return Some(found);
-        }
-    }
-    None
+    ytdlp::find_in_env(binary, &env.to_tool_env())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn append_windows_quoted_arg(out: &mut OsString, arg: &OsStr) {
     let text = arg.to_string_lossy();
     let needs_quotes = text.is_empty()
@@ -740,7 +697,7 @@ fn append_windows_quoted_arg(out: &mut OsString, arg: &OsStr) {
 }
 
 /// Format a `.cmd`/`.bat` invocation wrapped in outer `"..."` for `cmd.exe /D /S /C`.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn format_windows_cmd_batch_line(binary: &Path, args: &[OsString]) -> OsString {
     let mut line = OsString::from("\"");
     append_windows_quoted_arg(&mut line, binary.as_os_str());
@@ -753,81 +710,30 @@ fn format_windows_cmd_batch_line(binary: &Path, args: &[OsString]) -> OsString {
 }
 
 fn command_for_binary(binary: &Path, args: &[OsString]) -> Command {
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let is_batch = binary
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-        let mut cmd = if is_batch {
-            let mut c = Command::new("cmd");
-            c.arg("/D").arg("/S").arg("/C");
-            c.raw_arg(format_windows_cmd_batch_line(binary, args));
-            c
-        } else {
-            let mut c = Command::new(binary);
-            c.args(args);
-            c
-        };
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd
-    }
-    #[cfg(not(windows))]
-    {
-        let mut cmd = Command::new(binary);
-        cmd.args(args);
-        cmd
-    }
+    ytdlp::command_for_binary(binary, args)
 }
 
 fn find_yt_dlp(env: &DownloadEnv) -> Result<PathBuf> {
-    if let Some(home) = env.home_dir.as_deref() {
-        let local_bin_dir = home.join(".local").join("bin");
-        if let Some(found) = find_in_dir(&local_bin_dir, "yt-dlp", env.pathext.as_deref()) {
-            return Ok(found);
-        }
-    }
+    ytdlp::find_yt_dlp(&env.to_tool_env())
+}
 
-    find_in_env("yt-dlp", env).ok_or_else(|| {
+fn find_ffmpeg(env: &DownloadEnv) -> Result<PathBuf> {
+    ytdlp::find_ffmpeg(&env.to_tool_env()).ok_or_else(|| {
         #[cfg(target_os = "android")]
-        let hint = "yt-dlp not found in ~/.local/bin or PATH (install via: pkg install yt-dlp)";
+        let hint = "neither ffmpeg nor avconv found in PATH (install via: pkg install ffmpeg)";
         #[cfg(target_os = "macos")]
-        let hint = "yt-dlp not found in ~/.local/bin, PATH, or Homebrew (install via: brew install yt-dlp)";
+        let hint = "neither ffmpeg nor avconv found in PATH or Homebrew (install via: brew install ffmpeg)";
         #[cfg(windows)]
-        let hint = "yt-dlp not found in ~/.local/bin, PATH, or WinGet/Scoop (install via: winget install yt-dlp.yt-dlp)";
+        let hint = "neither ffmpeg nor avconv found in PATH or WinGet/Scoop (install via: winget install Gyan.FFmpeg)";
         #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
-        let hint = "yt-dlp not found in ~/.local/bin or PATH";
+        let hint = "neither ffmpeg nor avconv found in PATH";
 
         TermusicError::NotFound(hint.into())
     })
 }
 
-fn find_ffmpeg(env: &DownloadEnv) -> Result<PathBuf> {
-    find_in_env("ffmpeg", env)
-        .or_else(|| find_in_env("avconv", env))
-        .ok_or_else(|| {
-            #[cfg(target_os = "android")]
-            let hint = "neither ffmpeg nor avconv found in PATH (install via: pkg install ffmpeg)";
-            #[cfg(target_os = "macos")]
-            let hint = "neither ffmpeg nor avconv found in PATH or Homebrew (install via: brew install ffmpeg)";
-            #[cfg(windows)]
-            let hint = "neither ffmpeg nor avconv found in PATH or WinGet/Scoop (install via: winget install Gyan.FFmpeg)";
-            #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
-            let hint = "neither ffmpeg nor avconv found in PATH";
-
-            TermusicError::NotFound(hint.into())
-        })
-}
-
 fn detect_js_runtime(env: &DownloadEnv) -> Option<String> {
-    if let Some(deno_path) = find_in_env("deno", env) {
-        Some(format!("deno:{}", deno_path.display()))
-    } else if let Some(node_path) = find_in_env("node", env) {
-        Some(format!("node:{}", node_path.display()))
-    } else {
-        None
-    }
+    ytdlp::detect_js_runtime(&env.to_tool_env())
 }
 
 async fn has_python_mutagen(env: &DownloadEnv) -> bool {
@@ -888,7 +794,9 @@ async fn should_embed_thumbnail_with_progress(
                 false
             }
         }
-        DownloadFormat::Mp3 | DownloadFormat::Flac | DownloadFormat::M4a => true,
+        DownloadFormat::Mp3 | DownloadFormat::Flac | DownloadFormat::M4a | DownloadFormat::Mp4 => {
+            true
+        }
     }
 }
 
@@ -904,16 +812,24 @@ fn build_yt_dlp_args(
     let mut temp_paths = OsString::from("temp:");
     temp_paths.push(stage_dir.as_os_str());
 
-    let mut args = vec![
-        OsString::from("-f"),
-        OsString::from("bestaudio/best"),
-        OsString::from("-x"),
-        OsString::from("--audio-format"),
-        OsString::from(format.yt_dlp_format()),
-        OsString::from("--audio-quality"),
-        OsString::from("0"),
-        OsString::from("--add-metadata"),
-    ];
+    let mut args = if format.is_audio() {
+        vec![
+            OsString::from("-f"),
+            OsString::from("bestaudio/best"),
+            OsString::from("-x"),
+            OsString::from("--audio-format"),
+            OsString::from(format.yt_dlp_format()),
+            OsString::from("--audio-quality"),
+            OsString::from("0"),
+            OsString::from("--add-metadata"),
+        ]
+    } else {
+        vec![
+            OsString::from("-t"),
+            OsString::from("mp4"),
+            OsString::from("--add-metadata"),
+        ]
+    };
 
     if embed_thumbnail {
         args.push(OsString::from("--embed-thumbnail"));
@@ -1189,12 +1105,7 @@ async fn execute_yt_dlp(
 }
 
 fn extract_diagnostic_line(lines: &[String]) -> Option<String> {
-    lines
-        .iter()
-        .rev()
-        .find(|l| l.starts_with("ERROR:"))
-        .or_else(|| lines.last())
-        .cloned()
+    ytdlp::extract_diagnostic_line(&lines.join("\n"))
 }
 
 fn resolve_printed_filepaths(lines: &[String], stage_dir: &Path) -> Vec<PathBuf> {
@@ -1410,6 +1321,8 @@ fn index_downloaded_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use crate::paths::initialize_workspace_with_env;
 
     struct TempDir(PathBuf);
@@ -2553,5 +2466,113 @@ printf '%s\n' "$out""#,
         let logged = fs::read_to_string(&args_log).unwrap();
         assert!(logged.lines().any(|l| l == PROGRESS_TEMPLATE_DOWNLOAD));
         assert!(logged.lines().any(|l| l == spaced_stage.to_string_lossy()));
+    }
+
+    #[test]
+    fn parse_download_format_str_accepts_optional_dot_and_mp4() {
+        assert_eq!(parse_download_format_str("mp3").unwrap(), DownloadFormat::Mp3);
+        assert_eq!(parse_download_format_str(".mp3").unwrap(), DownloadFormat::Mp3);
+        assert_eq!(parse_download_format_str(" .MP4 ").unwrap(), DownloadFormat::Mp4);
+        assert_eq!(parse_download_format_str("mp4").unwrap(), DownloadFormat::Mp4);
+        assert_eq!(parse_download_format_str(".flac").unwrap(), DownloadFormat::Flac);
+        assert_eq!(parse_download_format_str(".M4A").unwrap(), DownloadFormat::M4a);
+        assert_eq!(parse_download_format_str("ogg").unwrap(), DownloadFormat::Ogg);
+        assert_eq!(parse_download_format_str(".wav").unwrap(), DownloadFormat::Wav);
+        assert_eq!(parse_download_format_str("aac").unwrap(), DownloadFormat::Aac);
+
+        assert!(DownloadFormat::Mp3.is_audio());
+        assert!(DownloadFormat::Flac.is_audio());
+        assert!(!DownloadFormat::Mp4.is_audio());
+
+        for bad in ["", "   ", ".", ".mkv", "avi"] {
+            assert!(
+                matches!(parse_download_format_str(bad), Err(TermusicError::InvalidArg(_))),
+                "expected InvalidArg for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_yt_dlp_args_uses_video_preset_for_mp4() {
+        let stage = PathBuf::from("/tmp/stage");
+        let args = build_yt_dlp_args(
+            DownloadFormat::Mp4,
+            false,
+            &stage,
+            None,
+            None,
+            true,
+            "https://example.com/video",
+        );
+        let str_args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(str_args.windows(2).any(|w| w == ["-t", "mp4"]));
+        assert!(str_args.contains(&"--add-metadata".to_string()));
+        assert!(str_args.contains(&"--embed-thumbnail".to_string()));
+        assert!(!str_args.contains(&"-x".to_string()));
+        assert!(!str_args.contains(&"--audio-format".to_string()));
+        assert!(!str_args.contains(&"--audio-quality".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mock_yt_dlp_downloads_mp4_and_skips_library_indexing_when_auto_add_enabled() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("videos");
+        fs::create_dir_all(&dest).unwrap();
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
+
+        let args_log = ws.root.join("mp4-args.txt");
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                "printf '%s\\n' \"$@\" > \"{args_log}\"\nout=\"$stage/Video Clip.mp4\"\nprintf 'fake-mp4' > \"$out\"\nprintf '%s\\n' \"$out\"",
+                args_log = args_log.display(),
+            ),
+            &format!(
+                "var ts = fso.OpenTextFile(\"{args_log}\", 2, true);\n\
+                 for (var i = 0; i < allArgs.length; i++) ts.WriteLine(allArgs[i]);\n\
+                 ts.Close();\n\
+                 var out = stage + \"\\\\Video Clip.mp4\";\n\
+                 var outFile = fso.OpenTextFile(out, 2, true);\n\
+                 outFile.Write(\"fake-mp4\");\n\
+                 outFile.Close();\n\
+                 WScript.StdOut.WriteLine(out);",
+                args_log = js_escape(&args_log),
+            ),
+        );
+
+        let mut opts = base_options(vec!["https://example.com/video"]);
+        opts.dest = Some(dest.clone());
+        opts.format = DownloadFormat::Mp4;
+        opts.auto_add = true;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = run_download_with_env_and_progress(&ws.paths, &opts, &ws.env(None), Some(tx))
+            .await
+            .expect("mp4 download should succeed without failing library indexing");
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.downloaded_files, vec![dest.join("Video Clip.mp4")]);
+        assert!(outcome.add_summary.is_none());
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert!(lib.songs.is_empty());
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::Notice(msg) if msg.contains("mp4")
+        )));
+
+        let logged = fs::read_to_string(&args_log).unwrap();
+        let logged_lines: Vec<&str> = logged.lines().collect();
+        assert!(logged_lines.windows(2).any(|w| w == ["-t", "mp4"]));
+        assert!(!logged_lines.contains(&"-x"));
     }
 }

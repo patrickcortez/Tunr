@@ -6,16 +6,51 @@ use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::text::Span;
+use ratatui::widgets::BorderType;
 use ratatui::{DefaultTerminal, Terminal};
 
 use crate::error::{Result, TermusicError};
 
 static PANIC_HOOK_ONCE: Once = Once::new();
 
+pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ASCII_SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
+
 /// Return whether UI chrome should fall back to pure ASCII glyphs.
 pub fn use_ascii_glyphs() -> bool {
     std::env::var_os("TERMUSIC_ASCII")
         .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"))
+}
+
+/// Return the standard block border style for the current ASCII/Unicode mode.
+pub(crate) fn border_type(ascii: bool) -> BorderType {
+    if ascii {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
+    }
+}
+
+/// Return the spinner glyph for `tick` in Unicode or ASCII mode.
+pub(crate) fn active_spinner(tick: usize, ascii: bool) -> &'static str {
+    if ascii {
+        ASCII_SPINNER_FRAMES[tick % ASCII_SPINNER_FRAMES.len()]
+    } else {
+        SPINNER_FRAMES[tick % SPINNER_FRAMES.len()]
+    }
+}
+
+/// Format a duration in seconds as `MM:SS` or `HH:MM:SS`.
+pub(crate) fn format_duration(total_secs: u64) -> String {
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins >= 60 {
+        let hrs = mins / 60;
+        let rem_mins = mins % 60;
+        format!("{hrs:02}:{rem_mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
 }
 
 /// Restore cursor visibility, exit the alternate screen, and disable raw mode.
@@ -189,5 +224,27 @@ mod tests {
         assert_eq!(truncated, "日本...");
         assert_eq!(truncate_to_width("日本語", 2), "日");
         assert_eq!(truncate_to_width("abc", 0), "");
+    }
+
+    #[test]
+    fn format_duration_formats_minutes_and_hours() {
+        assert_eq!(format_duration(0), "00:00");
+        assert_eq!(format_duration(65), "01:05");
+        assert_eq!(format_duration(3599), "59:59");
+        assert_eq!(format_duration(3600), "01:00:00");
+        assert_eq!(format_duration(3665), "01:01:05");
+    }
+
+    #[test]
+    fn active_spinner_and_border_type_respect_ascii_flag() {
+        assert_eq!(active_spinner(0, false), SPINNER_FRAMES[0]);
+        assert_eq!(
+            active_spinner(SPINNER_FRAMES.len() + 2, false),
+            SPINNER_FRAMES[2]
+        );
+        assert_eq!(active_spinner(0, true), "|");
+        assert_eq!(active_spinner(5, true), "/");
+        assert_eq!(border_type(false), BorderType::Rounded);
+        assert_eq!(border_type(true), BorderType::Plain);
     }
 }

@@ -221,22 +221,15 @@ pub fn probe_track(path: &Path) -> Result<TrackProbe> {
     };
     let duration_secs = duration_secs.or_else(|| compute_media_duration_secs(format.media_info()));
 
-    let mut title = None;
-    let mut artist = None;
-    let mut album = None;
+    let mut collected = CollectedTags::default();
 
     let mut meta = format.metadata();
     loop {
         if let Some(rev) = meta.current() {
-            collect_standard_tags(&rev.media.tags, &mut title, &mut artist, &mut album);
+            collect_standard_tags(&rev.media.tags, &mut collected);
             for per_track in &rev.per_track {
                 if per_track.track_id == u64::from(track_id) {
-                    collect_standard_tags(
-                        &per_track.metadata.tags,
-                        &mut title,
-                        &mut artist,
-                        &mut album,
-                    );
+                    collect_standard_tags(&per_track.metadata.tags, &mut collected);
                 }
             }
         }
@@ -245,12 +238,7 @@ pub fn probe_track(path: &Path) -> Result<TrackProbe> {
         }
     }
 
-    Ok(TrackProbe {
-        title,
-        artist,
-        album,
-        duration_secs,
-    })
+    Ok(collected.into_track_probe(duration_secs))
 }
 
 impl SymphoniaTrack {
@@ -535,20 +523,46 @@ fn extract_audio_spec(
     Ok((sample_rate, channels))
 }
 
-fn collect_standard_tags(
-    tags: &[Tag],
-    title: &mut Option<String>,
-    artist: &mut Option<String>,
-    album: &mut Option<String>,
-) {
+#[derive(Default)]
+struct CollectedTags {
+    title: Option<String>,
+    artist: Option<String>,
+    album_artist: Option<String>,
+    performer: Option<String>,
+    album: Option<String>,
+}
+
+impl CollectedTags {
+    #[cfg(test)]
+    fn resolved_artist(&self) -> Option<String> {
+        self.artist
+            .as_ref()
+            .or(self.album_artist.as_ref())
+            .or(self.performer.as_ref())
+            .cloned()
+    }
+
+    fn into_track_probe(self, duration_secs: Option<f64>) -> TrackProbe {
+        TrackProbe {
+            title: self.title,
+            artist: self.artist.or(self.album_artist).or(self.performer),
+            album: self.album,
+            duration_secs,
+        }
+    }
+}
+
+fn collect_standard_tags(tags: &[Tag], out: &mut CollectedTags) {
     for tag in tags {
         let Some(std_tag) = &tag.std else {
             continue;
         };
         match std_tag {
-            StandardTag::TrackTitle(val) => set_non_empty(title, val),
-            StandardTag::Artist(val) => set_non_empty(artist, val),
-            StandardTag::Album(val) => set_non_empty(album, val),
+            StandardTag::TrackTitle(val) => set_non_empty(&mut out.title, val),
+            StandardTag::Artist(val) => set_non_empty(&mut out.artist, val),
+            StandardTag::AlbumArtist(val) => set_non_empty(&mut out.album_artist, val),
+            StandardTag::Performer(val) => set_non_empty(&mut out.performer, val),
+            StandardTag::Album(val) => set_non_empty(&mut out.album, val),
             _ => {}
         }
     }
@@ -727,5 +741,55 @@ mod tests {
         {
             assert!(default_sink_for_backend(Some("audioqueue")).is_ok());
         }
+    }
+
+    #[test]
+    fn collect_standard_tags_prefers_artist_then_album_artist_then_performer() {
+        use std::sync::Arc;
+        use symphonia::core::meta::RawTag;
+
+        let std_tag = |tag: StandardTag| Tag::new_std(RawTag::new("TAG", "val"), tag);
+
+        // Artist wins even when AlbumArtist and Performer appear after it.
+        let mut with_artist = CollectedTags::default();
+        collect_standard_tags(
+            &[
+                std_tag(StandardTag::TrackTitle(Arc::new("  CANTO DE LUNA  ".to_string()))),
+                std_tag(StandardTag::Artist(Arc::new("h6itam".to_string()))),
+                std_tag(StandardTag::AlbumArtist(Arc::new("Album Artist".to_string()))),
+                std_tag(StandardTag::Performer(Arc::new("Performer".to_string()))),
+                std_tag(StandardTag::Album(Arc::new("Singles".to_string()))),
+            ],
+            &mut with_artist,
+        );
+        assert_eq!(with_artist.title.as_deref(), Some("CANTO DE LUNA"));
+        assert_eq!(with_artist.album.as_deref(), Some("Singles"));
+        assert_eq!(with_artist.resolved_artist().as_deref(), Some("h6itam"));
+
+        // AlbumArtist is used when Artist is absent or blank, beating Performer.
+        let mut with_album_artist = CollectedTags::default();
+        collect_standard_tags(
+            &[
+                std_tag(StandardTag::Artist(Arc::new("   ".to_string()))),
+                std_tag(StandardTag::Performer(Arc::new("Performer".to_string()))),
+                std_tag(StandardTag::AlbumArtist(Arc::new("Album Artist".to_string()))),
+            ],
+            &mut with_album_artist,
+        );
+        assert_eq!(
+            with_album_artist.resolved_artist().as_deref(),
+            Some("Album Artist")
+        );
+
+        // Performer is used when both Artist and AlbumArtist are absent.
+        let mut with_performer = CollectedTags::default();
+        collect_standard_tags(
+            &[std_tag(StandardTag::Performer(Arc::new("Session Performer".to_string())))],
+            &mut with_performer,
+        );
+        assert_eq!(
+            with_performer.resolved_artist().as_deref(),
+            Some("Session Performer")
+        );
     }
 }

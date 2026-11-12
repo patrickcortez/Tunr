@@ -68,6 +68,40 @@ pub enum DeleteOutcome {
     Playlist(Playlist),
 }
 
+/// Disambiguation candidate describing a matching song entry in [`Library::songs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SongCandidate {
+    pub index: usize,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub path: PathBuf,
+    pub duration_secs: Option<f64>,
+}
+
+impl SongCandidate {
+    fn from_song(index: usize, song: &Song) -> Self {
+        Self {
+            index,
+            title: song.title.clone(),
+            artist: song.artist.clone(),
+            album: song.album.clone(),
+            path: song.path.clone(),
+            duration_secs: song.duration_secs,
+        }
+    }
+}
+
+/// Result of resolving a `play` target query with optional artist disambiguation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayResolution {
+    Ready(PlayTarget),
+    AmbiguousSongs {
+        query: String,
+        candidates: Vec<SongCandidate>,
+    },
+}
+
 /// Resolved playback target and ordered queue ready for `IpcRequest::Play`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayTarget {
@@ -103,8 +137,24 @@ impl Library {
             return Ok(Self::default());
         }
         let raw = fs::read_to_string(path)?;
-        let lib: Library = serde_json::from_str(&raw)?;
+        let mut lib: Library = serde_json::from_str(&raw)?;
+        lib.normalize_existing_songs();
         Ok(lib)
+    }
+
+    /// Normalize legacy `"Artist - Title"` entries in place; returns `true` if any song changed.
+    pub(crate) fn normalize_existing_songs(&mut self) -> bool {
+        let mut changed = false;
+        for song in &mut self.songs {
+            let (norm_title, norm_artist) =
+                normalize_track_metadata(Some(&song.title), song.artist.as_deref(), &song.path);
+            if song.title != norm_title || song.artist != norm_artist {
+                song.title = norm_title;
+                song.artist = norm_artist;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Load library from `path` under a shared advisory lock, or return an empty default `Library` if absent.
@@ -185,14 +235,11 @@ impl Library {
 
             match probe_track(&canonical) {
                 Ok(probe) => {
-                    let title = probe
-                        .title
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| fallback_title(&canonical));
-                    let artist = clean_opt(probe.artist);
+                    let (title, artist) = normalize_track_metadata(
+                        probe.title.as_deref(),
+                        probe.artist.as_deref(),
+                        &canonical,
+                    );
                     let album = clean_opt(probe.album);
                     let song = Song {
                         id: Uuid::new_v4().to_string(),
@@ -380,32 +427,85 @@ impl Library {
     /// When resolving a song, the library songs are rotated so the selected song starts at index 0
     /// and `next`/`prev` navigate through the rest of the library.
     pub fn resolve_play_target(&self, query: &str, kind: TargetKind) -> Result<PlayTarget> {
+        match self.resolve_play_target_with_artist(query, kind, None)? {
+            PlayResolution::Ready(target) => Ok(target),
+            PlayResolution::AmbiguousSongs { query, candidates } => {
+                let labels: Vec<String> = candidates
+                    .iter()
+                    .map(format_ambiguous_candidate)
+                    .collect();
+                Err(TermusicError::Ambiguous(format!(
+                    "multiple songs match '{query}': {}",
+                    labels.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Resolve a song or playlist target, returning [`PlayResolution::AmbiguousSongs`] when
+    /// multiple songs match `query` (and optional `artist` filter) so interactive callers can
+    /// prompt for disambiguation.
+    pub fn resolve_play_target_with_artist(
+        &self,
+        query: &str,
+        kind: TargetKind,
+        artist: Option<&str>,
+    ) -> Result<PlayResolution> {
         let q = query.trim();
         if q.is_empty() {
             return Err(TermusicError::InvalidArg(
                 "play target cannot be empty".to_string(),
             ));
         }
+        let clean_artist = match artist {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(TermusicError::InvalidArg(
+                        "artist filter cannot be empty".to_string(),
+                    ));
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
 
         match kind {
-            TargetKind::Song => self.resolve_song_play_target(q),
-            TargetKind::Playlist => self.resolve_playlist_play_target(q),
+            TargetKind::Song => self.resolve_song_play_candidates(q, clean_artist),
+            TargetKind::Playlist => {
+                if clean_artist.is_some() {
+                    return Err(TermusicError::InvalidArg(
+                        "--artist cannot be used with --playlist".to_string(),
+                    ));
+                }
+                self.resolve_playlist_play_target(q)
+                    .map(PlayResolution::Ready)
+            }
             TargetKind::Auto => {
-                let song_match = self.lookup_song(q);
+                if clean_artist.is_some() {
+                    return self.resolve_song_play_candidates(q, clean_artist);
+                }
+                let (song_indices, song_is_exact_title) = self.lookup_song_indices_with_tier(q, None);
                 let playlist_match = self.lookup_playlist(q);
 
-                let has_song = !matches!(song_match, LookupMatch::None);
+                let has_song = !song_indices.is_empty();
                 let has_playlist = !matches!(playlist_match, LookupMatch::None);
 
-                if has_song && has_playlist {
+                if has_song && has_playlist && song_is_exact_title {
                     return Err(TermusicError::Ambiguous(format!(
                         "'{q}' matches both a song and a playlist; specify `--song` or `--playlist`"
                     )));
                 }
+                if has_playlist && !song_is_exact_title {
+                    return self
+                        .resolve_playlist_play_target(q)
+                        .map(PlayResolution::Ready);
+                }
                 if has_song {
-                    self.resolve_song_play_target(q)
+                    self.resolve_song_indices_to_resolution(q, None, song_indices)
                 } else if has_playlist {
                     self.resolve_playlist_play_target(q)
+                        .map(PlayResolution::Ready)
                 } else {
                     Err(TermusicError::NotFound(format!(
                         "no song or playlist found matching '{q}'"
@@ -413,6 +513,19 @@ impl Library {
                 }
             }
         }
+    }
+
+    /// Build a rotated [`PlayTarget::Song`] queue starting at `self.songs[index]`.
+    pub fn play_target_for_song_index(&self, index: usize) -> Result<PlayTarget> {
+        let selected = self
+            .songs
+            .get(index)
+            .cloned()
+            .ok_or_else(|| TermusicError::NotFound(format!("song index {index} out of bounds")))?;
+        let mut queue = Vec::with_capacity(self.songs.len());
+        queue.extend_from_slice(&self.songs[index..]);
+        queue.extend_from_slice(&self.songs[..index]);
+        Ok(PlayTarget::Song { selected, queue })
     }
 
     fn delete_song_by_query(&mut self, query: &str) -> Result<DeleteOutcome> {
@@ -430,13 +543,143 @@ impl Library {
         Ok(DeleteOutcome::Playlist(playlist))
     }
 
-    fn resolve_song_play_target(&self, query: &str) -> Result<PlayTarget> {
-        let idx = self.resolve_unique_song_index(query)?;
-        let selected = self.songs[idx].clone();
-        let mut queue = Vec::with_capacity(self.songs.len());
-        queue.extend_from_slice(&self.songs[idx..]);
-        queue.extend_from_slice(&self.songs[..idx]);
-        Ok(PlayTarget::Song { selected, queue })
+    fn resolve_song_play_candidates(
+        &self,
+        query: &str,
+        artist_filter: Option<&str>,
+    ) -> Result<PlayResolution> {
+        let indices = self.lookup_song_indices(query, artist_filter);
+        self.resolve_song_indices_to_resolution(query, artist_filter, indices)
+    }
+
+    fn resolve_song_indices_to_resolution(
+        &self,
+        query: &str,
+        artist_filter: Option<&str>,
+        indices: Vec<usize>,
+    ) -> Result<PlayResolution> {
+        match indices.len() {
+            0 => {
+                let msg = match artist_filter {
+                    Some(artist) => format!("no song found matching '{query}' by artist '{artist}'"),
+                    None => format!("no song found matching '{query}'"),
+                };
+                Err(TermusicError::NotFound(msg))
+            }
+            1 => Ok(PlayResolution::Ready(
+                self.play_target_for_song_index(indices[0])?,
+            )),
+            _ => Ok(PlayResolution::AmbiguousSongs {
+                query: query.to_string(),
+                candidates: indices
+                    .into_iter()
+                    .map(|idx| SongCandidate::from_song(idx, &self.songs[idx]))
+                    .collect(),
+            }),
+        }
+    }
+
+    fn lookup_song_indices(&self, query: &str, artist_filter: Option<&str>) -> Vec<usize> {
+        self.lookup_song_indices_with_tier(query, artist_filter).0
+    }
+
+    fn lookup_song_indices_with_tier(
+        &self,
+        query: &str,
+        artist_filter: Option<&str>,
+    ) -> (Vec<usize>, bool) {
+        let q = query.trim();
+        if q.is_empty() {
+            return (Vec::new(), false);
+        }
+        let q_lower = q.to_lowercase();
+
+        let (tier_matches, is_exact_title) = {
+            let exact: Vec<usize> = self
+                .songs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.title == q)
+                .map(|(i, _)| i)
+                .collect();
+            if !exact.is_empty() {
+                (exact, true)
+            } else {
+                let ci_exact: Vec<usize> = self
+                    .songs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.title.to_lowercase() == q_lower)
+                    .map(|(i, _)| i)
+                    .collect();
+                if !ci_exact.is_empty() {
+                    (ci_exact, true)
+                } else {
+                    let substring: Vec<usize> = self
+                        .songs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.title.to_lowercase().contains(&q_lower))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !substring.is_empty() {
+                        (substring, false)
+                    } else {
+                        let file_match: Vec<usize> = self
+                            .songs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| {
+                                s.path
+                                    .file_stem()
+                                    .and_then(|st| st.to_str())
+                                    .is_some_and(|st| st.to_lowercase() == q_lower)
+                                    || s.path
+                                        .file_name()
+                                        .and_then(|fnm| fnm.to_str())
+                                        .is_some_and(|fnm| fnm.to_lowercase() == q_lower)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        (file_match, false)
+                    }
+                }
+            }
+        };
+
+        let Some(raw_artist) = artist_filter else {
+            return (tier_matches, is_exact_title);
+        };
+        let a = raw_artist.trim();
+        if a.is_empty() || tier_matches.is_empty() {
+            return (Vec::new(), is_exact_title);
+        }
+        let a_lower = a.to_lowercase();
+
+        let exact_artist: Vec<usize> = tier_matches
+            .iter()
+            .copied()
+            .filter(|&i| {
+                self.songs[i]
+                    .artist
+                    .as_deref()
+                    .is_some_and(|art| art.to_lowercase() == a_lower)
+            })
+            .collect();
+        if !exact_artist.is_empty() {
+            return (exact_artist, is_exact_title);
+        }
+
+        let sub_artist: Vec<usize> = tier_matches
+            .into_iter()
+            .filter(|&i| {
+                self.songs[i]
+                    .artist
+                    .as_deref()
+                    .is_some_and(|art| art.to_lowercase().contains(&a_lower))
+            })
+            .collect();
+        (sub_artist, is_exact_title)
     }
 
     fn resolve_playlist_play_target(&self, query: &str) -> Result<PlayTarget> {
@@ -612,6 +855,66 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, V
         )));
     }
     Ok((files, skipped))
+}
+
+fn split_artist_title(text: &str) -> Option<(&str, &str)> {
+    const SEPARATORS: [&str; 3] = [" - ", " – ", " — "];
+    let (pos, sep) = SEPARATORS
+        .iter()
+        .filter_map(|sep| text.find(sep).map(|idx| (idx, *sep)))
+        .min_by_key(|(idx, _)| *idx)?;
+
+    let left = text[..pos].trim();
+    let right = text[pos + sep.len()..].trim();
+    if left.is_empty() || right.is_empty() || left.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((left, right))
+}
+
+pub(crate) fn normalize_track_metadata(
+    raw_title: Option<&str>,
+    raw_artist: Option<&str>,
+    path: &Path,
+) -> (String, Option<String>) {
+    let base_title = raw_title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_title(path));
+    let base_artist = raw_artist
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    if let Some((left, right)) = split_artist_title(&base_title) {
+        let artist_matches_left = base_artist
+            .as_deref()
+            .is_some_and(|a| a.to_lowercase() == left.to_lowercase());
+        let title_matches_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .is_some_and(|stem| stem.to_lowercase() == base_title.to_lowercase());
+
+        if base_artist.is_none() || artist_matches_left || title_matches_stem {
+            return (right.to_string(), Some(left.to_string()));
+        }
+    }
+
+    (base_title, base_artist)
+}
+
+fn format_ambiguous_candidate(candidate: &SongCandidate) -> String {
+    match candidate.artist.as_deref() {
+        Some(artist) => format!(
+            "{} - {} ({})",
+            candidate.title,
+            artist,
+            candidate.path.display()
+        ),
+        None => format!("{} ({})", candidate.title, candidate.path.display()),
+    }
 }
 
 fn fallback_title(path: &Path) -> String {
@@ -1020,5 +1323,200 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("termusic-missing-{}", Uuid::new_v4()));
         let err = collect_candidate_files(&missing, true).unwrap_err();
         assert!(matches!(err, TermusicError::Io(_)));
+    }
+
+    #[test]
+    fn normalize_track_metadata_handles_separators_numeric_prefixes_and_youtube_uploader_tags() {
+        // Untagged filename splits on first hyphen/en-dash/em-dash.
+        assert_eq!(
+            normalize_track_metadata(None, None, Path::new("/music/Artist A - Song One.mp3")),
+            ("Song One".to_string(), Some("Artist A".to_string()))
+        );
+        assert_eq!(
+            normalize_track_metadata(None, None, Path::new("/music/Artist B – Song Two.mp3")),
+            ("Song Two".to_string(), Some("Artist B".to_string()))
+        );
+        assert_eq!(
+            normalize_track_metadata(None, None, Path::new("/music/Artist C — Song Three.flac")),
+            ("Song Three".to_string(), Some("Artist C".to_string()))
+        );
+
+        // Numeric track prefixes like "01 - Intro" must NOT split as artist.
+        assert_eq!(
+            normalize_track_metadata(None, None, Path::new("/music/01 - Intro.wav")),
+            ("01 - Intro".to_string(), None)
+        );
+
+        // yt-dlp pattern: raw_title equals file_stem while raw_artist is the uploader channel.
+        assert_eq!(
+            normalize_track_metadata(
+                Some("h6itam · ICEDMANE · DYSMANE - CANTO DE LUNA (Extended)"),
+                Some("SUKA."),
+                Path::new("/music/h6itam · ICEDMANE · DYSMANE - CANTO DE LUNA (Extended).mp3"),
+            ),
+            (
+                "CANTO DE LUNA (Extended)".to_string(),
+                Some("h6itam · ICEDMANE · DYSMANE".to_string())
+            )
+        );
+
+        // Matching artist prefix on left splits cleanly.
+        assert_eq!(
+            normalize_track_metadata(
+                Some("Daft Punk - Harder Better Faster"),
+                Some("daft punk"),
+                Path::new("/music/track_04.mp3"),
+            ),
+            (
+                "Harder Better Faster".to_string(),
+                Some("Daft Punk".to_string())
+            )
+        );
+
+        // Distinct embedded artist & non-matching stem keeps title intact.
+        assert_eq!(
+            normalize_track_metadata(
+                Some("Part I - Dawn"),
+                Some("Real Composer"),
+                Path::new("/music/01_dawn.mp3"),
+            ),
+            ("Part I - Dawn".to_string(), Some("Real Composer".to_string()))
+        );
+    }
+
+    #[test]
+    fn legacy_library_json_normalizes_on_load_and_persists_on_update() {
+        let dir = temp_workspace("legacy-norm");
+        let lib_path = dir.join("library.json");
+        let extra = dir.join("Extra.wav");
+        write_synthetic_wav(&extra, 22_050, 0.1);
+
+        let legacy = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![Song {
+                id: "s1".to_string(),
+                title: "Artist X - Legacy Track".to_string(),
+                artist: Some("ChannelUploader".to_string()),
+                album: None,
+                path: PathBuf::from("/music/Artist X - Legacy Track.mp3"),
+                duration_secs: Some(120.0),
+            }],
+            playlists: Vec::new(),
+        };
+        legacy.save(&lib_path).unwrap();
+
+        let loaded = Library::load(&lib_path).unwrap();
+        assert_eq!(loaded.songs[0].title, "Legacy Track");
+        assert_eq!(loaded.songs[0].artist.as_deref(), Some("Artist X"));
+
+        // Running Library::update persists the normalized fields to disk.
+        Library::update(&lib_path, |lib| lib.add_files(&extra, false, None).map(|_| ())).unwrap();
+        let raw = fs::read_to_string(&lib_path).unwrap();
+        let raw_parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(raw_parsed["songs"][0]["title"], "Legacy Track");
+        assert_eq!(raw_parsed["songs"][0]["artist"], "Artist X");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_play_target_with_artist_handles_tiers_ambiguity_and_filtering() {
+        let lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                Song {
+                    id: "1".to_string(),
+                    title: "Echoes".to_string(),
+                    artist: Some("Artist One".to_string()),
+                    album: None,
+                    path: PathBuf::from("/music/one_echoes.mp3"),
+                    duration_secs: Some(100.0),
+                },
+                Song {
+                    id: "2".to_string(),
+                    title: "Echoes".to_string(),
+                    artist: Some("Artist Two".to_string()),
+                    album: Some("Album B".to_string()),
+                    path: PathBuf::from("/music/two_echoes.mp3"),
+                    duration_secs: Some(200.0),
+                },
+                Song {
+                    id: "3".to_string(),
+                    title: "Midnight Echoes Remix".to_string(),
+                    artist: Some("Artist One".to_string()),
+                    album: None,
+                    path: PathBuf::from("/music/03_remix_file.flac"),
+                    duration_secs: Some(150.0),
+                },
+            ],
+            playlists: vec![Playlist {
+                name: "Midnight".to_string(),
+                song_ids: vec!["3".to_string()],
+            }],
+        };
+
+        // Same title across two artists returns AmbiguousSongs with full metadata.
+        let res = lib
+            .resolve_play_target_with_artist("echoes", TargetKind::Auto, None)
+            .unwrap();
+        match res {
+            PlayResolution::AmbiguousSongs { query, candidates } => {
+                assert_eq!(query, "echoes");
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].index, 0);
+                assert_eq!(candidates[0].artist.as_deref(), Some("Artist One"));
+                assert_eq!(candidates[1].index, 1);
+                assert_eq!(candidates[1].artist.as_deref(), Some("Artist Two"));
+            }
+            other => panic!("expected AmbiguousSongs, got {other:?}"),
+        }
+
+        // Legacy resolve_play_target surfaces artist labels in Ambiguous error.
+        let amb_err = lib.resolve_play_target("Echoes", TargetKind::Song).unwrap_err();
+        assert!(matches!(amb_err, TermusicError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")));
+
+        // --artist filter narrows to unique candidate.
+        let filtered = lib
+            .resolve_play_target_with_artist("echoes", TargetKind::Auto, Some("artist two"))
+            .unwrap();
+        match filtered {
+            PlayResolution::Ready(PlayTarget::Song { selected, queue }) => {
+                assert_eq!(selected.id, "2");
+                assert_eq!(queue.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["2", "3", "1"]);
+            }
+            other => panic!("expected Ready song 2, got {other:?}"),
+        }
+
+        // Non-matching artist filter errors with NotFound instead of falling through to substring tier.
+        let not_found = lib
+            .resolve_play_target_with_artist("echoes", TargetKind::Song, Some("Artist Three"))
+            .unwrap_err();
+        assert!(matches!(not_found, TermusicError::NotFound(_)));
+
+        // Substring match works when exact tiers have no match.
+        let sub = lib
+            .resolve_play_target_with_artist("Remix", TargetKind::Song, None)
+            .unwrap();
+        assert!(matches!(sub, PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "3"));
+
+        // Stem / filename match works as final tier.
+        let stem = lib
+            .resolve_play_target_with_artist("03_remix_file", TargetKind::Song, None)
+            .unwrap();
+        assert!(matches!(stem, PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "3"));
+
+        // Exact playlist name beats substring song match in TargetKind::Auto.
+        let pl = lib
+            .resolve_play_target_with_artist("Midnight", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(pl, PlayResolution::Ready(PlayTarget::Playlist { ref playlist, .. }) if playlist.name == "Midnight"));
+
+        // play_target_for_song_index rotates queue and rejects out-of-bounds.
+        let by_idx = lib.play_target_for_song_index(1).unwrap();
+        assert!(matches!(by_idx, PlayTarget::Song { ref selected, .. } if selected.id == "2"));
+        assert!(matches!(
+            lib.play_target_for_song_index(99),
+            Err(TermusicError::NotFound(_))
+        ));
     }
 }

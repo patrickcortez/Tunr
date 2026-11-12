@@ -1,8 +1,12 @@
-use std::ffi::OsStr;
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-use crate::error::Result;
+use tokio::io::AsyncWriteExt;
+
+use crate::error::{Result, TermusicError};
 
 /// Cross-platform shutdown signal listener (`SIGINT` / `SIGTERM` on Unix; console control
 /// events on Windows).
@@ -353,6 +357,237 @@ fn is_termux_from_env(termux_version: Option<&OsStr>, prefix: Option<&OsStr>) ->
         || prefix.is_some_and(|p| p.to_string_lossy().contains("com.termux"))
 }
 
+/// Return `true` when running inside Windows Subsystem for Linux (`WSL_DISTRO_NAME` or `WSL_INTEROP` set).
+pub fn is_wsl() -> bool {
+    is_wsl_from_env(
+        std::env::var_os("WSL_DISTRO_NAME").as_deref(),
+        std::env::var_os("WSL_INTEROP").as_deref(),
+    )
+}
+
+fn is_wsl_from_env(wsl_distro: Option<&OsStr>, wsl_interop: Option<&OsStr>) -> bool {
+    wsl_distro.is_some_and(|v| !v.is_empty()) || wsl_interop.is_some_and(|v| !v.is_empty())
+}
+
+/// Clipboard backend used by [`copy_to_clipboard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardMethod {
+    ClipExe,
+    Pbcopy,
+    WlCopy,
+    Xclip,
+    Xsel,
+    TermuxClipboard,
+    Osc52,
+}
+
+impl ClipboardMethod {
+    /// Short human-readable label for the clipboard backend.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClipExe => "clip.exe",
+            Self::Pbcopy => "pbcopy",
+            Self::WlCopy => "wl-copy",
+            Self::Xclip => "xclip",
+            Self::Xsel => "xsel",
+            Self::TermuxClipboard => "termux-clipboard-set",
+            Self::Osc52 => "OSC 52",
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardCandidate {
+    method: ClipboardMethod,
+    binary: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(any(unix, test))]
+fn unix_clipboard_candidates_from_env(
+    is_macos: bool,
+    is_android_or_termux: bool,
+    wsl: bool,
+    wayland_display: Option<&OsStr>,
+    display: Option<&OsStr>,
+) -> Vec<ClipboardCandidate> {
+    if is_macos {
+        return vec![ClipboardCandidate {
+            method: ClipboardMethod::Pbcopy,
+            binary: "pbcopy",
+            args: &[],
+        }];
+    }
+    if is_android_or_termux {
+        return vec![ClipboardCandidate {
+            method: ClipboardMethod::TermuxClipboard,
+            binary: "termux-clipboard-set",
+            args: &[],
+        }];
+    }
+
+    let mut candidates = Vec::new();
+    if wsl {
+        candidates.push(ClipboardCandidate {
+            method: ClipboardMethod::ClipExe,
+            binary: "clip.exe",
+            args: &[],
+        });
+    }
+    if wayland_display.is_some_and(|v| !v.is_empty()) {
+        candidates.push(ClipboardCandidate {
+            method: ClipboardMethod::WlCopy,
+            binary: "wl-copy",
+            args: &[],
+        });
+    }
+    if display.is_some_and(|v| !v.is_empty()) {
+        candidates.push(ClipboardCandidate {
+            method: ClipboardMethod::Xclip,
+            binary: "xclip",
+            args: &["-selection", "clipboard"],
+        });
+        candidates.push(ClipboardCandidate {
+            method: ClipboardMethod::Xsel,
+            binary: "xsel",
+            args: &["--clipboard", "--input"],
+        });
+    }
+    candidates
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map(u32::from).unwrap_or(0);
+        let b2 = chunk.get(2).copied().map(u32::from).unwrap_or(0);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
+}
+
+fn write_osc52(text: &str) -> io::Result<()> {
+    let seq = format!("\x1b]52;c;{}\x07", encode_base64(text.as_bytes()));
+    #[cfg(unix)]
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        tty.write_all(seq.as_bytes())?;
+        return tty.flush();
+    }
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(seq.as_bytes())?;
+    stdout.flush()
+}
+
+async fn copy_via_command(binary: &Path, args: &[&str], text: &str) -> io::Result<()> {
+    const CLIPBOARD_CMD_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let mut cmd = crate::ytdlp::command_for_binary(binary, &os_args);
+    // Keep stdout/stderr null so forking tools like `wl-copy` / `xclip` do not block waiting on EOF.
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("clipboard process stdin missing"))?;
+    let payload = text.as_bytes().to_vec();
+
+    let run_io = async {
+        stdin.write_all(&payload).await?;
+        stdin.shutdown().await?;
+        drop(stdin);
+        child.wait().await
+    };
+
+    let status = match tokio::time::timeout(CLIPBOARD_CMD_TIMEOUT, run_io).await {
+        Ok(res) => res?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("clipboard command `{}` timed out", binary.display()),
+            ));
+        }
+    };
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "clipboard command `{}` exited with {status}",
+            binary.display()
+        )))
+    }
+}
+
+/// Copy `text` to the system clipboard using platform utilities, optionally falling back to OSC 52.
+pub async fn copy_to_clipboard(text: &str, allow_osc52: bool) -> Result<ClipboardMethod> {
+    let env = crate::ytdlp::ToolEnv::from_system();
+    let mut last_err: Option<String> = None;
+
+    #[cfg(windows)]
+    {
+        if let Some(bin) = crate::ytdlp::find_in_env("clip.exe", &env)
+            .or_else(|| crate::ytdlp::find_in_env("clip", &env))
+        {
+            match copy_via_command(&bin, &[], text).await {
+                Ok(()) => return Ok(ClipboardMethod::ClipExe),
+                Err(err) => last_err = Some(err.to_string()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let candidates = unix_clipboard_candidates_from_env(
+            cfg!(target_os = "macos"),
+            cfg!(target_os = "android") || is_termux(),
+            is_wsl(),
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+            std::env::var_os("DISPLAY").as_deref(),
+        );
+        for candidate in candidates {
+            if let Some(bin) = crate::ytdlp::find_in_env(candidate.binary, &env) {
+                match copy_via_command(&bin, candidate.args, text).await {
+                    Ok(()) => return Ok(candidate.method),
+                    Err(err) => last_err = Some(err.to_string()),
+                }
+            }
+        }
+    }
+
+    if allow_osc52 {
+        write_osc52(text)?;
+        return Ok(ClipboardMethod::Osc52);
+    }
+
+    let detail = last_err.unwrap_or_else(|| "no supported clipboard utility found".to_string());
+    Err(TermusicError::NotFound(detail))
+}
+
 /// Resolve the user's default music directory via `dirs::audio_dir()`, falling back to
 /// `$HOME/storage/music`, `/sdcard/Music`, and `$HOME/Music` if they exist.
 pub fn default_music_dir() -> Option<PathBuf> {
@@ -610,5 +845,85 @@ mod tests {
         configure_detached_daemon(&mut cmd);
         let status = cmd.status().await.unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn encode_base64_matches_rfc4648_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
+        assert_eq!(encode_base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            encode_base64(b"https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            "aHR0cHM6Ly93d3cueW91dHViZS5jb20vd2F0Y2g/dj1kUXc0dzlXZ1hjUQ=="
+        );
+    }
+
+    #[test]
+    fn is_wsl_from_env_checks_distro_and_interop() {
+        assert!(!is_wsl_from_env(None, None));
+        assert!(!is_wsl_from_env(Some(OsStr::new("")), Some(OsStr::new(""))));
+        assert!(is_wsl_from_env(Some(OsStr::new("Ubuntu")), None));
+        assert!(is_wsl_from_env(None, Some(OsStr::new("/run/WSL/491_interop"))));
+        let _ = is_wsl();
+    }
+
+    #[test]
+    fn unix_clipboard_candidates_prioritize_platform_and_display() {
+        assert_eq!(
+            unix_clipboard_candidates_from_env(true, false, false, None, None),
+            vec![ClipboardCandidate {
+                method: ClipboardMethod::Pbcopy,
+                binary: "pbcopy",
+                args: &[],
+            }]
+        );
+        assert_eq!(
+            unix_clipboard_candidates_from_env(false, true, false, Some(OsStr::new("wayland-0")), None),
+            vec![ClipboardCandidate {
+                method: ClipboardMethod::TermuxClipboard,
+                binary: "termux-clipboard-set",
+                args: &[],
+            }]
+        );
+        assert_eq!(
+            unix_clipboard_candidates_from_env(
+                false,
+                false,
+                true,
+                Some(OsStr::new("wayland-0")),
+                Some(OsStr::new(":0")),
+            ),
+            vec![
+                ClipboardCandidate {
+                    method: ClipboardMethod::ClipExe,
+                    binary: "clip.exe",
+                    args: &[],
+                },
+                ClipboardCandidate {
+                    method: ClipboardMethod::WlCopy,
+                    binary: "wl-copy",
+                    args: &[],
+                },
+                ClipboardCandidate {
+                    method: ClipboardMethod::Xclip,
+                    binary: "xclip",
+                    args: &["-selection", "clipboard"],
+                },
+                ClipboardCandidate {
+                    method: ClipboardMethod::Xsel,
+                    binary: "xsel",
+                    args: &["--clipboard", "--input"],
+                },
+            ]
+        );
+        assert!(
+            unix_clipboard_candidates_from_env(false, false, false, None, None).is_empty()
+        );
+        assert_eq!(ClipboardMethod::Osc52.label(), "OSC 52");
+        assert_eq!(ClipboardMethod::ClipExe.label(), "clip.exe");
     }
 }

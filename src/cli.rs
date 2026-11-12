@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::download::{DownloadFormat, DownloadOptions, normalize_urls};
+use crate::download::{DownloadFormat, DownloadOptions, normalize_urls, parse_download_format_str};
 use crate::error::{Result, TermusicError};
 use crate::ipc::{PlayMode, TargetKind};
-use crate::paths::{AppPaths, IpcEndpoint};
+use crate::paths::{self, AppPaths, IpcEndpoint};
+use crate::search::{SearchOptions, SearchProvider};
 
 /// Sub-target filter for `termusic list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -104,6 +105,9 @@ pub enum RawCommand {
         /// Force interpreting target as a playlist name
         #[arg(long, conflicts_with = "song")]
         playlist: bool,
+        /// Disambiguate song target by artist name
+        #[arg(long = "artist", value_name = "ARTIST", conflicts_with = "playlist")]
+        artist: Option<String>,
     },
 
     /// Add an audio file or folder of audio files to the library
@@ -191,12 +195,12 @@ pub enum RawCommand {
         /// Persist default download destination in workspace config
         #[arg(long = "set-dest", value_name = "DIR")]
         set_dest: Option<PathBuf>,
-        /// Target audio format
+        /// Target audio/video format
         #[arg(
             short = 'f',
             long = "format",
-            value_enum,
-            ignore_case = true,
+            value_name = "FORMAT",
+            value_parser = parse_download_format_str,
             default_value_t = DownloadFormat::Mp3
         )]
         format: DownloadFormat,
@@ -226,6 +230,60 @@ pub enum RawCommand {
         /// One or more media URLs to download
         #[arg(value_name = "URL")]
         urls: Vec<String>,
+    },
+
+    /// Search YouTube or SoundCloud (2 supported providers) via yt-dlp and browse, copy, or download results
+    Search {
+        /// Maximum number of search results (1..=100)
+        #[arg(short = 'n', long = "limit", value_name = "N")]
+        limit: Option<usize>,
+        /// Persist default search result limit in workspace config
+        #[arg(long = "set-limit", value_name = "N")]
+        set_limit: Option<usize>,
+        /// Download selected result instead of copying URL (top result in --no-tui mode)
+        #[arg(short = 'd', long = "download")]
+        download: bool,
+        /// Destination directory when downloading with -d / --download
+        #[arg(long = "dest", value_name = "DIR")]
+        dest: Option<PathBuf>,
+        /// Search provider website/name (2 supported: YouTube, SoundCloud)
+        #[arg(
+            short = 'p',
+            long = "provider",
+            value_name = "URL",
+            value_parser = SearchProvider::parse
+        )]
+        provider: Option<SearchProvider>,
+        /// Persist default search provider in workspace config (-pd / --pd / --provider-default)
+        #[arg(
+            long = "provider-default",
+            visible_alias = "pd",
+            value_name = "URL",
+            value_parser = SearchProvider::parse
+        )]
+        provider_default: Option<SearchProvider>,
+        /// Download format for -d / --download (mp3, mp4, flac, m4a, ogg, wav, aac; optional leading '.')
+        #[arg(
+            short = 'f',
+            long = "format",
+            value_name = "FORMAT",
+            value_parser = parse_download_format_str
+        )]
+        format: Option<DownloadFormat>,
+        /// Persist default download format in workspace config (-fd / --fd / -format-default / --format-default)
+        #[arg(
+            long = "format-default",
+            visible_alias = "fd",
+            value_name = "FORMAT",
+            value_parser = parse_download_format_str
+        )]
+        format_default: Option<DownloadFormat>,
+        /// Disable interactive TUI and print search results to stdout
+        #[arg(long = "no-tui")]
+        no_tui: bool,
+        /// Search query terms (optional in interactive TUI mode or when setting defaults)
+        #[arg(value_name = "QUERY")]
+        query: Vec<String>,
     },
 
     /// Manage the background playback daemon
@@ -259,6 +317,7 @@ pub enum Command {
         target: String,
         mode: PlayMode,
         kind: TargetKind,
+        artist: Option<String>,
     },
     Add {
         folder: bool,
@@ -290,6 +349,7 @@ pub enum Command {
         kind: Option<ListKind>,
     },
     Download(DownloadOptions),
+    Search(SearchOptions),
     DaemonStop,
     Daemon(DaemonOverrides),
 }
@@ -380,9 +440,10 @@ fn validate_cli(cli: Cli) -> Result<Command> {
             mode,
             song,
             playlist,
+            artist,
         } => match target {
             None => {
-                if song || playlist || mode.is_some() {
+                if song || playlist || mode.is_some() || artist.is_some() {
                     return Err(TermusicError::InvalidArg(
                         "play requires a song or playlist name when flags or play mode are specified"
                             .to_string(),
@@ -396,10 +457,23 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                         "play target cannot be empty".to_string(),
                     ));
                 }
+                let clean_artist = match artist {
+                    Some(raw) => {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            return Err(TermusicError::InvalidArg(
+                                "--artist cannot be empty".to_string(),
+                            ));
+                        }
+                        Some(trimmed.to_string())
+                    }
+                    None => None,
+                };
                 Ok(Command::Play {
                     target,
                     mode: mode.unwrap_or_default(),
                     kind: resolve_target_kind(song, playlist)?,
+                    artist: clean_artist,
                 })
             }
         },
@@ -534,6 +608,53 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 no_tui,
             }))
         }
+        RawCommand::Search {
+            limit,
+            set_limit,
+            download,
+            dest,
+            provider,
+            provider_default,
+            format,
+            format_default,
+            no_tui,
+            query,
+        } => {
+            if let Some(n) = limit {
+                paths::validate_search_limit(n)?;
+            }
+            if let Some(n) = set_limit {
+                paths::validate_search_limit(n)?;
+            }
+            if let Some(ref d) = dest
+                && (d.as_os_str().is_empty() || d.to_str().is_some_and(|s| s.trim().is_empty()))
+            {
+                return Err(TermusicError::InvalidArg(
+                    "--dest requires a non-empty directory path".to_string(),
+                ));
+            }
+            let joined_query = query.join(" ").trim().to_string();
+            let setting_default =
+                set_limit.is_some() || provider_default.is_some() || format_default.is_some();
+            if joined_query.is_empty() && no_tui && (!setting_default || download) {
+                return Err(TermusicError::InvalidArg(
+                    "missing search query (pass <QUERY...> or omit --no-tui for interactive prompt)"
+                        .to_string(),
+                ));
+            }
+            Ok(Command::Search(SearchOptions {
+                query: joined_query,
+                limit,
+                set_limit,
+                no_tui,
+                download,
+                dest,
+                provider,
+                provider_default,
+                format,
+                format_default,
+            }))
+        }
         RawCommand::DaemonControl {
             action: DaemonAction::Stop,
         } => Ok(Command::DaemonStop),
@@ -541,9 +662,94 @@ fn validate_cli(cli: Cli) -> Result<Command> {
     }
 }
 
+/// Normalize single-dash multi-character `search` default flags (`-pd`, `-fd`, `-format-default`)
+/// into their canonical `--` long forms before clap parses them, preserving tokens after `--`
+/// and immediate flag values.
+pub fn normalize_search_args<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let raw: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if raw.get(1).and_then(|s| s.to_str()) != Some("search") {
+        return raw;
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    out.push(raw[0].clone());
+    out.push(raw[1].clone());
+
+    let mut after_double_dash = false;
+    let mut expect_value = false;
+
+    for arg in raw.into_iter().skip(2) {
+        if after_double_dash {
+            out.push(arg);
+            continue;
+        }
+        if expect_value {
+            expect_value = false;
+            out.push(arg);
+            continue;
+        }
+
+        let Some(text) = arg.to_str() else {
+            out.push(arg);
+            continue;
+        };
+
+        if text == "--" {
+            after_double_dash = true;
+            out.push(arg);
+            continue;
+        }
+
+        let rewritten = if text == "-pd" {
+            expect_value = true;
+            Some("--provider-default".to_string())
+        } else if let Some(rest) = text.strip_prefix("-pd=") {
+            Some(format!("--provider-default={rest}"))
+        } else if text == "-fd" || text == "-format-default" {
+            expect_value = true;
+            Some("--format-default".to_string())
+        } else if let Some(rest) = text.strip_prefix("-fd=") {
+            Some(format!("--format-default={rest}"))
+        } else if let Some(rest) = text.strip_prefix("-format-default=") {
+            Some(format!("--format-default={rest}"))
+        } else {
+            None
+        };
+
+        if let Some(next) = rewritten {
+            out.push(OsString::from(next));
+        } else {
+            if matches!(
+                text,
+                "-n" | "--limit"
+                    | "--set-limit"
+                    | "--dest"
+                    | "-p"
+                    | "--provider"
+                    | "--provider-default"
+                    | "--pd"
+                    | "-f"
+                    | "--format"
+                    | "--format-default"
+                    | "--fd"
+            ) {
+                expect_value = true;
+            }
+            out.push(arg);
+        }
+    }
+
+    out
+}
+
 /// Parse and validate CLI arguments from `std::env::args_os()`, exiting cleanly on `--help`/`--version`.
 pub fn parse_cli() -> Result<Command> {
-    match Cli::try_parse() {
+    let args = normalize_search_args(std::env::args_os());
+    match Cli::try_parse_from(args) {
         Ok(cli) => validate_cli(cli),
         Err(err) => match err.kind() {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
@@ -558,7 +764,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = Cli::try_parse_from(args)
+    let normalized = normalize_search_args(args);
+    let cli = Cli::try_parse_from(normalized)
         .map_err(|err| TermusicError::InvalidArg(err.to_string()))?;
     validate_cli(cli)
 }
@@ -604,6 +811,7 @@ mod tests {
                 target: "My Song".to_string(),
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
+                artist: None,
             }
         );
         assert_eq!(
@@ -612,6 +820,7 @@ mod tests {
                 target: "Chill Mix".to_string(),
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Auto,
+                artist: None,
             }
         );
         assert_eq!(
@@ -620,6 +829,7 @@ mod tests {
                 target: "Chill Mix".to_string(),
                 mode: PlayMode::Next,
                 kind: TargetKind::Playlist,
+                artist: None,
             }
         );
         assert_eq!(
@@ -628,10 +838,50 @@ mod tests {
                 target: "Track".to_string(),
                 mode: PlayMode::Next,
                 kind: TargetKind::Song,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "Track", "--artist", "Artist A"]).unwrap(),
+            Command::Play {
+                target: "Track".to_string(),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: Some("Artist A".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "play",
+                "Track",
+                "shuffle",
+                "--song",
+                "--artist",
+                "  Artist B  ",
+            ])
+            .unwrap(),
+            Command::Play {
+                target: "Track".to_string(),
+                mode: PlayMode::Shuffle,
+                kind: TargetKind::Song,
+                artist: Some("Artist B".to_string()),
             }
         );
         assert!(parse_cli_from(["termusic", "play", "--song"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "--playlist"]).is_err());
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "--artist", "Artist A"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "Track", "--artist", "   "]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "Mix", "--playlist", "--artist", "Artist A"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
         assert!(parse_cli_from(["termusic", "play", "Track", "random"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "Track", "--song", "--playlist"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "   "]).is_err());
@@ -1042,6 +1292,321 @@ mod tests {
         ));
         assert!(matches!(
             parse_cli_from(["termusic", "download", "-p", "  ", "https://example.com/a"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn search_parses_options_and_validates_constraints() {
+        assert_eq!(
+            parse_cli_from(["termusic", "search"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "   "]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "-n", "15", "lofi", "hip", "hop"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: "lofi hip hop".to_string(),
+                limit: Some(15),
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "search",
+                "--limit",
+                "25",
+                "--set-limit",
+                "20",
+                "--no-tui",
+                "synthwave",
+            ])
+            .unwrap(),
+            Command::Search(SearchOptions {
+                query: "synthwave".to_string(),
+                limit: Some(25),
+                set_limit: Some(20),
+                no_tui: true,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "--set-limit", "30"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: Some(30),
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "--set-limit", "30", "--no-tui"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: Some(30),
+                no_tui: true,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        // -d/--download, --dest, -p/--provider, -f/--format (with and without leading '.').
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "search",
+                "-d",
+                "--dest",
+                "/tmp/dl",
+                "-p",
+                "https://soundcloud.com/",
+                "-f",
+                ".mp4",
+                "chill",
+                "beats",
+            ])
+            .unwrap(),
+            Command::Search(SearchOptions {
+                query: "chill beats".to_string(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: true,
+                dest: Some(PathBuf::from("/tmp/dl")),
+                provider: Some(SearchProvider::SoundCloud),
+                provider_default: None,
+                format: Some(DownloadFormat::Mp4),
+                format_default: None,
+            })
+        );
+
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "search",
+                "--download",
+                "--provider",
+                "https://youtu.be/xyz",
+                "--format",
+                "mp3",
+                "--no-tui",
+                "ambient",
+            ])
+            .unwrap(),
+            Command::Search(SearchOptions {
+                query: "ambient".to_string(),
+                limit: None,
+                set_limit: None,
+                no_tui: true,
+                download: true,
+                dest: None,
+                provider: Some(SearchProvider::YouTube),
+                provider_default: None,
+                format: Some(DownloadFormat::Mp3),
+                format_default: None,
+            })
+        );
+
+        // Default-setting flags: -pd, --pd, --provider-default, -fd, --fd, -format-default, --format-default.
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "-pd", "soundcloud"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: Some(SearchProvider::SoundCloud),
+                format: None,
+                format_default: None,
+            })
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "--pd=youtube", "-fd", ".mp4"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: Some(SearchProvider::YouTube),
+                format: None,
+                format_default: Some(DownloadFormat::Mp4),
+            })
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "-format-default", ".mp3", "--no-tui"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: true,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: Some(DownloadFormat::Mp3),
+            })
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "search",
+                "--provider-default",
+                "soundcloud.com",
+                "--format-default=.flac",
+            ])
+            .unwrap(),
+            Command::Search(SearchOptions {
+                query: String::new(),
+                limit: None,
+                set_limit: None,
+                no_tui: false,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: Some(SearchProvider::SoundCloud),
+                format: None,
+                format_default: Some(DownloadFormat::Flac),
+            })
+        );
+
+        // `--` passthrough keeps literal `-pd` / `-fd` as query text.
+        assert_eq!(
+            parse_cli_from(["termusic", "search", "--no-tui", "--", "-pd", "-fd"]).unwrap(),
+            Command::Search(SearchOptions {
+                query: "-pd -fd".to_string(),
+                limit: None,
+                set_limit: None,
+                no_tui: true,
+                download: false,
+                dest: None,
+                provider: None,
+                provider_default: None,
+                format: None,
+                format_default: None,
+            })
+        );
+
+        // `download -f` also accepts `.mp4` / `mp4` / `.mp3`.
+        assert_eq!(
+            parse_cli_from(["termusic", "download", "-f", ".mp4", "https://youtu.be/abc"]).unwrap(),
+            Command::Download(DownloadOptions {
+                urls: vec!["https://youtu.be/abc".to_string()],
+                dest: None,
+                set_dest: None,
+                format: DownloadFormat::Mp4,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // Empty/whitespace query with --no-tui and without default-setting flags fails.
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--no-tui"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--no-tui", "   "]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--no-tui", "-d", "--set-limit", "5"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        // Empty --dest, unsupported provider, and unsupported format fail.
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--dest", "", "jazz"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "-p", "https://example.com", "jazz"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "-f", ".avi", "jazz"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        // Bounds validation (1..=100) for --limit / -n and --set-limit.
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "-n", "0", "jazz"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--limit", "101", "jazz"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--set-limit", "0"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            parse_cli_from(["termusic", "search", "--set-limit", "101"]),
             Err(TermusicError::InvalidArg(_))
         ));
     }

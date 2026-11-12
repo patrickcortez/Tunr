@@ -9,5 +9,8 @@ pub mod library;
 pub mod paths;
 pub mod platform;
 pub mod player;
+pub mod search;
+pub mod search_tui;
 pub mod tui;
 pub mod tui_common;
+mod ytdlp;

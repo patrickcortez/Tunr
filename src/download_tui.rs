@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph,
+    Block, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -19,27 +19,12 @@ use crate::download::{
 use crate::error::{Result, TermusicError};
 use crate::paths::AppPaths;
 use crate::platform::ShutdownSignals;
-use crate::tui_common::{TerminalSession, truncate_to_width, use_ascii_glyphs};
+use crate::tui_common::{
+    SPINNER_FRAMES, TerminalSession, active_spinner, border_type, format_duration,
+    truncate_to_width, use_ascii_glyphs,
+};
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(80);
-
-fn active_spinner(idx: usize, ascii: bool) -> &'static str {
-    if ascii {
-        ASCII_SPINNER_FRAMES[idx % ASCII_SPINNER_FRAMES.len()]
-    } else {
-        SPINNER_FRAMES[idx % SPINNER_FRAMES.len()]
-    }
-}
-
-fn border_type(ascii: bool) -> BorderType {
-    if ascii {
-        BorderType::Plain
-    } else {
-        BorderType::Rounded
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DownloadItemState {
@@ -586,18 +571,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_duration(total_secs: u64) -> String {
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    if mins >= 60 {
-        let hrs = mins / 60;
-        let rem_mins = mins % 60;
-        format!("{hrs:02}:{rem_mins:02}:{secs:02}")
-    } else {
-        format!("{mins:02}:{secs:02}")
-    }
-}
-
 fn is_cancel_key(key: &KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
@@ -612,18 +585,46 @@ fn is_cancel_key(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc)
 }
 
+/// Outcome of running the interactive download loading TUI on an active terminal session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadTuiOutcome {
+    Completed(DownloadOutcome),
+    Cancelled,
+}
+
 /// Run [`download::run_download_with_progress`] with an interactive ratatui loading TUI.
 pub async fn run_download_tui(
     paths: &AppPaths,
     opts: &DownloadOptions,
 ) -> Result<DownloadOutcome> {
-    let mut state = DownloadTuiState::from_options(opts);
-
     let mut session = TerminalSession::enter()?;
     let mut signals = ShutdownSignals::new()?;
 
     // Instantiate EventStream after TerminalSession so EventStream drops before raw mode restores.
     let mut events = EventStream::new();
+
+    let res =
+        run_download_tui_on_session(&mut session, &mut events, &mut signals, paths, opts).await;
+    drop(events);
+    drop(session);
+
+    match res? {
+        DownloadTuiOutcome::Completed(outcome) => Ok(outcome),
+        DownloadTuiOutcome::Cancelled => Err(TermusicError::Download(
+            "download cancelled by user".to_string(),
+        )),
+    }
+}
+
+/// Run [`download::run_download_with_progress`] inside an existing [`TerminalSession`].
+pub async fn run_download_tui_on_session(
+    session: &mut TerminalSession,
+    events: &mut EventStream,
+    signals: &mut ShutdownSignals,
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+) -> Result<DownloadTuiOutcome> {
+    let mut state = DownloadTuiState::from_options(opts);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let paths_cloned = paths.clone();
@@ -645,7 +646,9 @@ pub async fn run_download_tui(
                 while let Ok(ev) = rx.try_recv() {
                     state.apply_event(ev);
                 }
-                return res.map_err(|err| TermusicError::Async(format!("download task panicked: {err}")))?;
+                let outcome = res
+                    .map_err(|err| TermusicError::Async(format!("download task panicked: {err}")))??;
+                return Ok(DownloadTuiOutcome::Completed(outcome));
             }
             Some(ev) = rx.recv() => {
                 state.apply_event(ev);
@@ -664,9 +667,7 @@ pub async fn run_download_tui(
                         if is_cancel_key(&key) {
                             download_task.abort();
                             let _ = download_task.await;
-                            return Err(TermusicError::Download(
-                                "download cancelled by user".to_string(),
-                            ));
+                            return Ok(DownloadTuiOutcome::Cancelled);
                         }
                         if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                             match key.code {

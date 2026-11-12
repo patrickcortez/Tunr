@@ -6,10 +6,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::download::DownloadFormat;
 use crate::error::{Result, TermusicError};
 pub use crate::platform::canonicalize_clean as normalize_canonical_path;
+use crate::search::SearchProvider;
 
 pub const WORKSPACE_CONFIG_VERSION: u32 = 1;
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+pub const MAX_SEARCH_LIMIT: usize = 100;
 
 const NOT_INITIALIZED_MSG: &str =
     "Termusic is not initialized. Run `termusic init <working-directory-location>` first.";
@@ -101,6 +105,12 @@ pub struct WorkspaceConfig {
     pub music_dir: PathBuf,
     #[serde(default)]
     pub download_dest: Option<PathBuf>,
+    #[serde(default)]
+    pub search_limit: Option<usize>,
+    #[serde(default)]
+    pub search_provider: Option<SearchProvider>,
+    #[serde(default)]
+    pub search_format: Option<DownloadFormat>,
 }
 
 /// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/termusic/workspace.json` (or OS config dir).
@@ -416,6 +426,9 @@ fn initialize_workspace_with_env_and_os(
         playlists_dir,
         music_dir,
         download_dest: None,
+        search_limit: None,
+        search_provider: None,
+        search_format: None,
     };
 
     let config_file = config_dir.join("config.json");
@@ -485,6 +498,60 @@ fn set_workspace_download_dest_with_cwd(
         Ok(())
     })?;
     Ok(abs)
+}
+
+/// Atomically update `paths.config_path` under an exclusive advisory file lock.
+fn update_workspace_config<T>(
+    paths: &AppPaths,
+    mutate: impl FnOnce(&mut WorkspaceConfig) -> T,
+) -> Result<T> {
+    with_file_lock(&lock_path_for(&paths.config_path), true, || {
+        let mut cfg = load_workspace_config_unlocked(&paths.config_path)?;
+        let out = mutate(&mut cfg);
+        write_json_atomic(&paths.config_path, &cfg)?;
+        Ok(out)
+    })
+}
+
+/// Validate that a search result limit is within `1..=MAX_SEARCH_LIMIT`.
+pub fn validate_search_limit(limit: usize) -> Result<usize> {
+    if limit == 0 || limit > MAX_SEARCH_LIMIT {
+        return Err(TermusicError::InvalidArg(format!(
+            "search limit must be between 1 and {MAX_SEARCH_LIMIT}, got {limit}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// Persist `search_limit` inside `paths.config_path` atomically after validating `limit`.
+pub fn set_workspace_search_limit(paths: &AppPaths, limit: usize) -> Result<usize> {
+    let valid = validate_search_limit(limit)?;
+    update_workspace_config(paths, |cfg| {
+        cfg.search_limit = Some(valid);
+        valid
+    })
+}
+
+/// Persist `search_provider` inside `paths.config_path` atomically.
+pub fn set_workspace_search_provider(
+    paths: &AppPaths,
+    provider: SearchProvider,
+) -> Result<SearchProvider> {
+    update_workspace_config(paths, |cfg| {
+        cfg.search_provider = Some(provider);
+        provider
+    })
+}
+
+/// Persist `search_format` inside `paths.config_path` atomically.
+pub fn set_workspace_search_format(
+    paths: &AppPaths,
+    format: DownloadFormat,
+) -> Result<DownloadFormat> {
+    update_workspace_config(paths, |cfg| {
+        cfg.search_format = Some(format);
+        format
+    })
 }
 
 fn resolve_workspace_pointer_path_with_os(
@@ -1468,5 +1535,212 @@ mod tests {
             log,
             PathBuf::from(r"C:\Users\alice\AppData\Local\termusic\run\termusic-daemon.log")
         );
+    }
+
+    #[test]
+    fn legacy_workspace_config_without_search_limit_deserializes_as_none() {
+        let legacy_json = r#"{
+  "version": 1,
+  "working_dir": "/tmp/ws",
+  "config_dir": "/tmp/ws/config",
+  "playlists_dir": "/tmp/ws/playlists",
+  "music_dir": "/tmp/ws/music",
+  "download_dest": null
+}"#;
+        let cfg: WorkspaceConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(cfg.search_limit, None);
+
+        let minimal_json = r#"{
+  "version": 1,
+  "working_dir": "/tmp/ws",
+  "config_dir": "/tmp/ws/config",
+  "playlists_dir": "/tmp/ws/playlists",
+  "music_dir": "/tmp/ws/music"
+}"#;
+        let cfg2: WorkspaceConfig = serde_json::from_str(minimal_json).unwrap();
+        assert_eq!(cfg2.download_dest, None);
+        assert_eq!(cfg2.search_limit, None);
+        assert_eq!(cfg2.search_provider, None);
+        assert_eq!(cfg2.search_format, None);
+        assert_eq!(cfg.search_provider, None);
+        assert_eq!(cfg.search_format, None);
+    }
+
+    #[test]
+    fn set_workspace_search_provider_and_format_persist_roundtrip() {
+        let root = temp_dir("search-provider-format");
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        let init_cfg = initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        assert_eq!(init_cfg.search_provider, None);
+        assert_eq!(init_cfg.search_format, None);
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_workspace_search_provider(&paths, SearchProvider::SoundCloud).unwrap(),
+            SearchProvider::SoundCloud
+        );
+        assert_eq!(
+            set_workspace_search_format(&paths, DownloadFormat::Mp4).unwrap(),
+            DownloadFormat::Mp4
+        );
+        assert_eq!(set_workspace_search_limit(&paths, 15).unwrap(), 15);
+
+        let reloaded = load_workspace_config(&paths).unwrap();
+        assert_eq!(reloaded.search_provider, Some(SearchProvider::SoundCloud));
+        assert_eq!(reloaded.search_format, Some(DownloadFormat::Mp4));
+        assert_eq!(reloaded.search_limit, Some(15));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_search_limit_enforces_bounds() {
+        assert!(matches!(
+            validate_search_limit(0),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            validate_search_limit(MAX_SEARCH_LIMIT + 1),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert_eq!(validate_search_limit(1).unwrap(), 1);
+        assert_eq!(
+            validate_search_limit(DEFAULT_SEARCH_LIMIT).unwrap(),
+            DEFAULT_SEARCH_LIMIT
+        );
+        assert_eq!(
+            validate_search_limit(MAX_SEARCH_LIMIT).unwrap(),
+            MAX_SEARCH_LIMIT
+        );
+    }
+
+    #[test]
+    fn set_workspace_search_limit_persists_and_validates() {
+        let root = temp_dir("search-limit");
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        let init_cfg = initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        assert_eq!(init_cfg.search_limit, None);
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+        assert_eq!(load_workspace_config(&paths).unwrap().search_limit, None);
+
+        assert!(matches!(
+            set_workspace_search_limit(&paths, 0),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            set_workspace_search_limit(&paths, MAX_SEARCH_LIMIT + 1),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert_eq!(load_workspace_config(&paths).unwrap().search_limit, None);
+
+        let saved_dest =
+            set_workspace_download_dest_with_cwd(&paths, Path::new("downloads"), &root).unwrap();
+        assert_eq!(set_workspace_search_limit(&paths, 25).unwrap(), 25);
+
+        let reloaded = load_workspace_config(&paths).unwrap();
+        assert_eq!(reloaded.search_limit, Some(25));
+        assert_eq!(reloaded.download_dest, Some(saved_dest));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_set_workspace_search_limit_preserves_valid_json_and_leaves_no_tmp() {
+        let root = temp_dir("concurrent-search-limit");
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+
+        let thread_count = 8usize;
+        let expected_limits: Vec<usize> = (1..=thread_count).map(|i| i * 5).collect();
+
+        std::thread::scope(|scope| {
+            for &limit in &expected_limits {
+                let paths = &paths;
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let res = set_workspace_search_limit(paths, limit);
+                        assert!(res.is_ok(), "writer thread limit={limit} failed: {res:?}");
+                        let cfg = load_workspace_config(paths).unwrap();
+                        assert!(cfg.search_limit.is_some());
+                    }
+                });
+            }
+        });
+
+        let final_cfg = load_workspace_config(&paths).unwrap();
+        assert_eq!(final_cfg.version, WORKSPACE_CONFIG_VERSION);
+        assert!(
+            final_cfg
+                .search_limit
+                .is_some_and(|l| expected_limits.contains(&l)),
+            "unexpected search_limit: {:?}",
+            final_cfg.search_limit
+        );
+
+        let config_dir = paths.config_path.parent().unwrap();
+        let leftover_tmps: Vec<PathBuf> = fs::read_dir(config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "leftover tmp files: {leftover_tmps:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

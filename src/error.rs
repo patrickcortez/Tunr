@@ -36,6 +36,9 @@ pub enum TermusicError {
     #[error("download error: {0}")]
     Download(String),
 
+    #[error("search error: {0}")]
+    Search(String),
+
     #[error("async task error: {0}")]
     Async(String),
 }

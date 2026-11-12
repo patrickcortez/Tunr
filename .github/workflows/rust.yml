@@ -89,12 +89,12 @@ jobs:
 
       - name: Check (Android API 24)
         if: matrix.mode == 'android'
-        run: cargo ndk -t aarch64-linux-android -p 24 check --all-targets --locked
+        run: cargo ndk -t aarch64-linux-android --platform 24 check --all-targets --locked
 
       - name: Compile tests (Android API 24)
         if: matrix.mode == 'android'
-        run: cargo ndk -t aarch64-linux-android -p 24 test --no-run --locked
+        run: cargo ndk -t aarch64-linux-android --platform 24 test --no-run --locked
 
       - name: Build release (Android API 24)
         if: matrix.mode == 'android'
-        run: cargo ndk -t aarch64-linux-android -p 24 build --release --locked
+        run: cargo ndk -t aarch64-linux-android --platform 24 build --release --locked

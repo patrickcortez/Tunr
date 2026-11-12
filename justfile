@@ -30,7 +30,7 @@ test-live *args:
 
 # Type-check Android / Termux target (native on Android, cargo-ndk API 24 elsewhere)
 android-check:
-    {{cargo}} {{ if os() == "android" { "check --all-targets --locked" } else { "ndk -t aarch64-linux-android -p 24 check --all-targets --locked" } }}
+    {{cargo}} {{ if os() == "android" { "check --all-targets --locked" } else { "ndk -t aarch64-linux-android --platform 24 check --all-targets --locked" } }}
 
 # Launch Termusic TUI via cargo run
 run *args:
