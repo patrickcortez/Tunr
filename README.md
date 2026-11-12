@@ -82,6 +82,8 @@ pkg install rust yt-dlp ffmpeg pulseaudio
 
 On Linux, install `yt-dlp` and `ffmpeg` via your distribution package manager (for example, `apt`, `dnf`, or `pacman`) or `~/.local/bin`, and verify with `termusic --version` and `yt-dlp --version`.
 
+Termusic discovers external `yt-dlp` automatically across `~/.local/bin`, `PATH`, and platform package manager paths (Homebrew, WinGet, Scoop, Chocolatey), and forwards `deno` or `node` via `--js-runtimes` when present on your system.
+
 ## Quick Start
 
 Initialize a Termusic working directory before running commands:
@@ -107,7 +109,7 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic download [OPTIONS] <URL...>` | Download media via `yt-dlp` and auto-index audio tracks into the library |
 | `termusic add [-f] [-p] <path> [playlist]` | Add an audio file or directory (`-f`) to the library (and optionally a playlist `-p`) |
 | `termusic list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
-| `termusic play [target] [mode]` | Play a song or playlist via `termusic play <target\|index>`, `-i`/`--index <INDEX>`, or `--playlist <index>` (`--song`, `--playlist`, `--artist <NAME>`), or resume when omitted |
+| `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song or playlist by name or 1-based `list` index, or resume paused playback when omitted |
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
 | `termusic next` / `prev` | Skip to next or previous track |
 | `termusic rewind <secs>` / `advance <secs>` | Seek backward or forward |
@@ -116,6 +118,48 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic status` | Show current daemon playback status |
 | `termusic daemon stop` | Gracefully stop the background playback daemon |
 | `termusic version` | Print version information |
+
+## `termusic play`
+
+Play a song or playlist by title/name or by its 1-based index from `termusic list`, or omit all arguments to resume paused playback.
+
+### Options
+
+| Flag / Argument | Description |
+| --- | --- |
+| `[TARGET]` | Song title, playlist name, or 1-based index from `termusic list` |
+| `[MODE]` | Playback ordering mode: `next` (default) or `shuffle` |
+| `-i`, `--index <INDEX>` | Force strict 1-based list index lookup (cannot be combined with `[TARGET]` or `--artist`) |
+| `--song` | Force interpreting `[TARGET]` / `--index` as a song |
+| `--playlist` | Force interpreting `[TARGET]` / `--index` as a playlist |
+| `--artist <ARTIST>` | Disambiguate song title matches by artist name |
+
+### Index Resolution Rules
+
+- **Positional integers** (such as `termusic play 3` or `termusic play --playlist 2`) resolve **index-first** when `1 <= N <= len`.
+- If a positional integer exceeds the list length (for example, playing a song literally titled `"1984"` in a smaller library), `termusic` checks for an exact title or playlist name match before reporting an out-of-bounds error.
+- **`-i` / `--index <INDEX>`** always performs strict 1-based index lookup with no title or playlist fallback.
+
+### Examples
+
+```bash
+# List songs and playlists with 1-based indices
+termusic list
+
+# Play song #3 from `termusic list`, or play it in shuffle mode
+termusic play 3
+termusic play 3 shuffle
+
+# Play playlist #2 from `termusic list`
+termusic play --playlist 2
+
+# Force strict index lookup
+termusic play -i 3
+termusic play --playlist -i 2 shuffle
+
+# Play by title with artist disambiguation
+termusic play "Echoes" --artist "Artist Two"
+```
 
 ## `termusic search`
 
