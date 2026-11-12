@@ -2,8 +2,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
