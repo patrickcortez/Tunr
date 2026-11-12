@@ -141,6 +141,12 @@ Play a song or playlist by title/name or by its 1-based index from `termusic lis
 - If a positional integer exceeds the list length (for example, playing a song literally titled `"1984"` in a smaller library), `termusic` checks for an exact title or playlist name match before reporting an out-of-bounds error.
 - **`-i` / `--index <INDEX>`** always performs strict 1-based index lookup with no title or playlist fallback.
 
+### Loop Behavior (`-l` / `--loop`)
+
+- Pass `-l <BOOL>` or `--loop <BOOL>` (`true` or `false`; defaults to `false`) with a song or playlist target (for example, `termusic play MyPlaylist --loop true` or `termusic play 1 -l true`). Passing `--loop` without a target returns an error.
+- When `true`, finishing the last track in the active queue (naturally or by seeking past the end with `termusic advance`) wraps back to track 1 instead of ending the playback session. In `shuffle` mode, it wraps to the beginning of the active shuffled queue; single-song queues repeat the song.
+- When loop playback is enabled, `termusic status` shows `loop: on` and the TUI header displays `[Loop]`.
+
 ### Examples
 
 ```bash
@@ -154,8 +160,12 @@ termusic play 3 shuffle
 # Play playlist #2 from `termusic list`
 termusic play --playlist 2
 
-# Play a playlist and loop back to the beginning when it finishes
+# Play a playlist or song index and loop back to track 1 when it finishes
 termusic play MyPlaylist --loop true
+termusic play -i 1 shuffle -l true
+
+# Explicitly disable looping (default)
+termusic play "Echoes" --loop false
 
 # Force strict index lookup
 termusic play -i 3
@@ -163,10 +173,40 @@ termusic play --playlist -i 2 shuffle
 
 # Play by title with artist disambiguation
 termusic play "Echoes" --artist "Artist Two"
-
-# Rewind to the beginning of the current song
-termusic rewind
 ```
+
+## Playback & Seeking Controls
+
+Control an active daemon playback session from the CLI:
+
+```bash
+termusic rewind          # Rewind to 00:00 (the beginning of the current song)
+termusic rewind 15       # Rewind backward by 15 seconds
+termusic advance 15      # Seek forward by 15 seconds
+termusic pause           # Pause playback
+termusic resume          # Resume paused playback
+termusic next            # Skip to next track
+termusic prev            # Return to previous track
+termusic stop            # Stop playback and clear the active queue
+termusic status          # Print current track, state, mode, and loop status
+```
+
+- Calling `termusic rewind` without `<seconds>` seeks in place to `00:00`: if playback is `playing`, it restarts from the beginning; if `paused`, it resets to `00:00` while staying paused; if `stopped`, it returns an error.
+
+### Interactive Player TUI Controls
+
+Launch the full-screen player UI with `termusic` (or `termusic tui`):
+
+- `h`/`l` or `←`/`→` (plus `Tab`): switch focus between the Playlists and Tracks panes
+- `j`/`k` or `↑`/`↓`: move selection up or down
+- `Enter` or `p`: start playing the selected playlist or track
+- `Space`: pause or resume playback
+- `n` / `b`: next or previous track
+- `[` / `]`: rewind or advance by `5` seconds
+- `s`: toggle playback mode (`Next` / `Shuffle`)
+- `d`: delete selected song or playlist from the library index (with confirmation)
+- `q` / `Esc`: quit the TUI (keeps background daemon playing)
+- `Q`: stop playback and quit the TUI
 
 ## `termusic search`
 
