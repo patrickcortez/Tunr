@@ -43,6 +43,13 @@ async fn run() -> Result<()> {
             })
             .await?;
             let _ = ipc::send_request(&paths, &IpcRequest::Shutdown).await;
+            #[cfg(target_os = "android")]
+            if is_android_shared_storage(&cfg.working_dir) {
+                eprintln!(
+                    "warning: workspace {} is on Android shared storage, where file locking may be unreliable; consider placing the workspace under $HOME (e.g. ~/termusic-workspace) and using `termusic add -f` to import music",
+                    cfg.working_dir.display()
+                );
+            }
             println!(
                 "Initialized Termusic workspace at {}",
                 cfg.working_dir.display()
@@ -63,7 +70,14 @@ async fn run() -> Result<()> {
     let paths = run_blocking(AppPaths::resolve).await?;
     match command {
         Command::Version | Command::Init { .. } | Command::Daemon(_) => unreachable!(),
-        Command::Tui => tui::run_tui(&paths).await,
+        Command::Tui => {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(TermusicError::InvalidArg(
+                    "interactive TUI requires a terminal (stdin/stdout TTY); pass a subcommand such as `termusic status` or `termusic play`".to_string(),
+                ));
+            }
+            tui::run_tui(&paths).await
+        }
         Command::Play { target, mode, kind } => {
             let lib_path = paths.library_path.clone();
             let resolved = run_blocking(move || {
@@ -192,6 +206,17 @@ async fn run() -> Result<()> {
             }
             Err(TermusicError::Ipc(_)) => {
                 println!("State: stopped (daemon not running)");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        },
+        Command::DaemonStop => match ipc::send_request(&paths, &IpcRequest::Shutdown).await {
+            Ok(_) => {
+                println!("Stopped playback daemon.");
+                Ok(())
+            }
+            Err(TermusicError::Ipc(_)) => {
+                println!("Playback daemon is not running.");
                 Ok(())
             }
             Err(err) => Err(err),
@@ -351,4 +376,12 @@ fn format_time(secs: f64) -> String {
     let mins = clamped / 60;
     let rem = clamped % 60;
     format!("{mins:02}:{rem:02}")
+}
+
+#[cfg(target_os = "android")]
+fn is_android_shared_storage(path: &std::path::Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.starts_with("/sdcard")
+        || raw.starts_with("/storage/emulated")
+        || raw.starts_with("/storage/self")
 }

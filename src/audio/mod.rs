@@ -11,8 +11,16 @@ use symphonia::core::units::{Duration, Time, TimeBase};
 
 use crate::error::{Result, TermusicError};
 
+#[cfg(target_os = "android")]
+pub mod aaudio;
+#[cfg(target_os = "macos")]
+pub mod audioqueue;
 pub mod null_sink;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod pulse;
+pub mod resample;
+#[cfg(target_os = "windows")]
+pub mod wasapi;
 
 /// Return `true` if `path` has a supported audio file extension (`mp3`, `flac`, `wav`, `ogg`,
 /// `m4a`, `aac`, case-insensitive).
@@ -49,6 +57,132 @@ pub trait AudioSink: Send {
     fn flush(&mut self) -> Result<()>;
     fn drain(&mut self) -> Result<()>;
     fn close(&mut self);
+}
+
+/// Construct the platform default [`AudioSink`], honoring `TERMUSIC_AUDIO_BACKEND`
+/// (`auto`, `null`, `pulse`; platform-specific backends such as `aaudio`, `wasapi`, and
+/// `audioqueue` are reported explicitly until implemented).
+pub fn default_sink() -> Result<Box<dyn AudioSink>> {
+    let backend = std::env::var("TERMUSIC_AUDIO_BACKEND").ok();
+    default_sink_for_backend(backend.as_deref())
+}
+
+fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>> {
+    let selected = backend
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+
+    match selected.as_str() {
+        "null" => Ok(Box::new(null_sink::NullSink::default())),
+        "auto" => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Box::new(pulse::PulseSimpleSink::new()?))
+            }
+            #[cfg(target_os = "android")]
+            {
+                let prefer_pulse = std::env::var_os("PULSE_SERVER").is_some_and(|v| !v.is_empty());
+                if prefer_pulse {
+                    match pulse::PulseSimpleSink::new() {
+                        Ok(sink) => Ok(Box::new(sink)),
+                        Err(pulse_err) => match aaudio::AAudioSink::new() {
+                            Ok(sink) => Ok(Box::new(sink)),
+                            Err(aaudio_err) => Err(TermusicError::Audio(format!(
+                                "failed to initialize Termux PulseAudio ({pulse_err}) and AAudio ({aaudio_err})"
+                            ))),
+                        },
+                    }
+                } else {
+                    match aaudio::AAudioSink::new() {
+                        Ok(sink) => Ok(Box::new(sink)),
+                        Err(aaudio_err) => match pulse::PulseSimpleSink::new() {
+                            Ok(sink) => Ok(Box::new(sink)),
+                            Err(pulse_err) => Err(TermusicError::Audio(format!(
+                                "failed to initialize AAudio ({aaudio_err}) and Termux PulseAudio ({pulse_err})"
+                            ))),
+                        },
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Ok(Box::new(wasapi::WasapiSink::new()?))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Box::new(audioqueue::AudioQueueSink::new()?))
+            }
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "windows",
+                target_os = "macos"
+            )))]
+            {
+                Err(TermusicError::Audio(format!(
+                    "no default audio backend is available for target OS '{}' (use TERMUSIC_AUDIO_BACKEND=null for headless playback)",
+                    std::env::consts::OS
+                )))
+            }
+        }
+        "pulse" => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                Ok(Box::new(pulse::PulseSimpleSink::new()?))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                Err(TermusicError::Audio(format!(
+                    "audio backend 'pulse' is only supported on Linux and Android (current target OS: '{}')",
+                    std::env::consts::OS
+                )))
+            }
+        }
+        "aaudio" => {
+            #[cfg(target_os = "android")]
+            {
+                Ok(Box::new(aaudio::AAudioSink::new()?))
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                Err(TermusicError::Audio(format!(
+                    "audio backend 'aaudio' is only supported on Android (current target OS: '{}')",
+                    std::env::consts::OS
+                )))
+            }
+        }
+        "wasapi" => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(Box::new(wasapi::WasapiSink::new()?))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(TermusicError::Audio(format!(
+                    "audio backend 'wasapi' is only supported on Windows (current target OS: '{}')",
+                    std::env::consts::OS
+                )))
+            }
+        }
+        "audioqueue" => {
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Box::new(audioqueue::AudioQueueSink::new()?))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(TermusicError::Audio(format!(
+                    "audio backend 'audioqueue' is only supported on macOS (current target OS: '{}')",
+                    std::env::consts::OS
+                )))
+            }
+        }
+        other => Err(TermusicError::Audio(format!(
+            "unknown TERMUSIC_AUDIO_BACKEND '{other}' (expected one of: auto, null, pulse, aaudio, wasapi, audioqueue)"
+        ))),
+    }
 }
 
 /// Owned chunk of decoded interleaved `f32` PCM samples with its presentation timestamp.
@@ -538,5 +672,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(wav.parent().unwrap());
+    }
+
+    #[test]
+    fn default_sink_for_backend_handles_null_unknown_and_target_constraints() {
+        let mut sink = default_sink_for_backend(Some("  NULL  ")).unwrap();
+        sink.open(44_100, 2).unwrap();
+        sink.write_f32(&[0.0; 16]).unwrap();
+        sink.flush().unwrap();
+        sink.drain().unwrap();
+        sink.close();
+
+        let unknown_err = default_sink_for_backend(Some("bogus"))
+            .err()
+            .expect("unknown backend must error");
+        assert!(matches!(unknown_err, TermusicError::Audio(ref msg) if msg.contains("unknown TERMUSIC_AUDIO_BACKEND")));
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let err = default_sink_for_backend(Some("aaudio")).err().expect("aaudio is Android-only");
+            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("aaudio")));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let err = default_sink_for_backend(Some("wasapi")).err().expect("wasapi is Windows-only");
+            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("wasapi")));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let err = default_sink_for_backend(Some("audioqueue"))
+                .err()
+                .expect("audioqueue is macOS-only");
+            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("audioqueue")));
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let err = default_sink_for_backend(Some("pulse"))
+                .err()
+                .expect("pulse is Linux/Android-only");
+            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("pulse")));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(default_sink_for_backend(None).is_ok());
+            assert!(default_sink_for_backend(Some("auto")).is_ok());
+            assert!(default_sink_for_backend(Some("pulse")).is_ok());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(default_sink_for_backend(Some("audioqueue")).is_ok());
+        }
     }
 }

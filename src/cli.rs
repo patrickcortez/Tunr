@@ -7,7 +7,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use crate::download::{DownloadFormat, DownloadOptions, normalize_urls};
 use crate::error::{Result, TermusicError};
 use crate::ipc::{PlayMode, TargetKind};
-use crate::paths::AppPaths;
+use crate::paths::{AppPaths, IpcEndpoint};
 
 /// Sub-target filter for `termusic list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -22,7 +22,7 @@ pub struct DaemonOverrides {
     #[arg(long, hide = true)]
     pub library_path: Option<PathBuf>,
     #[arg(long, hide = true)]
-    pub socket_path: Option<PathBuf>,
+    pub socket_path: Option<String>,
     #[arg(long, hide = true)]
     pub pid_path: Option<PathBuf>,
     #[arg(long, hide = true)]
@@ -39,10 +39,10 @@ impl DaemonOverrides {
             &self.log_path,
         ) {
             let data_root = library_path.parent().unwrap_or_else(|| Path::new("."));
-            let run_root = socket_path.parent().unwrap_or_else(|| Path::new("."));
+            let run_root = pid_path.parent().unwrap_or_else(|| Path::new("."));
             let mut paths = AppPaths::from_roots(data_root, run_root);
             paths.library_path = library_path.clone();
-            paths.socket_path = socket_path.clone();
+            paths.ipc_endpoint = IpcEndpoint::from_override(socket_path)?;
             paths.pid_path = pid_path.clone();
             paths.log_path = log_path.clone();
             return Ok(paths);
@@ -52,8 +52,8 @@ impl DaemonOverrides {
         if let Some(p) = &self.library_path {
             paths.library_path = p.clone();
         }
-        if let Some(p) = &self.socket_path {
-            paths.socket_path = p.clone();
+        if let Some(raw_ep) = &self.socket_path {
+            paths.ipc_endpoint = IpcEndpoint::from_override(raw_ep)?;
         }
         if let Some(p) = &self.pid_path {
             paths.pid_path = p.clone();
@@ -228,9 +228,23 @@ pub enum RawCommand {
         urls: Vec<String>,
     },
 
+    /// Manage the background playback daemon
+    #[command(name = "daemon")]
+    DaemonControl {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
     /// Internal background playback daemon entrypoint
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonOverrides),
+}
+
+/// Subcommands for `termusic daemon`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum DaemonAction {
+    /// Gracefully stop the running background playback daemon
+    Stop,
 }
 
 /// Validated application command ready for dispatch.
@@ -276,6 +290,7 @@ pub enum Command {
         kind: Option<ListKind>,
     },
     Download(DownloadOptions),
+    DaemonStop,
     Daemon(DaemonOverrides),
 }
 
@@ -519,6 +534,9 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 no_tui,
             }))
         }
+        RawCommand::DaemonControl {
+            action: DaemonAction::Stop,
+        } => Ok(Command::DaemonStop),
         RawCommand::Daemon(overrides) => Ok(Command::Daemon(overrides)),
     }
 }
@@ -811,9 +829,34 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_cli_from(["termusic", "daemon", "stop"]).unwrap(),
+            Command::DaemonStop
+        );
+        assert_eq!(
             parse_cli_from(["termusic", "__daemon"]).unwrap(),
             Command::Daemon(DaemonOverrides::default())
         );
+
+        let overrides = DaemonOverrides {
+            library_path: Some(PathBuf::from("/tmp/data/library.json")),
+            socket_path: Some("/tmp/run/custom.sock".to_string()),
+            pid_path: Some(PathBuf::from("/tmp/run/custom.pid")),
+            log_path: Some(PathBuf::from("/tmp/run/custom.log")),
+        };
+        let resolved = overrides.resolve_paths().unwrap();
+        assert_eq!(resolved.library_path, PathBuf::from("/tmp/data/library.json"));
+        assert_eq!(resolved.pid_path, PathBuf::from("/tmp/run/custom.pid"));
+        assert_eq!(resolved.log_path, PathBuf::from("/tmp/run/custom.log"));
+        #[cfg(unix)]
+        assert_eq!(
+            resolved.ipc_endpoint,
+            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/run/custom.sock"))
+        );
+        #[cfg(windows)]
+        assert!(matches!(
+            resolved.ipc_endpoint,
+            IpcEndpoint::NamedPipe(ref name) if name.starts_with(r"\\.\pipe\termusic-")
+        ));
     }
 
     #[test]

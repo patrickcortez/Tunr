@@ -1,11 +1,9 @@
 use std::fs;
-use std::io::{self, stdout};
+use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -14,7 +12,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
-use tokio::signal::unix::{Signal, SignalKind, signal as unix_signal};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
@@ -23,6 +20,8 @@ use crate::error::{Result, TermusicError};
 use crate::ipc::{self, IpcRequest, PlayMode, PlaybackState, PlaybackStatus, TargetKind};
 use crate::library::{DeleteOutcome, Library, Song};
 use crate::paths::AppPaths;
+use crate::platform::ShutdownSignals;
+use crate::tui_common::{TerminalSession, fit_to_width, use_ascii_glyphs};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const SEEK_STEP_SECS: f64 = 5.0;
@@ -100,15 +99,6 @@ pub enum TuiEvent {
         result: Result<(Library, Option<(SystemTime, u64)>, DeleteOutcome)>,
     },
     WorkerError(String),
-}
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(stdout(), Show);
-        ratatui::restore();
-    }
 }
 
 struct AbortGuard(JoinHandle<()>);
@@ -398,37 +388,57 @@ impl TuiApp {
         }
     }
 
-    /// Handle a single terminal key event. Non-press events are ignored.
+    /// Handle a single terminal key event.
+    ///
+    /// Navigation and seek keys respond to both `Press` and `Repeat` events, while
+    /// state-toggling shortcuts, modal confirmations, and quit keys act only on `Press`.
+    /// Release events are ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
         }
+        let is_press = key.kind == KeyEventKind::Press;
 
         if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
-            self.should_quit = true;
+            if is_press {
+                self.should_quit = true;
+            }
             return;
         }
 
         if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-            return;
+            #[cfg(windows)]
+            let allow_altgr_char = key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_ascii_alphabetic());
+            #[cfg(not(windows))]
+            let allow_altgr_char = false;
+
+            if !allow_altgr_char {
+                return;
+            }
         }
 
         if self.confirm_delete.is_some() {
-            self.handle_modal_key(key);
+            if is_press {
+                self.handle_modal_key(key);
+            }
             return;
         }
 
         match key.code {
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = FocusPane::Playlists;
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 self.focus = FocusPane::Tracks;
                 self.ensure_track_selected();
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab | KeyCode::BackTab if is_press => {
                 self.focus = match self.focus {
                     FocusPane::Playlists => {
                         self.ensure_track_selected();
@@ -439,19 +449,19 @@ impl TuiApp {
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Enter => self.handle_enter(),
-            KeyCode::Char('p') => self.handle_play_shortcut(),
-            KeyCode::Char(' ') => self.send_control(IpcRequest::TogglePause),
-            KeyCode::Char('n') => self.send_control(IpcRequest::Next),
-            KeyCode::Char('b') => self.send_control(IpcRequest::Prev),
+            KeyCode::Enter if is_press => self.handle_enter(),
+            KeyCode::Char('p') if is_press => self.handle_play_shortcut(),
+            KeyCode::Char(' ') if is_press => self.send_control(IpcRequest::TogglePause),
+            KeyCode::Char('n') if is_press => self.send_control(IpcRequest::Next),
+            KeyCode::Char('b') if is_press => self.send_control(IpcRequest::Prev),
             KeyCode::Char('[') => self.send_control(IpcRequest::SeekRelative(-SEEK_STEP_SECS)),
             KeyCode::Char(']') => self.send_control(IpcRequest::SeekRelative(SEEK_STEP_SECS)),
-            KeyCode::Char('s') => self.toggle_mode(),
-            KeyCode::Char('d') => self.open_delete_modal(),
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('s') if is_press => self.toggle_mode(),
+            KeyCode::Char('d') if is_press => self.open_delete_modal(),
+            KeyCode::Char('q') | KeyCode::Esc if is_press => {
                 self.should_quit = true;
             }
-            KeyCode::Char('Q') => {
+            KeyCode::Char('Q') if is_press => {
                 let generation = self.next_status_gen();
                 self.min_status_gen = generation;
                 self.should_quit = true;
@@ -777,6 +787,10 @@ impl TuiApp {
 
     /// Render the complete TUI frame (header, split library panes, now-playing footer, optional modal).
     pub fn render(&mut self, frame: &mut Frame) {
+        self.render_with_ascii(frame, use_ascii_glyphs());
+    }
+
+    fn render_with_ascii(&mut self, frame: &mut Frame, ascii: bool) {
         let area = frame.area();
         let [header_area, main_area, footer_area] = Layout::vertical([
             Constraint::Length(3),
@@ -785,16 +799,16 @@ impl TuiApp {
         ])
         .areas(area);
 
-        self.render_header(frame, header_area);
-        self.render_main(frame, main_area);
-        self.render_footer(frame, footer_area);
+        self.render_header(frame, header_area, ascii);
+        self.render_main(frame, main_area, ascii);
+        self.render_footer(frame, footer_area, ascii);
 
         if let Some(modal) = self.confirm_delete.clone() {
-            self.render_delete_modal(frame, area, &modal);
+            self.render_delete_modal(frame, area, &modal, ascii);
         }
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
+    fn render_header(&self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
@@ -832,27 +846,37 @@ impl TuiApp {
         ]);
 
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::DarkGray));
         let paragraph = Paragraph::new(title_line).block(block);
         frame.render_widget(paragraph, area);
     }
 
-    fn render_main(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_main(&mut self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
-        let [playlists_area, tracks_area] = Layout::horizontal([
-            Constraint::Percentage(30),
-            Constraint::Percentage(70),
-        ])
-        .areas(area);
+        let (playlists_area, tracks_area) = if area.width < 65 {
+            let [top, bottom] = Layout::vertical([
+                Constraint::Percentage(35),
+                Constraint::Percentage(65),
+            ])
+            .areas(area);
+            (top, bottom)
+        } else {
+            let [left, right] = Layout::horizontal([
+                Constraint::Percentage(30),
+                Constraint::Percentage(70),
+            ])
+            .areas(area);
+            (left, right)
+        };
 
-        self.render_playlists(frame, playlists_area);
-        self.render_tracks(frame, tracks_area);
+        self.render_playlists(frame, playlists_area, ascii);
+        self.render_tracks(frame, tracks_area, ascii);
     }
 
-    fn render_playlists(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_playlists(&mut self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
@@ -861,7 +885,7 @@ impl TuiApp {
         let title_style = pane_title_style(focused);
 
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(border_style)
             .title(Span::styled(" Playlists ", title_style));
 
@@ -896,7 +920,7 @@ impl TuiApp {
         frame.render_stateful_widget(list, area, &mut self.playlist_state);
     }
 
-    fn render_tracks(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_tracks(&mut self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
@@ -908,7 +932,7 @@ impl TuiApp {
             .selected_playlist_name()
             .unwrap_or_else(|| "[All Songs]".to_string());
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(border_style)
             .title(Span::styled(format!(" Tracks: {context_label} "), title_style));
 
@@ -941,7 +965,11 @@ impl TuiApp {
             .map(|song| {
                 let is_active =
                     active_track.is_some_and(|cur| cur.id == song.id || cur.path == song.path);
-                let prefix = if is_active { "▶ " } else { "  " };
+                let prefix = if is_active {
+                    if ascii { "> " } else { "▶ " }
+                } else {
+                    "  "
+                };
                 let artist = song.artist.as_deref().unwrap_or("Unknown Artist");
                 let dur = song
                     .duration_secs
@@ -1000,12 +1028,12 @@ impl TuiApp {
         frame.render_stateful_widget(list, area, &mut self.track_state);
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
         let mut block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::DarkGray))
             .title(Span::styled(
                 " Now Playing ",
@@ -1043,8 +1071,14 @@ impl TuiApp {
             )),
             (state, Some(track)) => {
                 let icon = match state {
-                    PlaybackState::Playing => "▶ ",
-                    PlaybackState::Paused => "⏸ ",
+                    PlaybackState::Playing => {
+                        if ascii {
+                            "> "
+                        } else {
+                            "▶ "
+                        }
+                    }
+                    PlaybackState::Paused => "|| ",
                     PlaybackState::Stopped => "",
                 };
                 let artist = track
@@ -1110,14 +1144,22 @@ impl TuiApp {
             .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray));
         frame.render_widget(gauge, gauge_area);
 
-        let help_line = Line::from(Span::styled(
-            "←/→/Tab:Pane  ↑/↓/j/k:Nav  Enter:Play  p:PlayList  Space:Pause  n/b:Next/Prev  [/]:±5s  s:Mode  d:Del  q:Quit  Q:Stop+Quit",
-            Style::new().fg(Color::Gray),
-        ));
+        let help_text = if inner.width < 110 {
+            if ascii {
+                "<-/->/Tab:Pane  h/j/k/l:Nav  Enter:Play  Space:Pause  n/b:Next  d:Del  q:Quit"
+            } else {
+                "←/→/Tab:Pane  ↑/↓:Nav  Enter:Play  Space:Pause  n/b:Next  d:Del  q:Quit"
+            }
+        } else if ascii {
+            "<-/->/Tab:Pane  Up/Down/j/k:Nav  Enter:Play  p:PlayList  Space:Pause  n/b:Next/Prev  [/]:+/-5s  s:Mode  d:Del  q:Quit  Q:Stop+Quit"
+        } else {
+            "←/→/Tab:Pane  ↑/↓/j/k:Nav  Enter:Play  p:PlayList  Space:Pause  n/b:Next/Prev  [/]:±5s  s:Mode  d:Del  q:Quit  Q:Stop+Quit"
+        };
+        let help_line = Line::from(Span::styled(help_text, Style::new().fg(Color::Gray)));
         frame.render_widget(Paragraph::new(help_line), help_area);
     }
 
-    fn render_delete_modal(&self, frame: &mut Frame, area: Rect, modal: &ConfirmDelete) {
+    fn render_delete_modal(&self, frame: &mut Frame, area: Rect, modal: &ConfirmDelete, ascii: bool) {
         if area.width < 10 || area.height < 5 {
             return;
         }
@@ -1127,8 +1169,13 @@ impl TuiApp {
         );
         frame.render_widget(Clear, popup);
 
+        let modal_border = if ascii {
+            BorderType::Plain
+        } else {
+            BorderType::Double
+        };
         let block = Block::bordered()
-            .border_type(BorderType::Double)
+            .border_type(modal_border)
             .border_style(Style::new().fg(Color::Red))
             .title(Span::styled(
                 " Confirm Delete ",
@@ -1168,17 +1215,8 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
     let mut app = TuiApp::from_loaded(library, library_stamp);
     app.request_poll_status();
 
-    let mut terminal = match ratatui::try_init() {
-        Ok(term) => term,
-        Err(err) => {
-            ratatui::restore();
-            return Err(err.into());
-        }
-    };
-    let _guard = TerminalGuard;
-
-    let mut sigint = unix_signal(SignalKind::interrupt())?;
-    let mut sigterm = unix_signal(SignalKind::terminate())?;
+    let mut session = TerminalSession::enter()?;
+    let mut signals = ShutdownSignals::new()?;
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::unbounded_channel::<QueuedIpcAction>();
@@ -1190,7 +1228,7 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
     let action_guard = AbortGuard(action_worker);
     let mut background_tasks = JoinSet::new();
 
-    // Create EventStream after TerminalGuard so EventStream drops before raw mode restores.
+    // Create EventStream after TerminalSession so EventStream drops before raw mode restores.
     let mut events = EventStream::new();
 
     let mut stop_on_quit = dispatch_effects(
@@ -1206,12 +1244,16 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
     sync_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     while !app.should_quit() {
-        terminal.draw(|frame| app.render(frame))?;
+        session
+            .terminal_mut()
+            .draw(|frame| app.render(frame))?;
 
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Some(Ok(Event::Key(key)))
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         app.handle_key(key);
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
@@ -1240,10 +1282,7 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
                     )));
                 }
             }
-            _ = sigint.recv() => {
-                app.request_quit();
-            }
-            _ = sigterm.recv() => {
+            _ = signals.recv() => {
                 app.request_quit();
             }
         }
@@ -1264,11 +1303,10 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
     background_tasks.abort_all();
     while background_tasks.join_next().await.is_some() {}
 
-    let _ = terminal.show_cursor();
-    drop(_guard);
+    drop(session);
 
     if stop_on_quit {
-        stop_daemon_on_quit(paths, &mut sigint, &mut sigterm).await?;
+        stop_daemon_on_quit(paths, &mut signals).await?;
     }
 
     Ok(())
@@ -1413,8 +1451,7 @@ async fn run_ipc_action_worker(
 
 async fn stop_daemon_on_quit(
     paths: &AppPaths,
-    sigint: &mut Signal,
-    sigterm: &mut Signal,
+    signals: &mut ShutdownSignals,
 ) -> Result<()> {
     let stop_fut = tokio::time::timeout(
         STOP_ON_QUIT_TIMEOUT,
@@ -1429,8 +1466,7 @@ async fn stop_daemon_on_quit(
                 "timed out waiting for daemon stop".to_string(),
             )),
         },
-        _ = sigint.recv() => Ok(()),
-        _ = sigterm.recv() => Ok(()),
+        _ = signals.recv() => Ok(()),
     }
 }
 
@@ -1501,46 +1537,18 @@ fn is_daemon_offline_error(err: &TermusicError) -> bool {
                 | io::ErrorKind::ConnectionRefused
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
         ),
         _ => false,
     }
 }
 
-fn fit_to_width(text: &str, max_width: usize) -> String {
-    let width = Span::raw(text).width();
-    if width <= max_width {
-        let mut out = String::with_capacity(text.len() + (max_width - width));
-        out.push_str(text);
-        for _ in 0..(max_width - width) {
-            out.push(' ');
-        }
-        return out;
+fn border_type(ascii: bool) -> BorderType {
+    if ascii {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
     }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-    let target = max_width - 1;
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let mut buf = [0u8; 4];
-        let ch_str = ch.encode_utf8(&mut buf);
-        let ch_w = Span::raw(&*ch_str).width();
-        if used + ch_w > target {
-            break;
-        }
-        out.push(ch);
-        used += ch_w;
-    }
-    out.push('…');
-    while used + 1 < max_width {
-        out.push(' ');
-        used += 1;
-    }
-    out
 }
 
 fn format_time(secs: f64) -> String {
@@ -2153,5 +2161,116 @@ mod tests {
         assert!(!is_daemon_offline_error(&TermusicError::Io(
             io::Error::from(io::ErrorKind::TimedOut)
         )));
+        assert!(is_daemon_offline_error(&TermusicError::Io(
+            io::Error::from(io::ErrorKind::NotConnected)
+        )));
+    }
+
+    #[test]
+    fn repeat_events_allow_navigation_and_seek_but_ignore_actions_and_quit() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+
+        // Switch pane with repeat 'l' and move down with repeat Down.
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.focus(), FocusPane::Tracks);
+
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.track_state.selected(), Some(1));
+
+        // Repeat '[' / ']' still dispatches seek requests.
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(
+            app.take_effects(),
+            vec![TuiEffect::SendControl {
+                generation: 1,
+                request: IpcRequest::SeekRelative(SEEK_STEP_SECS),
+            }]
+        );
+
+        // Repeat on toggles/playback/delete/quit must be ignored.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+            KeyCode::Char('s'),
+            KeyCode::Char('d'),
+            KeyCode::Char('q'),
+            KeyCode::Char('Q'),
+            KeyCode::Esc,
+        ] {
+            app.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ));
+        }
+        assert!(!app.should_quit());
+        assert_eq!(app.mode(), PlayMode::Next);
+        assert_eq!(app.focus(), FocusPane::Tracks);
+        assert!(app.confirm_delete.is_none());
+        assert!(app.take_effects().is_empty());
+
+        // Ctrl+Alt+C must not trigger Ctrl+C quit.
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyEventKind::Press,
+        ));
+        assert!(!app.should_quit());
+
+        // Vim 'h' switches back to Playlists.
+        app.handle_key(press(KeyCode::Char('h')));
+        assert_eq!(app.focus(), FocusPane::Playlists);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_altgr_punctuation_reaches_seek_binding() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('['),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(
+            app.take_effects(),
+            vec![TuiEffect::SendControl {
+                generation: 1,
+                request: IpcRequest::SeekRelative(-SEEK_STEP_SECS),
+            }]
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_and_ascii_mode_render_cleanly() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+        app.status.state = PlaybackState::Paused;
+        app.status.current_track = Some(app.library.songs[0].clone());
+
+        let backend = TestBackend::new(50, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render_with_ascii(frame, true))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Playlists"), "missing playlists pane:\n{screen}");
+        assert!(screen.contains("Tracks:"), "missing tracks pane:\n{screen}");
+        assert!(screen.contains("|| Alpha Dawn"), "missing ASCII pause icon:\n{screen}");
+        assert!(!screen.contains('╭'), "unexpected rounded border in ASCII mode:\n{screen}");
+        assert!(!screen.contains('▶'), "unexpected unicode play glyph in ASCII mode:\n{screen}");
     }
 }

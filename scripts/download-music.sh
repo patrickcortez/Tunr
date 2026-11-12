@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Legacy bash wrapper for downloading audio with yt-dlp.
+# Deprecated: prefer the built-in cross-platform `termusic download` command,
+# which works across Linux, macOS, Windows, and Termux without bash or jq.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -238,8 +241,8 @@ if command -v deno >/dev/null 2>&1; then
     CMD+=(--js-runtimes "deno:$(command -v deno)")
 elif command -v node >/dev/null 2>&1; then
     CMD+=(--js-runtimes "node:$(command -v node)")
-elif [[ -x "/mnt/c/Users/patri/scoop/apps/nodejs/current/node.exe" ]]; then
-    CMD+=(--js-runtimes "node:/mnt/c/Users/patri/scoop/apps/nodejs/current/node.exe")
+elif command -v node.exe >/dev/null 2>&1; then
+    CMD+=(--js-runtimes "node:$(command -v node.exe)")
 fi
 
 USE_EMBED_THUMB=0

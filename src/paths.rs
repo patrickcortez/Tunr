@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -6,11 +7,89 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TermusicError};
+pub use crate::platform::canonicalize_clean as normalize_canonical_path;
 
 pub const WORKSPACE_CONFIG_VERSION: u32 = 1;
 
 const NOT_INITIALIZED_MSG: &str =
     "Termusic is not initialized. Run `termusic init <working-directory-location>` first.";
+
+#[cfg(target_os = "macos")]
+const UNIX_SOCKET_MAX_PATH_BYTES: usize = 104;
+#[cfg(all(unix, not(target_os = "macos")))]
+const UNIX_SOCKET_MAX_PATH_BYTES: usize = 108;
+
+/// Cross-platform daemon IPC endpoint address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcEndpoint {
+    #[cfg(unix)]
+    UnixSocket(PathBuf),
+    #[cfg(windows)]
+    NamedPipe(String),
+}
+
+impl IpcEndpoint {
+    /// Parse a CLI or daemon `--socket-path` override string into a platform endpoint.
+    pub fn from_override(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(TermusicError::InvalidArg(
+                "--socket-path requires a non-empty endpoint".to_string(),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            Ok(Self::UnixSocket(PathBuf::from(raw)))
+        }
+
+        #[cfg(windows)]
+        {
+            if trimmed
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\.\pipe\"))
+            {
+                if trimmed.len() == 9 {
+                    return Err(TermusicError::InvalidArg(
+                        "--socket-path named pipe name must not be empty".to_string(),
+                    ));
+                }
+                Ok(Self::NamedPipe(trimmed.to_string()))
+            } else {
+                Ok(Self::NamedPipe(named_pipe_for_seed(trimmed)))
+            }
+        }
+    }
+
+    /// Borrow the underlying Unix socket path if this endpoint uses Unix domain sockets.
+    #[cfg(unix)]
+    pub fn as_unix_socket(&self) -> Option<&Path> {
+        match self {
+            Self::UnixSocket(path) => Some(path),
+        }
+    }
+
+    /// Format this endpoint as a CLI argument or display token.
+    pub fn to_arg_string(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::UnixSocket(path) => path.to_string_lossy().into_owned(),
+            #[cfg(windows)]
+            Self::NamedPipe(name) => name.clone(),
+        }
+    }
+}
+
+impl fmt::Display for IpcEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(unix)]
+            Self::UnixSocket(path) => write!(f, "{}", path.display()),
+            #[cfg(windows)]
+            Self::NamedPipe(name) => f.write_str(name),
+        }
+    }
+}
 
 /// Workspace metadata persisted at `<working-dir>/config/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +103,7 @@ pub struct WorkspaceConfig {
     pub download_dest: Option<PathBuf>,
 }
 
-/// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/termusic/workspace.json`.
+/// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/termusic/workspace.json` (or OS config dir).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePointer {
     pub working_dir: PathBuf,
@@ -38,7 +117,7 @@ pub struct AppPaths {
     pub playlists_dir: PathBuf,
     pub music_dir: PathBuf,
     pub library_path: PathBuf,
-    pub socket_path: PathBuf,
+    pub ipc_endpoint: IpcEndpoint,
     pub pid_path: PathBuf,
     pub log_path: PathBuf,
 }
@@ -48,13 +127,19 @@ impl AppPaths {
     pub fn from_roots(data_dir: impl AsRef<Path>, runtime_dir: impl AsRef<Path>) -> Self {
         let data_dir = data_dir.as_ref();
         let runtime_dir = runtime_dir.as_ref();
+        #[cfg(unix)]
+        let ipc_endpoint = IpcEndpoint::UnixSocket(runtime_dir.join("termusic.sock"));
+        #[cfg(windows)]
+        let ipc_endpoint =
+            IpcEndpoint::NamedPipe(named_pipe_for_seed(&runtime_dir.to_string_lossy()));
+
         Self {
             working_dir: data_dir.to_path_buf(),
             config_path: data_dir.join("config").join("config.json"),
             playlists_dir: data_dir.join("playlists"),
             music_dir: data_dir.join("music"),
             library_path: data_dir.join("library.json"),
-            socket_path: runtime_dir.join("termusic.sock"),
+            ipc_endpoint,
             pid_path: runtime_dir.join("termusic.pid"),
             log_path: runtime_dir.join("termusic-daemon.log"),
         }
@@ -65,20 +150,50 @@ impl AppPaths {
     pub fn resolve() -> Result<Self> {
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let home_dir = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let os_config_dir = dirs::config_dir();
         let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-        let uid = unsafe { libc::geteuid() };
+        let runtime_id = crate::platform::user_runtime_id();
+        let runtime_env = RuntimeEnv::from_env(home_dir.clone());
 
-        Self::resolve_from_env(xdg_config_home, home_dir, xdg_runtime_dir, uid)
+        Self::resolve_from_env_full(
+            xdg_config_home,
+            home_dir,
+            os_config_dir,
+            xdg_runtime_dir,
+            &runtime_id,
+            &runtime_env,
+        )
     }
 
     pub fn resolve_from_env(
         xdg_config_home: Option<OsString>,
         home_dir: Option<PathBuf>,
         xdg_runtime_dir: Option<OsString>,
-        uid: libc::uid_t,
+        runtime_id: &str,
     ) -> Result<Self> {
-        let pointer_path = resolve_workspace_pointer_path(xdg_config_home, home_dir)?;
-        let (socket_path, pid_path, log_path) = resolve_runtime_paths(xdg_runtime_dir, uid);
+        let runtime_env = RuntimeEnv::from_home(home_dir.clone());
+        Self::resolve_from_env_full(
+            xdg_config_home,
+            home_dir,
+            None,
+            xdg_runtime_dir,
+            runtime_id,
+            &runtime_env,
+        )
+    }
+
+    fn resolve_from_env_full(
+        xdg_config_home: Option<OsString>,
+        home_dir: Option<PathBuf>,
+        os_config_dir: Option<PathBuf>,
+        xdg_runtime_dir: Option<OsString>,
+        runtime_id: &str,
+        runtime_env: &RuntimeEnv,
+    ) -> Result<Self> {
+        let pointer_path =
+            resolve_workspace_pointer_path_with_os(xdg_config_home, home_dir, os_config_dir)?;
+        let (ipc_endpoint, pid_path, log_path) =
+            resolve_runtime_paths_with_env(xdg_runtime_dir, runtime_id, runtime_env);
         let cfg = with_file_lock(&lock_path_for(&pointer_path), false, || {
             if !pointer_path.exists() {
                 return Err(TermusicError::NotInitialized(
@@ -106,7 +221,7 @@ impl AppPaths {
             library_path: cfg.playlists_dir.join("library.json"),
             playlists_dir: cfg.playlists_dir,
             music_dir: cfg.music_dir,
-            socket_path,
+            ipc_endpoint,
             pid_path,
             log_path,
         })
@@ -114,12 +229,25 @@ impl AppPaths {
 
     /// Ensure parent directories exist for library and runtime files.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for path in [
-            &self.library_path,
-            &self.socket_path,
-            &self.pid_path,
-            &self.log_path,
-        ] {
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &self.ipc_endpoint;
+            if let Some(parent) = socket_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                if parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("termusic-"))
+                {
+                    crate::platform::ensure_private_dir(parent)?;
+                } else {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+        }
+
+        for path in [&self.library_path, &self.pid_path, &self.log_path] {
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -129,14 +257,14 @@ impl AppPaths {
         Ok(())
     }
 
-    /// Lock file guarding single-instance daemon ownership for `socket_path`.
+    /// Lock file guarding single-instance daemon ownership for `pid_path`.
     pub fn daemon_lock_path(&self) -> PathBuf {
-        suffix_path(&self.socket_path, "daemon.lock")
+        suffix_path(&self.pid_path, "daemon.lock")
     }
 
-    /// Lock file serializing concurrent daemon auto-spawn attempts for `socket_path`.
+    /// Lock file serializing concurrent daemon auto-spawn attempts for `pid_path`.
     pub fn daemon_spawn_lock_path(&self) -> PathBuf {
-        suffix_path(&self.socket_path, "spawn.lock")
+        suffix_path(&self.pid_path, "spawn.lock")
     }
 }
 
@@ -229,8 +357,9 @@ pub fn with_file_lock<T>(
 pub fn initialize_workspace(dir: &Path) -> Result<WorkspaceConfig> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
     let home_dir = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let os_config_dir = dirs::config_dir();
     let current_dir = std::env::current_dir()?;
-    initialize_workspace_with_env(dir, &current_dir, xdg_config_home, home_dir)
+    initialize_workspace_with_env_and_os(dir, &current_dir, xdg_config_home, home_dir, os_config_dir)
 }
 
 /// Environment-parameterized workspace initialization helper (for isolated unit tests).
@@ -239,6 +368,16 @@ pub fn initialize_workspace_with_env(
     current_dir: &Path,
     xdg_config_home: Option<OsString>,
     home_dir: Option<PathBuf>,
+) -> Result<WorkspaceConfig> {
+    initialize_workspace_with_env_and_os(dir, current_dir, xdg_config_home, home_dir, None)
+}
+
+fn initialize_workspace_with_env_and_os(
+    dir: &Path,
+    current_dir: &Path,
+    xdg_config_home: Option<OsString>,
+    home_dir: Option<PathBuf>,
+    os_config_dir: Option<PathBuf>,
 ) -> Result<WorkspaceConfig> {
     if dir.as_os_str().is_empty() || dir.to_str().is_some_and(|s| s.trim().is_empty()) {
         return Err(TermusicError::InvalidArg(
@@ -260,7 +399,7 @@ pub fn initialize_workspace_with_env(
     }
 
     fs::create_dir_all(&candidate)?;
-    let working_dir = fs::canonicalize(&candidate)?;
+    let working_dir = normalize_canonical_path(&candidate)?;
 
     let config_dir = working_dir.join("config");
     let playlists_dir = working_dir.join("playlists");
@@ -280,7 +419,8 @@ pub fn initialize_workspace_with_env(
     };
 
     let config_file = config_dir.join("config.json");
-    let pointer_path = resolve_workspace_pointer_path(xdg_config_home, home_dir)?;
+    let pointer_path =
+        resolve_workspace_pointer_path_with_os(xdg_config_home, home_dir, os_config_dir)?;
     with_file_lock(&lock_path_for(&pointer_path), true, || {
         with_file_lock(&lock_path_for(&config_file), true, || {
             write_json_atomic(&config_file, &workspace_cfg)
@@ -336,7 +476,7 @@ fn set_workspace_download_dest_with_cwd(
     }
 
     fs::create_dir_all(&candidate)?;
-    let abs = fs::canonicalize(&candidate)?;
+    let abs = normalize_canonical_path(&candidate)?;
 
     with_file_lock(&lock_path_for(&paths.config_path), true, || {
         let mut cfg = load_workspace_config_unlocked(&paths.config_path)?;
@@ -347,47 +487,295 @@ fn set_workspace_download_dest_with_cwd(
     Ok(abs)
 }
 
-fn resolve_workspace_pointer_path(
+fn resolve_workspace_pointer_path_with_os(
     xdg_config_home: Option<OsString>,
     home_dir: Option<PathBuf>,
+    os_config_dir: Option<PathBuf>,
 ) -> Result<PathBuf> {
     let config_root = match xdg_config_home.filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
-        None => match home_dir.filter(|p| !p.as_os_str().is_empty()) {
-            Some(home) => home.join(".config"),
-            None => match dirs::config_dir() {
-                Some(dir) => dir,
-                None => {
+        None => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                if let Some(dir) = os_config_dir.filter(|p| !p.as_os_str().is_empty()) {
+                    dir
+                } else if let Some(home) = home_dir.filter(|p| !p.as_os_str().is_empty()) {
+                    home.join(".config")
+                } else {
                     return Err(TermusicError::Io(io::Error::new(
                         io::ErrorKind::NotFound,
                         "could not determine XDG_CONFIG_HOME or home directory",
                     )));
                 }
-            },
-        },
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                match home_dir.filter(|p| !p.as_os_str().is_empty()) {
+                    Some(home) => home.join(".config"),
+                    None => match os_config_dir.filter(|p| !p.as_os_str().is_empty()) {
+                        Some(dir) => dir,
+                        None => {
+                            return Err(TermusicError::Io(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "could not determine XDG_CONFIG_HOME or home directory",
+                            )));
+                        }
+                    },
+                }
+            }
+        }
     };
     Ok(config_root.join("termusic").join("workspace.json"))
 }
 
-fn resolve_runtime_paths(
+#[derive(Debug, Clone, Default)]
+struct RuntimeEnv {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    is_termux: bool,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    tmpdir: Option<OsString>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    prefix: Option<OsString>,
+    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+    home_dir: Option<PathBuf>,
+    #[cfg(windows)]
+    local_app_data: Option<PathBuf>,
+}
+
+impl RuntimeEnv {
+    fn from_home(home_dir: Option<PathBuf>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = home_dir;
+            Self {}
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                home_dir,
+                ..Default::default()
+            }
+        }
+    }
+
+    fn from_env(home_dir: Option<PathBuf>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = home_dir;
+            Self {}
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self {
+                is_termux: crate::platform::is_termux(),
+                tmpdir: std::env::var_os("TMPDIR"),
+                prefix: std::env::var_os("PREFIX"),
+                home_dir,
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                home_dir,
+                local_app_data: std::env::var_os("LOCALAPPDATA")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(dirs::data_local_dir),
+            }
+        }
+    }
+}
+
+fn sanitize_runtime_id(runtime_id: &str) -> String {
+    let clean: String = runtime_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "user".to_string()
+    } else {
+        clean
+    }
+}
+
+#[cfg(unix)]
+fn fits_unix_socket_limit(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().len() < UNIX_SOCKET_MAX_PATH_BYTES
+}
+
+#[cfg(windows)]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(windows)]
+fn named_pipe_for_seed(seed: &str) -> String {
+    format!(r"\\.\pipe\termusic-{:016x}", fnv1a_64(seed.as_bytes()))
+}
+
+fn resolve_runtime_paths_with_env(
     xdg_runtime_dir: Option<OsString>,
-    uid: libc::uid_t,
-) -> (PathBuf, PathBuf, PathBuf) {
-    if let Some(runtime_dir) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
-        let dir = PathBuf::from(runtime_dir);
+    runtime_id: &str,
+    runtime_env: &RuntimeEnv,
+) -> (IpcEndpoint, PathBuf, PathBuf) {
+    let safe_id = sanitize_runtime_id(runtime_id);
+
+    #[cfg(windows)]
+    {
+        let pipe_suffix = if safe_id.len() <= 128 {
+            safe_id.clone()
+        } else {
+            format!("{:016x}", fnv1a_64(safe_id.as_bytes()))
+        };
+        let endpoint = IpcEndpoint::NamedPipe(format!(r"\\.\pipe\termusic-{pipe_suffix}"));
+
+        let run_dir = xdg_runtime_dir
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                runtime_env
+                    .local_app_data
+                    .as_ref()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.join("termusic").join("run"))
+            })
+            .or_else(|| {
+                runtime_env
+                    .home_dir
+                    .as_ref()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|h| h.join("AppData").join("Local").join("termusic").join("run"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("termusic-{pipe_suffix}")));
+
         return (
-            dir.join("termusic.sock"),
-            dir.join("termusic.pid"),
-            dir.join("termusic-daemon.log"),
+            endpoint,
+            run_dir.join("termusic.pid"),
+            run_dir.join("termusic-daemon.log"),
         );
     }
 
-    let tmp = PathBuf::from("/tmp");
-    (
-        tmp.join(format!("termusic-{uid}.sock")),
-        tmp.join(format!("termusic-{uid}.pid")),
-        tmp.join(format!("termusic-{uid}-daemon.log")),
-    )
+    #[cfg(target_os = "macos")]
+    {
+        let _ = runtime_env;
+        if let Some(runtime_dir) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
+            let dir = PathBuf::from(runtime_dir);
+            let sock = dir.join("termusic.sock");
+            if fits_unix_socket_limit(&sock) {
+                return (
+                    IpcEndpoint::UnixSocket(sock),
+                    dir.join("termusic.pid"),
+                    dir.join("termusic-daemon.log"),
+                );
+            }
+        }
+
+        let dir = PathBuf::from(format!("/tmp/termusic-{safe_id}"));
+        let sock = dir.join("termusic.sock");
+        if fits_unix_socket_limit(&sock) {
+            return (
+                IpcEndpoint::UnixSocket(sock),
+                dir.join("termusic.pid"),
+                dir.join("termusic-daemon.log"),
+            );
+        }
+
+        let short = PathBuf::from("/tmp/termusic-user");
+        return (
+            IpcEndpoint::UnixSocket(short.join("termusic.sock")),
+            short.join("termusic.pid"),
+            short.join("termusic-daemon.log"),
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if runtime_env.is_termux || cfg!(target_os = "android") {
+            let mut candidates: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+            if let Some(dir) = xdg_runtime_dir.filter(|v| !v.is_empty()).map(PathBuf::from) {
+                candidates.push((
+                    dir.join("termusic.sock"),
+                    dir.join("termusic.pid"),
+                    dir.join("termusic-daemon.log"),
+                ));
+            }
+            if let Some(dir) = runtime_env
+                .tmpdir
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+            {
+                candidates.push((
+                    dir.join(format!("termusic-{safe_id}.sock")),
+                    dir.join(format!("termusic-{safe_id}.pid")),
+                    dir.join(format!("termusic-{safe_id}-daemon.log")),
+                ));
+            }
+            if let Some(prefix) = runtime_env
+                .prefix
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+            {
+                let var_run = prefix.join("var").join("run");
+                candidates.push((
+                    var_run.join("termusic.sock"),
+                    var_run.join("termusic.pid"),
+                    var_run.join("termusic-daemon.log"),
+                ));
+                let prefix_tmp = prefix.join("tmp");
+                candidates.push((
+                    prefix_tmp.join(format!("termusic-{safe_id}.sock")),
+                    prefix_tmp.join(format!("termusic-{safe_id}.pid")),
+                    prefix_tmp.join(format!("termusic-{safe_id}-daemon.log")),
+                ));
+            }
+            if let Some(home) = runtime_env
+                .home_dir
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                let cache_run = home.join(".cache").join("termusic").join("run");
+                candidates.push((
+                    cache_run.join("termusic.sock"),
+                    cache_run.join("termusic.pid"),
+                    cache_run.join("termusic-daemon.log"),
+                ));
+            }
+
+            if let Some((sock, pid, log)) = candidates
+                .into_iter()
+                .find(|(sock, _, _)| fits_unix_socket_limit(sock))
+            {
+                return (IpcEndpoint::UnixSocket(sock), pid, log);
+            }
+        } else if let Some(runtime_dir) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
+            let dir = PathBuf::from(runtime_dir);
+            return (
+                IpcEndpoint::UnixSocket(dir.join("termusic.sock")),
+                dir.join("termusic.pid"),
+                dir.join("termusic-daemon.log"),
+            );
+        }
+
+        let tmp = PathBuf::from("/tmp");
+        (
+            IpcEndpoint::UnixSocket(tmp.join(format!("termusic-{safe_id}.sock"))),
+            tmp.join(format!("termusic-{safe_id}.pid")),
+            tmp.join(format!("termusic-{safe_id}-daemon.log")),
+        )
+    }
 }
 
 /// Serialize `value` as pretty JSON and atomically replace `path` via a unique sibling temp file.
@@ -467,7 +855,16 @@ mod tests {
             paths.library_path,
             PathBuf::from("/tmp/data/termusic/library.json")
         );
-        assert_eq!(paths.socket_path, PathBuf::from("/tmp/run/termusic.sock"));
+        #[cfg(unix)]
+        assert_eq!(
+            paths.ipc_endpoint,
+            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/run/termusic.sock"))
+        );
+        #[cfg(windows)]
+        assert!(matches!(
+            paths.ipc_endpoint,
+            IpcEndpoint::NamedPipe(ref pipe) if pipe.starts_with(r"\\.\pipe\termusic-")
+        ));
         assert_eq!(paths.pid_path, PathBuf::from("/tmp/run/termusic.pid"));
         assert_eq!(
             paths.log_path,
@@ -485,7 +882,7 @@ mod tests {
             Some(cfg_home.clone().into_os_string()),
             Some(root.join("home")),
             Some(OsString::from("/run/user/1000")),
-            1000,
+            "1000",
         )
         .unwrap_err();
         assert!(matches!(err, TermusicError::NotInitialized(msg) if msg.contains("termusic init")));
@@ -504,7 +901,7 @@ mod tests {
             Some(cfg_home.into_os_string()),
             Some(root.join("home")),
             Some(OsString::from("/run/user/1000")),
-            1000,
+            "1000",
         )
         .unwrap_err();
         assert!(matches!(err2, TermusicError::NotInitialized(_)));
@@ -517,6 +914,12 @@ mod tests {
         let root = temp_dir("init-xdg");
         let cwd = root.join("cwd");
         let cfg_home = root.join("xdg_config");
+        #[cfg(unix)]
+        let run_dir = PathBuf::from("/tmp").join(format!(
+            "tm-pxdg-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        #[cfg(windows)]
         let run_dir = root.join("run");
         fs::create_dir_all(&cwd).unwrap();
 
@@ -528,7 +931,7 @@ mod tests {
         )
         .unwrap();
 
-        let canonical_ws = fs::canonicalize(cwd.join("my-ws")).unwrap();
+        let canonical_ws = normalize_canonical_path(&cwd.join("my-ws")).unwrap();
         assert_eq!(cfg.version, WORKSPACE_CONFIG_VERSION);
         assert_eq!(cfg.working_dir, canonical_ws);
         assert_eq!(cfg.config_dir, canonical_ws.join("config"));
@@ -543,7 +946,7 @@ mod tests {
             Some(cfg_home.into_os_string()),
             Some(root.join("home")),
             Some(run_dir.clone().into_os_string()),
-            1000,
+            "1000",
         )
         .unwrap();
 
@@ -555,10 +958,20 @@ mod tests {
             paths.library_path,
             canonical_ws.join("playlists/library.json")
         );
-        assert_eq!(paths.socket_path, run_dir.join("termusic.sock"));
+        #[cfg(unix)]
+        assert_eq!(
+            paths.ipc_endpoint,
+            IpcEndpoint::UnixSocket(run_dir.join("termusic.sock"))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            paths.ipc_endpoint,
+            IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-1000".to_string())
+        );
         assert_eq!(paths.pid_path, run_dir.join("termusic.pid"));
         assert_eq!(paths.log_path, run_dir.join("termusic-daemon.log"));
 
+        let _ = fs::remove_dir_all(&run_dir);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -576,14 +989,14 @@ mod tests {
         )
         .unwrap();
 
-        let canonical_ws = fs::canonicalize(&ws).unwrap();
+        let canonical_ws = normalize_canonical_path(&ws).unwrap();
         assert!(home.join(".config/termusic/workspace.json").exists());
 
         let paths = AppPaths::resolve_from_env(
             Some(OsString::from("")),
-            Some(home),
+            Some(home.clone()),
             None,
-            1042,
+            "1042",
         )
         .unwrap();
 
@@ -592,12 +1005,71 @@ mod tests {
             paths.library_path,
             canonical_ws.join("playlists/library.json")
         );
-        assert_eq!(paths.socket_path, PathBuf::from("/tmp/termusic-1042.sock"));
-        assert_eq!(paths.pid_path, PathBuf::from("/tmp/termusic-1042.pid"));
-        assert_eq!(
-            paths.log_path,
-            PathBuf::from("/tmp/termusic-1042-daemon.log")
-        );
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+        {
+            assert_eq!(
+                paths.ipc_endpoint,
+                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-1042.sock"))
+            );
+            assert_eq!(paths.pid_path, PathBuf::from("/tmp/termusic-1042.pid"));
+            assert_eq!(
+                paths.log_path,
+                PathBuf::from("/tmp/termusic-1042-daemon.log")
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                paths.ipc_endpoint,
+                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-1042/termusic.sock"))
+            );
+            assert_eq!(
+                paths.pid_path,
+                PathBuf::from("/tmp/termusic-1042/termusic.pid")
+            );
+            assert_eq!(
+                paths.log_path,
+                PathBuf::from("/tmp/termusic-1042/termusic-daemon.log")
+            );
+        }
+        #[cfg(target_os = "android")]
+        {
+            assert_eq!(
+                paths.ipc_endpoint,
+                IpcEndpoint::UnixSocket(home.join(".cache/termusic/run/termusic.sock"))
+            );
+            assert_eq!(
+                paths.pid_path,
+                home.join(".cache/termusic/run/termusic.pid")
+            );
+            assert_eq!(
+                paths.log_path,
+                home.join(".cache/termusic/run/termusic-daemon.log")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                paths.ipc_endpoint,
+                IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-1042".to_string())
+            );
+            assert_eq!(
+                paths.pid_path,
+                home.join("AppData")
+                    .join("Local")
+                    .join("termusic")
+                    .join("run")
+                    .join("termusic.pid")
+            );
+            assert_eq!(
+                paths.log_path,
+                home.join("AppData")
+                    .join("Local")
+                    .join("termusic")
+                    .join("run")
+                    .join("termusic-daemon.log")
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -622,7 +1094,7 @@ mod tests {
             Some(cfg_home.into_os_string()),
             Some(root.join("home")),
             Some(run_dir.into_os_string()),
-            1000,
+            "1000",
         )
         .unwrap();
         assert_eq!(load_workspace_config(&paths).unwrap().download_dest, None);
@@ -647,7 +1119,7 @@ mod tests {
         let saved =
             set_workspace_download_dest_with_cwd(&paths, Path::new("downloads/sub"), &root)
                 .unwrap();
-        let expected = fs::canonicalize(root.join("downloads/sub")).unwrap();
+        let expected = normalize_canonical_path(&root.join("downloads/sub")).unwrap();
         assert_eq!(saved, expected);
         assert!(expected.is_dir());
 
@@ -669,11 +1141,11 @@ mod tests {
         let paths = AppPaths::from_roots(root.join("data"), root.join("run"));
         assert_eq!(
             paths.daemon_lock_path(),
-            root.join("run").join("termusic.sock.daemon.lock")
+            root.join("run").join("termusic.pid.daemon.lock")
         );
         assert_eq!(
             paths.daemon_spawn_lock_path(),
-            root.join("run").join("termusic.sock.spawn.lock")
+            root.join("run").join("termusic.pid.spawn.lock")
         );
 
         let lock_path = lock_path_for(&target);
@@ -717,7 +1189,7 @@ mod tests {
             Some(cfg_home.into_os_string()),
             Some(root.join("home")),
             Some(run_dir.into_os_string()),
-            1000,
+            "1000",
         )
         .unwrap();
 
@@ -726,7 +1198,7 @@ mod tests {
             .map(|i| {
                 let d = root.join(format!("dest-{i}"));
                 fs::create_dir_all(&d).unwrap();
-                fs::canonicalize(d).unwrap()
+                normalize_canonical_path(&d).unwrap()
             })
             .collect();
 
@@ -819,7 +1291,7 @@ mod tests {
                             Some(cfg_home.clone().into_os_string()),
                             Some(home.clone()),
                             Some(run_dir.clone().into_os_string()),
-                            1000,
+                            "1000",
                         )
                         .unwrap();
                         assert_eq!(resolved.config_path, resolved.working_dir.join("config/config.json"));
@@ -828,7 +1300,7 @@ mod tests {
             }
         });
 
-        for dir in [cfg_home.join("termusic"), fs::canonicalize(&ws).unwrap().join("config")] {
+        for dir in [cfg_home.join("termusic"), normalize_canonical_path(&ws).unwrap().join("config")] {
             let leftover_tmps: Vec<PathBuf> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok().map(|entry| entry.path()))
@@ -842,5 +1314,159 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ipc_endpoint_from_override_rejects_blank_and_maps_per_platform() {
+        assert!(matches!(
+            IpcEndpoint::from_override("   "),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            let ep = IpcEndpoint::from_override("/tmp/custom.sock").unwrap();
+            assert_eq!(ep, IpcEndpoint::UnixSocket(PathBuf::from("/tmp/custom.sock")));
+            assert_eq!(ep.to_string(), "/tmp/custom.sock");
+        }
+
+        #[cfg(windows)]
+        {
+            let explicit = IpcEndpoint::from_override(r"\\.\pipe\custom-termusic").unwrap();
+            assert_eq!(
+                explicit,
+                IpcEndpoint::NamedPipe(r"\\.\pipe\custom-termusic".to_string())
+            );
+            let mapped = IpcEndpoint::from_override(r"C:\tmp\custom.sock").unwrap();
+            assert!(matches!(
+                mapped,
+                IpcEndpoint::NamedPipe(ref name) if name.starts_with(r"\\.\pipe\termusic-")
+            ));
+        }
+    }
+
+    #[test]
+    fn ensure_dirs_creates_library_and_runtime_parents() {
+        let root = temp_dir("ensure-dirs");
+        let data_dir = root.join("data");
+        let run_dir = root.join("termusic-run");
+        let paths = AppPaths::from_roots(&data_dir, &run_dir);
+        paths.ensure_dirs().unwrap();
+        assert!(data_dir.is_dir());
+        assert!(run_dir.is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_workspace_pointer_prefers_xdg_then_platform_defaults() {
+        let xdg = PathBuf::from("/custom/xdg");
+        let home = PathBuf::from("/custom/home");
+        let os_cfg = PathBuf::from("/custom/os-cfg");
+
+        let from_xdg = resolve_workspace_pointer_path_with_os(
+            Some(xdg.clone().into_os_string()),
+            Some(home.clone()),
+            Some(os_cfg.clone()),
+        )
+        .unwrap();
+        assert_eq!(from_xdg, xdg.join("termusic").join("workspace.json"));
+
+        let without_xdg =
+            resolve_workspace_pointer_path_with_os(None, Some(home.clone()), Some(os_cfg.clone()))
+                .unwrap();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(without_xdg, os_cfg.join("termusic").join("workspace.json"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            without_xdg,
+            home.join(".config").join("termusic").join("workspace.json")
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn termux_runtime_fallback_ladder_skips_slash_tmp() {
+        let env = RuntimeEnv {
+            is_termux: true,
+            tmpdir: Some(OsString::from("/data/data/com.termux/files/usr/tmp")),
+            prefix: Some(OsString::from("/data/data/com.termux/files/usr")),
+            home_dir: Some(PathBuf::from("/data/data/com.termux/files/home")),
+        };
+
+        let (ep1, pid1, _) = resolve_runtime_paths_with_env(None, "10234", &env);
+        assert_eq!(
+            ep1,
+            IpcEndpoint::UnixSocket(PathBuf::from(
+                "/data/data/com.termux/files/usr/tmp/termusic-10234.sock"
+            ))
+        );
+        assert_eq!(
+            pid1,
+            PathBuf::from("/data/data/com.termux/files/usr/tmp/termusic-10234.pid")
+        );
+
+        let no_tmpdir = RuntimeEnv {
+            tmpdir: None,
+            ..env.clone()
+        };
+        let (ep2, _, _) = resolve_runtime_paths_with_env(None, "10234", &no_tmpdir);
+        assert_eq!(
+            ep2,
+            IpcEndpoint::UnixSocket(PathBuf::from(
+                "/data/data/com.termux/files/usr/var/run/termusic.sock"
+            ))
+        );
+
+        let only_home = RuntimeEnv {
+            is_termux: true,
+            tmpdir: None,
+            prefix: None,
+            home_dir: Some(PathBuf::from("/data/data/com.termux/files/home")),
+        };
+        let (ep3, _, _) = resolve_runtime_paths_with_env(None, "10234", &only_home);
+        assert_eq!(
+            ep3,
+            IpcEndpoint::UnixSocket(PathBuf::from(
+                "/data/data/com.termux/files/home/.cache/termusic/run/termusic.sock"
+            ))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_long_xdg_runtime_dir_falls_back_to_short_tmp_socket() {
+        let long_dir = format!("/var/folders/xx/{}/T", "a".repeat(90));
+        let (ep, pid, _) = resolve_runtime_paths_with_env(
+            Some(OsString::from(long_dir)),
+            "501",
+            &RuntimeEnv::default(),
+        );
+        assert_eq!(
+            ep,
+            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-501/termusic.sock"))
+        );
+        assert_eq!(pid, PathBuf::from("/tmp/termusic-501/termusic.pid"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_paths_use_named_pipe_and_local_app_data() {
+        let env = RuntimeEnv {
+            home_dir: Some(PathBuf::from(r"C:\Users\alice")),
+            local_app_data: Some(PathBuf::from(r"C:\Users\alice\AppData\Local")),
+        };
+        let (ep, pid, log) = resolve_runtime_paths_with_env(None, "S-1-5-21-1001", &env);
+        assert_eq!(
+            ep,
+            IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-S-1-5-21-1001".to_string())
+        );
+        assert_eq!(
+            pid,
+            PathBuf::from(r"C:\Users\alice\AppData\Local\termusic\run\termusic.pid")
+        );
+        assert_eq!(
+            log,
+            PathBuf::from(r"C:\Users\alice\AppData\Local\termusic\run\termusic-daemon.log")
+        );
     }
 }

@@ -10,6 +10,7 @@ use crate::cli::validate_add_path;
 use crate::error::{Result, TermusicError};
 use crate::ipc::TargetKind;
 use crate::paths::{lock_path_for, with_file_lock, write_json_atomic};
+use crate::platform::canonicalize_clean;
 
 pub const LIBRARY_VERSION: u32 = 1;
 
@@ -166,9 +167,10 @@ impl Library {
             None => None,
         };
 
-        let candidates = collect_candidate_files(path, folder)?;
+        let (candidates, walk_skipped) = collect_candidate_files(path, folder)?;
         let mut summary = AddSummary {
             playlist_name: clean_playlist.clone(),
+            skipped_files: walk_skipped,
             ..AddSummary::default()
         };
         let mut resolved_ids = Vec::with_capacity(candidates.len());
@@ -555,29 +557,49 @@ impl Library {
     }
 }
 
-fn collect_candidate_files(path: &Path, folder: bool) -> Result<Vec<PathBuf>> {
+fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, Vec<String>)> {
     if !folder {
-        let canonical = fs::canonicalize(path)?;
+        let canonical = canonicalize_clean(path)?;
         if !is_supported_extension(&canonical) {
             return Err(TermusicError::InvalidArg(format!(
                 "unsupported audio file extension: {}",
                 canonical.display()
             )));
         }
-        return Ok(vec![canonical]);
+        return Ok((vec![canonical], Vec::new()));
     }
 
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     for entry in WalkDir::new(path).follow_links(false) {
-        let entry = entry.map_err(|err| {
-            TermusicError::Io(std::io::Error::other(format!(
-                "failed walking {}: {err}",
-                path.display()
-            )))
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                if err.depth() == 0 {
+                    return Err(TermusicError::Io(std::io::Error::other(format!(
+                        "failed walking {}: {err}",
+                        path.display()
+                    ))));
+                }
+                let entry_path = err
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                skipped.push(format!("{entry_path}: {err}"));
+                continue;
+            }
+        };
+        if entry.file_type().is_symlink() {
+            if is_supported_extension(entry.path()) || entry.path().extension().is_none() {
+                skipped.push(format!("{}: skipped symlink", entry.path().display()));
+            }
+            continue;
+        }
         if entry.file_type().is_file() && is_supported_extension(entry.path()) {
-            let canonical = fs::canonicalize(entry.path())?;
-            files.push(canonical);
+            match canonicalize_clean(entry.path()) {
+                Ok(canonical) => files.push(canonical),
+                Err(err) => skipped.push(format!("{}: {err}", entry.path().display())),
+            }
         }
     }
     files.sort();
@@ -589,7 +611,7 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<Vec<PathBuf>> {
             path.display()
         )));
     }
-    Ok(files)
+    Ok((files, skipped))
 }
 
 fn fallback_title(path: &Path) -> String {
@@ -960,5 +982,43 @@ mod tests {
         assert!(leftover_tmps.is_empty(), "leftover tmp files: {leftover_tmps:?}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_walk_reports_unfollowed_symlinks_without_aborting_valid_tracks() {
+        let dir = temp_workspace("symlink-skip");
+        let valid = dir.join("Valid.wav");
+        write_synthetic_wav(&valid, 22_050, 0.25);
+
+        let external = dir.join("External.wav");
+        write_synthetic_wav(&external, 22_050, 0.25);
+        let linked_dir = dir.join("music_root");
+        fs::create_dir_all(&linked_dir).unwrap();
+        let nested_valid = linked_dir.join("Inside.wav");
+        write_synthetic_wav(&nested_valid, 22_050, 0.25);
+        std::os::unix::fs::symlink(&external, linked_dir.join("LinkedTrack.wav")).unwrap();
+
+        let mut lib = Library::default();
+        let summary = lib.add_files(&linked_dir, true, None).unwrap();
+        assert_eq!(summary.added_count, 1);
+        assert_eq!(summary.added_titles, vec!["Inside".to_string()]);
+        assert!(
+            summary
+                .skipped_files
+                .iter()
+                .any(|msg| msg.contains("skipped symlink") && msg.contains("LinkedTrack.wav")),
+            "expected skipped symlink entry, got {:?}",
+            summary.skipped_files
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_candidate_files_errors_when_folder_missing() {
+        let missing = std::env::temp_dir().join(format!("termusic-missing-{}", Uuid::new_v4()));
+        let err = collect_candidate_files(&missing, true).unwrap_err();
+        assert!(matches!(err, TermusicError::Io(_)));
     }
 }

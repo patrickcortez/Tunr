@@ -7,5 +7,7 @@ pub mod error;
 pub mod ipc;
 pub mod library;
 pub mod paths;
+pub mod platform;
 pub mod player;
 pub mod tui;
+pub mod tui_common;

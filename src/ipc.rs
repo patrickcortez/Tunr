@@ -3,18 +3,20 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::process::{Child, Command};
 
 use crate::error::{Result, TermusicError};
 use crate::library::Song;
-use crate::paths::{self, AppPaths};
+use crate::paths::{self, AppPaths, IpcEndpoint};
+pub use crate::platform::is_pid_alive;
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -168,24 +170,411 @@ where
     Ok(Some(parsed))
 }
 
-/// Check whether a process with `pid` currently exists according to `kill(pid, 0)`.
-pub fn is_pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    matches!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    )
+/// Cross-platform async IPC stream wrapping Unix domain sockets or Windows named pipes.
+pub enum IpcStream {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    PipeServer(tokio::net::windows::named_pipe::NamedPipeServer),
+    #[cfg(windows)]
+    PipeClient(tokio::net::windows::named_pipe::NamedPipeClient),
 }
 
-fn read_pid_file(pid_path: &Path) -> Option<i32> {
+impl IpcStream {
+    /// Connect as a client to `endpoint`, returning `TermusicError::Ipc` if the daemon is offline.
+    pub async fn connect(endpoint: &IpcEndpoint) -> Result<Self> {
+        match endpoint {
+            #[cfg(unix)]
+            IpcEndpoint::UnixSocket(socket_path) => {
+                let stream = tokio::net::UnixStream::connect(socket_path)
+                    .await
+                    .map_err(|err| match err.kind() {
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                            TermusicError::Ipc(format!(
+                                "playback daemon is not running at {}: {err}",
+                                socket_path.display()
+                            ))
+                        }
+                        _ => TermusicError::Io(err),
+                    })?;
+                Ok(Self::Unix(stream))
+            }
+            #[cfg(windows)]
+            IpcEndpoint::NamedPipe(pipe_name) => {
+                let deadline = tokio::time::Instant::now() + IPC_TIMEOUT;
+                loop {
+                    match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name) {
+                        Ok(client) => return Ok(Self::PipeClient(client)),
+                        Err(err)
+                            if err.raw_os_error()
+                                == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
+                                && tokio::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        Err(err)
+                            if err.raw_os_error()
+                                == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
+                        {
+                            return Err(TermusicError::Ipc(format!(
+                                "timed out waiting for busy named pipe at {pipe_name}: {err}"
+                            )));
+                        }
+                        Err(err)
+                            if err.kind() == io::ErrorKind::NotFound
+                                || err.kind() == io::ErrorKind::ConnectionRefused =>
+                        {
+                            return Err(TermusicError::Ipc(format!(
+                                "playback daemon is not running at {pipe_name}: {err}"
+                            )));
+                        }
+                        Err(err) => return Err(TermusicError::Io(err)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AsyncRead for IpcStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            Self::PipeServer(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            Self::PipeClient(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for IpcStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            Self::PipeServer(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            Self::PipeClient(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            Self::PipeServer(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            Self::PipeClient(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            Self::PipeServer(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            Self::PipeClient(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows_pipe {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr::null_mut;
+
+    use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, FALSE, GetLastError, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use super::IpcStream;
+    use crate::error::{Result, TermusicError};
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is an owned non-null Win32 token handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalAllocGuard(*mut c_void);
+    impl Drop for LocalAllocGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by a Win32 security API and must be freed via `LocalFree`.
+                unsafe {
+                    LocalFree(self.0 as HLOCAL);
+                }
+            }
+        }
+    }
+
+    struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    // SAFETY: The underlying self-relative Win32 security descriptor is immutable after creation
+    // and only passed read-only to `CreateNamedPipeW`, then freed on `Drop`.
+    unsafe impl Send for OwnedSecurityDescriptor {}
+    // SAFETY: Same immutability invariant as `Send`.
+    unsafe impl Sync for OwnedSecurityDescriptor {}
+
+    impl Drop for OwnedSecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+                unsafe {
+                    LocalFree(self.0 as HLOCAL);
+                }
+            }
+        }
+    }
+
+    fn current_user_sid_string() -> Option<String> {
+        let mut token: HANDLE = null_mut();
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `token` receives an owned handle on success.
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if opened == FALSE || token.is_null() {
+            return None;
+        }
+        let _token_guard = HandleGuard(token);
+
+        let mut needed: u32 = 0;
+        // SAFETY: Querying required `TOKEN_USER` buffer size with null buffer and zero length.
+        let probed = unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed) };
+        if probed != FALSE || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+            return None;
+        }
+
+        let word_bytes = std::mem::size_of::<usize>();
+        let min_words = std::mem::size_of::<TOKEN_USER>().div_ceil(word_bytes);
+        let needed_words = (needed as usize).div_ceil(word_bytes);
+        let mut buf = vec![0usize; needed_words.max(min_words)];
+        let buf_len = u32::try_from(buf.len() * word_bytes).ok()?;
+        let mut returned: u32 = 0;
+        // SAFETY: `buf` is `usize`-aligned and sized for `TOKEN_USER`.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf_len,
+                &mut returned,
+            )
+        };
+        if ok == FALSE || (returned as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return None;
+        }
+
+        // SAFETY: `GetTokenInformation` succeeded and populated `TOKEN_USER` at the start of `buf`.
+        let token_user = unsafe { &*(buf.as_ptr().cast::<TOKEN_USER>()) };
+        if token_user.User.Sid.is_null() {
+            return None;
+        }
+
+        let mut sid_wide: windows_sys::core::PWSTR = null_mut();
+        // SAFETY: `token_user.User.Sid` points inside `buf`; `sid_wide` is freed via `LocalAllocGuard`.
+        let converted = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_wide) };
+        if converted == FALSE || sid_wide.is_null() {
+            return None;
+        }
+        let _sid_guard = LocalAllocGuard(sid_wide.cast::<c_void>());
+
+        let mut len = 0usize;
+        // SAFETY: `ConvertSidToStringSidW` NUL-terminates the SID string within standard SID bounds.
+        while len < 512 && unsafe { *sid_wide.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `sid_wide` points to `len` initialized UTF-16 code units.
+        let slice = unsafe { std::slice::from_raw_parts(sid_wide, len) };
+        let sid = String::from_utf16(slice).ok()?;
+        (!sid.is_empty()).then_some(sid)
+    }
+
+    impl OwnedSecurityDescriptor {
+        fn current_user_only() -> io::Result<Self> {
+            let sddl = match current_user_sid_string() {
+                Some(sid) if sid.starts_with("S-1-") => {
+                    format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})")
+                }
+                _ => "D:(A;;GA;;;CO)(A;;GA;;;SY)(A;;GA;;;BA)".to_string(),
+            };
+            let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            // SAFETY: `sddl_wide` is NUL-terminated UTF-16; `sd` receives an owned descriptor freed in `Drop`.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl_wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    null_mut(),
+                )
+            };
+            if ok == FALSE || sd.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(sd))
+        }
+    }
+
+    fn create_pipe_instance(
+        pipe_name: &str,
+        first: bool,
+        sd: &OwnedSecurityDescriptor,
+    ) -> io::Result<NamedPipeServer> {
+        let mut attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: FALSE,
+        };
+        let mut opts = ServerOptions::new();
+        opts.pipe_mode(PipeMode::Byte)
+            .first_pipe_instance(first)
+            .reject_remote_clients(true);
+        // SAFETY: `attrs` points to a valid stack `SECURITY_ATTRIBUTES` whose descriptor stays valid
+        // for the duration of `CreateNamedPipeW`.
+        unsafe {
+            opts.create_with_security_attributes_raw(
+                pipe_name,
+                (&mut attrs as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+        }
+    }
+
+    pub(super) struct NamedPipeListener {
+        pipe_name: String,
+        sd: OwnedSecurityDescriptor,
+        current: NamedPipeServer,
+        standby: NamedPipeServer,
+    }
+
+    impl NamedPipeListener {
+        pub(super) fn bind(pipe_name: &str) -> Result<Self> {
+            let sd = OwnedSecurityDescriptor::current_user_only().map_err(|err| {
+                TermusicError::Ipc(format!(
+                    "failed to build named pipe security descriptor: {err}"
+                ))
+            })?;
+            let current = create_pipe_instance(pipe_name, true, &sd).map_err(|err| {
+                TermusicError::Ipc(format!("failed to bind named pipe {pipe_name}: {err}"))
+            })?;
+            let standby = create_pipe_instance(pipe_name, false, &sd).map_err(|err| {
+                TermusicError::Ipc(format!(
+                    "failed to prepare standby named pipe {pipe_name}: {err}"
+                ))
+            })?;
+            Ok(Self {
+                pipe_name: pipe_name.to_string(),
+                sd,
+                current,
+                standby,
+            })
+        }
+
+        pub(super) async fn accept(&mut self) -> io::Result<IpcStream> {
+            self.current.connect().await?;
+            let replacement = create_pipe_instance(&self.pipe_name, false, &self.sd)?;
+            let next_current = std::mem::replace(&mut self.standby, replacement);
+            let connected = std::mem::replace(&mut self.current, next_current);
+            Ok(IpcStream::PipeServer(connected))
+        }
+    }
+}
+
+/// Cross-platform async IPC server listener accepting incoming client streams.
+pub struct IpcListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(windows)]
+    inner: windows_pipe::NamedPipeListener,
+}
+
+impl IpcListener {
+    /// Bind an IPC listener for `endpoint`, enforcing platform socket path length and permissions.
+    pub fn bind(endpoint: &IpcEndpoint) -> Result<Self> {
+        match endpoint {
+            #[cfg(unix)]
+            IpcEndpoint::UnixSocket(socket_path) => {
+                #[cfg(target_os = "macos")]
+                const MAX_SUN_PATH_BYTES: usize = 104;
+                #[cfg(all(unix, not(target_os = "macos")))]
+                const MAX_SUN_PATH_BYTES: usize = 108;
+
+                let path_bytes = socket_path.as_os_str().as_encoded_bytes().len();
+                if path_bytes >= MAX_SUN_PATH_BYTES {
+                    return Err(TermusicError::Ipc(format!(
+                        "Unix socket path {} exceeds OS sockaddr_un limit ({path_bytes} >= {MAX_SUN_PATH_BYTES} bytes); set XDG_RUNTIME_DIR to a shorter directory",
+                        socket_path.display()
+                    )));
+                }
+
+                let inner = tokio::net::UnixListener::bind(socket_path).map_err(|err| {
+                    TermusicError::Ipc(format!(
+                        "failed to bind playback daemon socket {}: {err}",
+                        socket_path.display()
+                    ))
+                })?;
+                crate::platform::restrict_socket_permissions(socket_path).map_err(|err| {
+                    TermusicError::Ipc(format!(
+                        "failed to set socket permissions on {}: {err}",
+                        socket_path.display()
+                    ))
+                })?;
+                Ok(Self { inner })
+            }
+            #[cfg(windows)]
+            IpcEndpoint::NamedPipe(pipe_name) => {
+                let inner = windows_pipe::NamedPipeListener::bind(pipe_name)?;
+                Ok(Self { inner })
+            }
+        }
+    }
+
+    /// Accept the next connected client stream.
+    pub async fn accept(&mut self) -> io::Result<IpcStream> {
+        #[cfg(unix)]
+        {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(IpcStream::Unix(stream))
+        }
+        #[cfg(windows)]
+        {
+            self.inner.accept().await
+        }
+    }
+}
+
+fn read_pid_file(pid_path: &Path) -> Option<u32> {
     let contents = fs::read_to_string(pid_path).ok()?;
-    contents.trim().parse::<i32>().ok()
+    contents.trim().parse::<u32>().ok()
 }
 
 fn is_daemon_lock_held(lock_path: &Path) -> Result<bool> {
@@ -199,7 +588,7 @@ async fn is_daemon_lock_held_async(lock_path: &Path) -> Result<bool> {
         .map_err(|err| TermusicError::Async(format!("daemon lock check task failed: {err}")))?
 }
 
-async fn exchange_on_stream(mut stream: UnixStream, req: &IpcRequest) -> Result<PlaybackStatus> {
+async fn exchange_on_stream(mut stream: IpcStream, req: &IpcRequest) -> Result<PlaybackStatus> {
     tokio::time::timeout(IPC_TIMEOUT, async {
         write_message(&mut stream, req).await?;
 
@@ -221,21 +610,15 @@ async fn exchange_on_stream(mut stream: UnixStream, req: &IpcRequest) -> Result<
     })?
 }
 
-/// Send an IPC request to an explicit Unix socket path without starting a daemon.
-pub async fn send_request_to(socket_path: &Path, req: &IpcRequest) -> Result<PlaybackStatus> {
-    let stream = UnixStream::connect(socket_path).await.map_err(|err| match err.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => TermusicError::Ipc(format!(
-            "playback daemon is not running at {}: {err}",
-            socket_path.display()
-        )),
-        _ => TermusicError::Io(err),
-    })?;
+/// Send an IPC request to an explicit IPC endpoint without starting a daemon.
+pub async fn send_request_to(endpoint: &IpcEndpoint, req: &IpcRequest) -> Result<PlaybackStatus> {
+    let stream = IpcStream::connect(endpoint).await?;
     exchange_on_stream(stream, req).await
 }
 
-/// Send an IPC request to the configured daemon socket without starting a daemon.
+/// Send an IPC request to the configured daemon endpoint without starting a daemon.
 pub async fn send_request(paths: &AppPaths, req: &IpcRequest) -> Result<PlaybackStatus> {
-    send_request_to(&paths.socket_path, req).await
+    send_request_to(&paths.ipc_endpoint, req).await
 }
 
 /// Clean up stale PID/socket files if no live daemon owns `daemon.lock` or the recorded PID.
@@ -257,10 +640,14 @@ pub fn prepare_daemon_spawn(paths: &AppPaths) -> Result<bool> {
     {
         return Err(err.into());
     }
-    if let Err(err) = fs::remove_file(&paths.socket_path)
-        && err.kind() != io::ErrorKind::NotFound
+    #[cfg(unix)]
     {
-        return Err(err.into());
+        let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+        if let Err(err) = fs::remove_file(socket_path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(err.into());
+        }
     }
 
     Ok(true)
@@ -288,7 +675,7 @@ async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
         .arg("--library-path")
         .arg(&paths.library_path)
         .arg("--socket-path")
-        .arg(&paths.socket_path)
+        .arg(paths.ipc_endpoint.to_arg_string())
         .arg("--pid-path")
         .arg(&paths.pid_path)
         .arg("--log-path")
@@ -297,15 +684,7 @@ async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
         .stdout(Stdio::null())
         .stderr(stderr_stdio);
 
-    // SAFETY: `setsid` is async-signal-safe and detaches the spawned daemon into a new session.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::platform::configure_detached_daemon(&mut cmd);
 
     let child = cmd.spawn().map_err(|err| {
         TermusicError::Daemon(format!("failed to spawn playback daemon: {err}"))
@@ -335,14 +714,14 @@ where
     F: FnOnce(AppPaths) -> Fut,
     Fut: Future<Output = Result<Option<Child>>>,
 {
-    if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
+    if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
         return exchange_on_stream(stream, req).await;
     }
 
     let spawn_guard = acquire_spawn_lock(paths).await?;
 
     // Double-check after acquiring spawn lock in case a concurrent caller just started it.
-    if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
+    if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
         drop(spawn_guard);
         return exchange_on_stream(stream, req).await;
     }
@@ -354,16 +733,16 @@ where
 
     if !should_spawn {
         drop(spawn_guard);
-        // A live daemon process already exists; give it up to 2s to finish binding its socket.
+        // A live daemon process already exists; give it up to 2s to finish binding its endpoint.
         for _ in 0..DAEMON_SPAWN_MAX_ATTEMPTS {
-            if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
+            if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
                 return exchange_on_stream(stream, req).await;
             }
             tokio::time::sleep(DAEMON_SPAWN_POLL_INTERVAL).await;
         }
         return Err(TermusicError::Daemon(format!(
             "existing daemon did not accept connections at {}",
-            paths.socket_path.display()
+            paths.ipc_endpoint
         )));
     }
 
@@ -371,14 +750,14 @@ where
     let daemon_lock_path = paths.daemon_lock_path();
 
     for _ in 0..DAEMON_SPAWN_MAX_ATTEMPTS {
-        if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
+        if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
             drop(spawn_guard);
             return exchange_on_stream(stream, req).await;
         }
         if let Some(child) = opt_child.as_mut()
             && let Ok(Some(exit_status)) = child.try_wait()
         {
-            if let Ok(stream) = UnixStream::connect(&paths.socket_path).await {
+            if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
                 drop(spawn_guard);
                 return exchange_on_stream(stream, req).await;
             }
@@ -396,13 +775,13 @@ where
     }
 
     Err(TermusicError::Daemon(format!(
-        "timed out waiting for playback daemon socket at {}",
-        paths.socket_path.display()
+        "timed out waiting for playback daemon endpoint at {}",
+        paths.ipc_endpoint
     )))
 }
 
-/// Connect to the playback daemon, spawning it detached (`setsid`) if not running,
-/// serializing cold-start election with `daemon_spawn_lock_path`, cleaning stale files only when
+/// Connect to the playback daemon, spawning it detached if not running, serializing
+/// cold-start election with `daemon_spawn_lock_path`, cleaning stale files only when
 /// `daemon_lock_path` is unheld, and sending `req`.
 pub async fn ensure_daemon_and_send(
     paths: &AppPaths,
@@ -419,7 +798,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::net::UnixListener;
     use tokio::sync::oneshot;
 
     use super::*;
@@ -427,12 +805,30 @@ mod tests {
     use crate::daemon;
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "termusic-ipc-test-{label}-{}",
-            uuid::Uuid::new_v4()
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::temp_dir();
+
+        let dir = base.join(format!(
+            "tm-ipc-{label}-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn spawn_short_lived_exit(success: bool) -> io::Result<std::process::Child> {
+        #[cfg(windows)]
+        {
+            let arg = if success { "exit 0" } else { "exit 1" };
+            StdCommand::new("cmd").args(["/C", arg]).spawn()
+        }
+        #[cfg(not(windows))]
+        {
+            let bin = if success { "true" } else { "false" };
+            StdCommand::new(bin).spawn()
+        }
     }
 
     #[test]
@@ -486,11 +882,11 @@ mod tests {
     async fn send_request_exchanges_status_and_error() {
         let dir = temp_dir("exchange");
         let paths = AppPaths::from_roots(&dir, &dir);
-        let listener = UnixListener::bind(&paths.socket_path).unwrap();
+        let mut listener = IpcListener::bind(&paths.ipc_endpoint).unwrap();
 
         let server = tokio::spawn(async move {
             for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut stream = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let req: IpcRequest = read_message(&mut reader).await.unwrap().unwrap();
                 let resp = match req {
@@ -520,16 +916,16 @@ mod tests {
     #[tokio::test]
     async fn read_message_rejects_oversized_frame() {
         let dir = temp_dir("oversized");
-        let socket_path = dir.join("oversized.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let paths = AppPaths::from_roots(&dir, &dir);
+        let mut listener = IpcListener::bind(&paths.ipc_endpoint).unwrap();
 
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let mut reader = BufReader::new(&mut stream);
             read_message::<_, IpcRequest>(&mut reader).await
         });
 
-        let mut client = UnixStream::connect(&socket_path).await.unwrap();
+        let mut client = IpcStream::connect(&paths.ipc_endpoint).await.unwrap();
         let huge = vec![b'a'; MAX_IPC_MESSAGE_BYTES + 16];
         let _ = client.write_all(&huge).await;
         let _ = client.write_all(b"\n").await;
@@ -546,11 +942,46 @@ mod tests {
     #[tokio::test]
     async fn send_request_to_missing_socket_reports_ipc_error() {
         let dir = temp_dir("missing");
-        let socket_path = dir.join("nonexistent.sock");
-        let err = send_request_to(&socket_path, &IpcRequest::GetStatus)
+        #[cfg(unix)]
+        let missing_ep = IpcEndpoint::UnixSocket(dir.join("nonexistent.sock"));
+        #[cfg(windows)]
+        let missing_ep = IpcEndpoint::NamedPipe(format!(
+            r"\\.\pipe\termusic-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let err = send_request_to(&missing_ep, &IpcRequest::GetStatus)
             .await
             .unwrap_err();
-        assert!(matches!(err, TermusicError::Ipc(_)));
+        assert!(matches!(err, TermusicError::Ipc(ref msg) if msg.contains("not running")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_rejects_overlong_unix_socket_path_and_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("perms");
+        let ok_ep = IpcEndpoint::UnixSocket(dir.join("ok.sock"));
+        let listener = IpcListener::bind(&ok_ep).unwrap();
+        let mode = fs::metadata(dir.join("ok.sock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+
+        let overlong = PathBuf::from("/tmp")
+            .join("a".repeat(120))
+            .join("termusic.sock");
+        let err = match IpcListener::bind(&IpcEndpoint::UnixSocket(overlong)) {
+            Ok(_) => panic!("expected overlong socket path to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, TermusicError::Ipc(ref msg) if msg.contains("sockaddr_un")));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -560,21 +991,29 @@ mod tests {
         let paths = AppPaths::from_roots(&dir, &dir);
 
         // Spawn and immediately reap a short-lived process so we get an unused dead PID.
-        let mut child = StdCommand::new("true").spawn().unwrap();
-        let dead_pid = child.id() as i32;
+        let mut child = spawn_short_lived_exit(true).unwrap();
+        let dead_pid = child.id();
         child.wait().unwrap();
 
         fs::write(&paths.pid_path, format!("{dead_pid}\n")).unwrap();
-        fs::write(&paths.socket_path, "stale").unwrap();
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            fs::write(socket_path, "stale").unwrap();
+        }
 
         assert!(!is_pid_alive(dead_pid));
         assert!(prepare_daemon_spawn(&paths).unwrap());
         assert!(!paths.pid_path.exists());
-        assert!(!paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(!socket_path.exists());
+        }
 
         // Live current process should NOT be cleaned up.
         fs::write(&paths.pid_path, format!("{}\n", std::process::id())).unwrap();
-        assert!(is_pid_alive(std::process::id() as i32));
+        assert!(is_pid_alive(std::process::id()));
         assert!(!prepare_daemon_spawn(&paths).unwrap());
         assert!(paths.pid_path.exists());
 
@@ -647,7 +1086,7 @@ mod tests {
             let winner_slot = Arc::clone(&winner_slot);
             async move {
                 // Hold `daemon.lock` synchronously before returning so it is guaranteed held when
-                // the losing `false` child exits immediately.
+                // the losing short-lived child exits immediately.
                 let lock_path = dp.daemon_lock_path();
                 let pre_lock = paths::acquire_file_lock(&lock_path, true, true)
                     .unwrap()
@@ -671,6 +1110,9 @@ mod tests {
                 });
 
                 *winner_slot.lock().await = Some(win_task);
+                #[cfg(windows)]
+                let loser = Command::new("cmd").args(["/C", "exit 1"]).spawn()?;
+                #[cfg(not(windows))]
                 let loser = Command::new("false").spawn()?;
                 Ok(Some(loser))
             }

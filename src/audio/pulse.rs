@@ -1,5 +1,6 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomPinned;
+use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null};
 
 use libloading::Library;
@@ -72,15 +73,57 @@ struct PulseApi {
     pa_strerror: Option<PaStrerrorFn>,
 }
 
+const TERMUX_FALLBACK_LIB_DIR: &str = "/data/data/com.termux/files/usr/lib";
+
+fn pulse_library_candidates(names: &[&str], prefix: Option<&Path>, include_termux_fallback: bool) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(p) = prefix.filter(|p| !p.as_os_str().is_empty()) {
+        dirs.push(p.join("lib"));
+    }
+    if include_termux_fallback {
+        let fallback = Path::new(TERMUX_FALLBACK_LIB_DIR);
+        if !dirs.iter().any(|d| d == fallback) {
+            dirs.push(fallback.to_path_buf());
+        }
+    }
+
+    let mut candidates = Vec::with_capacity(names.len() * (1 + dirs.len()));
+    for name in names {
+        candidates.push(PathBuf::from(name));
+    }
+    for dir in dirs {
+        for name in names {
+            candidates.push(dir.join(name));
+        }
+    }
+    candidates
+}
+
+fn load_pulse_library(names: &[&str]) -> std::result::Result<Library, libloading::Error> {
+    let prefix = std::env::var_os("PREFIX").map(PathBuf::from);
+    let candidates = pulse_library_candidates(names, prefix.as_deref(), cfg!(target_os = "android"));
+    let mut last_err = None;
+    for path in candidates {
+        match unsafe { Library::new(&path) } {
+            Ok(lib) => return Ok(lib),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.expect("names slice is non-empty"))
+}
+
 impl PulseApi {
     fn load() -> Result<Self> {
-        let simple_lib = unsafe { Library::new("libpulse-simple.so.0") }
-            .or_else(|_| unsafe { Library::new("libpulse-simple.so") })
-            .map_err(|err| {
-                TermusicError::Audio(format!(
-                    "failed to load libpulse-simple.so.0 (or libpulse-simple.so): {err}"
-                ))
-            })?;
+        let simple_lib = load_pulse_library(&["libpulse-simple.so.0", "libpulse-simple.so"]).map_err(|err| {
+            let hint = if cfg!(target_os = "android") {
+                " (on Termux install 'pulseaudio' and start 'pulseaudio --start --exit-idle-time=-1', or use AAudio)"
+            } else {
+                ""
+            };
+            TermusicError::Audio(format!(
+                "failed to load libpulse-simple.so.0 (or libpulse-simple.so): {err}{hint}"
+            ))
+        })?;
 
         let pa_simple_new = load_symbol::<PaSimpleNewFn>(&simple_lib, b"pa_simple_new\0")?;
         let pa_simple_write = load_symbol::<PaSimpleWriteFn>(&simple_lib, b"pa_simple_write\0")?;
@@ -92,9 +135,7 @@ impl PulseApi {
         let pa_strerror = match unsafe { simple_lib.get::<PaStrerrorFn>(b"pa_strerror\0") } {
             Ok(sym) => Some(*sym),
             Err(_) => {
-                let loaded = unsafe { Library::new("libpulse.so.0") }
-                    .or_else(|_| unsafe { Library::new("libpulse.so") })
-                    .ok();
+                let loaded = load_pulse_library(&["libpulse.so.0", "libpulse.so"]).ok();
                 let sym = loaded.as_ref().and_then(|lib| {
                     unsafe { lib.get::<PaStrerrorFn>(b"pa_strerror\0") }
                         .ok()
@@ -371,11 +412,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn loads_pulse_simple_symbols_without_opening_stream() {
         let sink = PulseSimpleSink::new().expect("libpulse-simple.so.0 should load on host");
         assert!(!sink.is_open());
         assert_eq!(sink.current_spec(), None);
         assert!(sink.api.pa_strerror.is_some());
+    }
+
+    #[test]
+    fn pulse_library_candidates_include_prefix_and_termux_fallback() {
+        let candidates = pulse_library_candidates(
+            &["libpulse-simple.so.0", "libpulse-simple.so"],
+            Some(Path::new("/data/data/com.termux/files/usr")),
+            true,
+        );
+        assert_eq!(candidates[0], PathBuf::from("libpulse-simple.so.0"));
+        assert_eq!(candidates[1], PathBuf::from("libpulse-simple.so"));
+        assert_eq!(
+            candidates[2],
+            PathBuf::from("/data/data/com.termux/files/usr/lib/libpulse-simple.so.0")
+        );
+        assert_eq!(
+            candidates[3],
+            PathBuf::from("/data/data/com.termux/files/usr/lib/libpulse-simple.so")
+        );
+        // Should not duplicate TERMUX_FALLBACK_LIB_DIR when PREFIX already points there.
+        assert_eq!(candidates.len(), 4);
+
+        let with_custom_prefix = pulse_library_candidates(
+            &["libpulse.so.0"],
+            Some(Path::new("/custom/termux/usr")),
+            true,
+        );
+        assert_eq!(
+            with_custom_prefix,
+            vec![
+                PathBuf::from("libpulse.so.0"),
+                PathBuf::from("/custom/termux/usr/lib/libpulse.so.0"),
+                PathBuf::from("/data/data/com.termux/files/usr/lib/libpulse.so.0"),
+            ]
+        );
     }
 
     #[test]
@@ -399,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn close_and_idle_controls_are_idempotent() {
         let mut sink = PulseSimpleSink::new().expect("libpulse-simple.so.0 should load on host");
         sink.flush().unwrap();

@@ -3,10 +3,13 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -16,8 +19,7 @@ use tokio::task::JoinSet;
 use crate::error::{Result, TermusicError};
 use crate::library::{AddSummary, Library};
 use crate::paths::{AppPaths, load_workspace_config, set_workspace_download_dest};
-
-const WSL_NODE_PATH: &str = "/mnt/c/Users/patri/scoop/apps/nodejs/current/node.exe";
+use crate::platform::canonicalize_clean;
 
 /// Audio output container/codec format passed to `yt-dlp --audio-format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -145,16 +147,37 @@ struct DownloadEnv {
     home_dir: Option<PathBuf>,
     path_var: Option<OsString>,
     termusic_dest: Option<String>,
-    wsl_node_path: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pathext: Option<OsString>,
+    extra_search_dirs: Vec<PathBuf>,
 }
 
 impl DownloadEnv {
     fn from_system() -> Self {
+        #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
+        let mut extra_search_dirs = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            extra_search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+            extra_search_dirs.push(PathBuf::from("/usr/local/bin"));
+        }
+        #[cfg(windows)]
+        {
+            if let Some(local_app_data) = dirs::data_local_dir() {
+                extra_search_dirs.push(local_app_data.join("Microsoft").join("WinGet").join("Links"));
+            }
+            extra_search_dirs.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+        }
+
         Self {
-            home_dir: std::env::var_os("HOME").map(PathBuf::from),
+            home_dir: std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir),
             path_var: std::env::var_os("PATH"),
             termusic_dest: std::env::var("TERMUSIC_DEST").ok(),
-            wsl_node_path: PathBuf::from(WSL_NODE_PATH),
+            pathext: std::env::var_os("PATHEXT"),
+            extra_search_dirs,
         }
     }
 }
@@ -162,6 +185,7 @@ impl DownloadEnv {
 /// Shared immutable tool/destination context plus destination finalizer lock for one download run.
 struct DownloadContext {
     yt_dlp_bin: PathBuf,
+    ffmpeg_location: Option<PathBuf>,
     dest_dir: PathBuf,
     staging_root: PathBuf,
     format: DownloadFormat,
@@ -313,7 +337,7 @@ async fn run_download_with_env_and_progress(
     let opts_cloned = opts.clone();
     let saved_cloned = saved_dest.clone();
     let env_cloned = env.clone();
-    let (dest_dir, yt_dlp_bin, js_runtime) = run_blocking(move || {
+    let (dest_dir, yt_dlp_bin, ffmpeg_bin, js_runtime) = run_blocking(move || {
         let dest_dir = resolve_destination(
             &paths_cloned,
             &opts_cloned,
@@ -321,12 +345,13 @@ async fn run_download_with_env_and_progress(
             &env_cloned,
         )?;
         let yt_dlp_bin = find_yt_dlp(&env_cloned)?;
-        let _ffmpeg = find_ffmpeg(&env_cloned)?;
+        let ffmpeg_bin = find_ffmpeg(&env_cloned)?;
         let js_runtime = detect_js_runtime(&env_cloned);
-        Ok((dest_dir, yt_dlp_bin, js_runtime))
+        Ok((dest_dir, yt_dlp_bin, ffmpeg_bin, js_runtime))
     })
     .await?;
 
+    let ffmpeg_location = ffmpeg_bin.parent().map(Path::to_path_buf);
     let embed_thumbnail = should_embed_thumbnail_with_progress(opts, env, progress_tx.as_ref()).await;
     let staging_root = dest_dir.join(".termusic-dl-tmp");
     let effective_jobs = opts.jobs.max(1);
@@ -342,6 +367,7 @@ async fn run_download_with_env_and_progress(
 
     let ctx = Arc::new(DownloadContext {
         yt_dlp_bin,
+        ffmpeg_location,
         dest_dir,
         staging_root,
         format: opts.format,
@@ -474,6 +500,7 @@ async fn download_into_stage_and_finalize(
         ctx.format,
         ctx.playlist,
         stage_dir,
+        ctx.ffmpeg_location.as_deref(),
         ctx.js_runtime.as_deref(),
         ctx.embed_thumbnail,
         url,
@@ -562,67 +589,254 @@ fn prepare_directory(dir: &Path) -> Result<PathBuf> {
         )));
     }
     fs::create_dir_all(dir)?;
-    Ok(fs::canonicalize(dir)?)
+    Ok(canonicalize_clean(dir)?)
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
+    }
 }
 
-fn find_on_path(binary: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    let paths = std::env::split_paths(path_var?);
-    for dir in paths {
+#[cfg(windows)]
+fn windows_executable_extensions(pathext: Option<&OsStr>) -> Vec<String> {
+    const FALLBACK_EXTS: &[&str] = &[".exe", ".cmd", ".bat", ".com"];
+    let mut parsed = Vec::new();
+    if let Some(raw) = pathext {
+        for part in raw.to_string_lossy().split(';') {
+            let trimmed = part.trim().to_ascii_lowercase();
+            if matches!(trimmed.as_str(), ".exe" | ".cmd" | ".bat" | ".com")
+                && !parsed.contains(&trimmed)
+            {
+                parsed.push(trimmed);
+            }
+        }
+    }
+    if parsed.is_empty() {
+        FALLBACK_EXTS.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        // Ensure `.exe` takes precedence over `.cmd`/`.bat` shims if both exist.
+        if let Some(exe_pos) = parsed.iter().position(|ext| ext == ".exe")
+            && exe_pos > 0
+        {
+            let exe = parsed.remove(exe_pos);
+            parsed.insert(0, exe);
+        }
+        parsed
+    }
+}
+
+fn find_in_dir(dir: &Path, binary: &str, pathext: Option<&OsStr>) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if Path::new(binary).extension().is_some() {
+            let candidate = dir.join(binary);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+            return None;
+        }
+        for ext in windows_executable_extensions(pathext) {
+            let candidate = dir.join(format!("{binary}{ext}"));
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pathext;
         let candidate = dir.join(binary);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+        is_executable_file(&candidate).then_some(candidate)
+    }
+}
+
+fn find_on_path_with_pathext(
+    binary: &str,
+    path_var: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var?) {
+        if let Some(found) = find_in_dir(&dir, binary, pathext) {
+            return Some(found);
         }
     }
     None
 }
 
-fn find_yt_dlp(env: &DownloadEnv) -> Result<PathBuf> {
+fn find_in_env(binary: &str, env: &DownloadEnv) -> Option<PathBuf> {
+    if let Some(found) =
+        find_on_path_with_pathext(binary, env.path_var.as_deref(), env.pathext.as_deref())
+    {
+        return Some(found);
+    }
+
+    #[cfg(windows)]
     if let Some(home) = env.home_dir.as_deref() {
-        let local_bin = home.join(".local/bin/yt-dlp");
-        if is_executable_file(&local_bin) {
-            return Ok(local_bin);
+        let scoop_shims = home.join("scoop").join("shims");
+        if let Some(found) = find_in_dir(&scoop_shims, binary, env.pathext.as_deref()) {
+            return Some(found);
         }
     }
 
-    find_on_path("yt-dlp", env.path_var.as_deref()).ok_or_else(|| {
-        TermusicError::NotFound("yt-dlp not found in ~/.local/bin or PATH".into())
+    for dir in &env.extra_search_dirs {
+        if let Some(found) = find_in_dir(dir, binary, env.pathext.as_deref()) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(any(windows, test))]
+fn append_windows_quoted_arg(out: &mut OsString, arg: &OsStr) {
+    let text = arg.to_string_lossy();
+    let needs_quotes = text.is_empty()
+        || text.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '&' | '|' | '<' | '>' | '(' | ')' | '^' | ',' | ';' | '=' | '%' | '!'
+                )
+        });
+    if !needs_quotes {
+        out.push(arg);
+        return;
+    }
+
+    out.push("\"");
+    let mut backslashes = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push("\\");
+                }
+                backslashes = 0;
+                out.push("\"");
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push("\\");
+                }
+                backslashes = 0;
+                let mut buf = [0u8; 4];
+                out.push(ch.encode_utf8(&mut buf));
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push("\\");
+    }
+    out.push("\"");
+}
+
+/// Format a `.cmd`/`.bat` invocation wrapped in outer `"..."` for `cmd.exe /D /S /C`.
+#[cfg(any(windows, test))]
+fn format_windows_cmd_batch_line(binary: &Path, args: &[OsString]) -> OsString {
+    let mut line = OsString::from("\"");
+    append_windows_quoted_arg(&mut line, binary.as_os_str());
+    for arg in args {
+        line.push(" ");
+        append_windows_quoted_arg(&mut line, arg);
+    }
+    line.push("\"");
+    line
+}
+
+fn command_for_binary(binary: &Path, args: &[OsString]) -> Command {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let is_batch = binary
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+        let mut cmd = if is_batch {
+            let mut c = Command::new("cmd");
+            c.arg("/D").arg("/S").arg("/C");
+            c.raw_arg(format_windows_cmd_batch_line(binary, args));
+            c
+        } else {
+            let mut c = Command::new(binary);
+            c.args(args);
+            c
+        };
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new(binary);
+        cmd.args(args);
+        cmd
+    }
+}
+
+fn find_yt_dlp(env: &DownloadEnv) -> Result<PathBuf> {
+    if let Some(home) = env.home_dir.as_deref() {
+        let local_bin_dir = home.join(".local").join("bin");
+        if let Some(found) = find_in_dir(&local_bin_dir, "yt-dlp", env.pathext.as_deref()) {
+            return Ok(found);
+        }
+    }
+
+    find_in_env("yt-dlp", env).ok_or_else(|| {
+        #[cfg(target_os = "android")]
+        let hint = "yt-dlp not found in ~/.local/bin or PATH (install via: pkg install yt-dlp)";
+        #[cfg(target_os = "macos")]
+        let hint = "yt-dlp not found in ~/.local/bin, PATH, or Homebrew (install via: brew install yt-dlp)";
+        #[cfg(windows)]
+        let hint = "yt-dlp not found in ~/.local/bin, PATH, or WinGet/Scoop (install via: winget install yt-dlp.yt-dlp)";
+        #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
+        let hint = "yt-dlp not found in ~/.local/bin or PATH";
+
+        TermusicError::NotFound(hint.into())
     })
 }
 
 fn find_ffmpeg(env: &DownloadEnv) -> Result<PathBuf> {
-    find_on_path("ffmpeg", env.path_var.as_deref())
-        .or_else(|| find_on_path("avconv", env.path_var.as_deref()))
+    find_in_env("ffmpeg", env)
+        .or_else(|| find_in_env("avconv", env))
         .ok_or_else(|| {
-            TermusicError::NotFound("neither ffmpeg nor avconv found in PATH".into())
+            #[cfg(target_os = "android")]
+            let hint = "neither ffmpeg nor avconv found in PATH (install via: pkg install ffmpeg)";
+            #[cfg(target_os = "macos")]
+            let hint = "neither ffmpeg nor avconv found in PATH or Homebrew (install via: brew install ffmpeg)";
+            #[cfg(windows)]
+            let hint = "neither ffmpeg nor avconv found in PATH or WinGet/Scoop (install via: winget install Gyan.FFmpeg)";
+            #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
+            let hint = "neither ffmpeg nor avconv found in PATH";
+
+            TermusicError::NotFound(hint.into())
         })
 }
 
 fn detect_js_runtime(env: &DownloadEnv) -> Option<String> {
-    if find_on_path("deno", env.path_var.as_deref()).is_some() {
-        Some("deno".into())
-    } else if find_on_path("node", env.path_var.as_deref()).is_some() {
-        Some("node".into())
-    } else if is_executable_file(&env.wsl_node_path) {
-        Some(format!("node:{}", env.wsl_node_path.display()))
+    if let Some(deno_path) = find_in_env("deno", env) {
+        Some(format!("deno:{}", deno_path.display()))
+    } else if let Some(node_path) = find_in_env("node", env) {
+        Some(format!("node:{}", node_path.display()))
     } else {
         None
     }
 }
 
 async fn has_python_mutagen(env: &DownloadEnv) -> bool {
-    let Some(python) = find_on_path("python3", env.path_var.as_deref()) else {
+    let Some(python) = find_in_env("python3", env).or_else(|| find_in_env("python", env)) else {
         return false;
     };
 
-    let mut cmd = Command::new(python);
-    cmd.args(["-c", "import mutagen"])
-        .stdin(Stdio::null())
+    let mut cmd = command_for_binary(&python, &[OsString::from("-c"), OsString::from("import mutagen")]);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -682,6 +896,7 @@ fn build_yt_dlp_args(
     format: DownloadFormat,
     playlist: bool,
     stage_dir: &Path,
+    ffmpeg_location: Option<&Path>,
     js_runtime: Option<&str>,
     embed_thumbnail: bool,
     url: &str,
@@ -710,9 +925,21 @@ fn build_yt_dlp_args(
         "--no-playlist"
     }));
 
+    if let Some(ffmpeg_dir) = ffmpeg_location {
+        args.push(OsString::from("--ffmpeg-location"));
+        args.push(ffmpeg_dir.as_os_str().to_os_string());
+    }
+
     if let Some(runtime) = js_runtime {
         args.push(OsString::from("--js-runtimes"));
         args.push(OsString::from(runtime));
+    }
+
+    #[cfg(any(windows, target_os = "android"))]
+    {
+        args.push(OsString::from("--windows-filenames"));
+        args.push(OsString::from("--trim-filenames"));
+        args.push(OsString::from("180"));
     }
 
     args.push(OsString::from("--newline"));
@@ -868,9 +1095,8 @@ async fn execute_yt_dlp(
     index: usize,
     progress_tx: Option<&mpsc::UnboundedSender<DownloadProgressEvent>>,
 ) -> Result<Vec<PathBuf>> {
-    let mut cmd = Command::new(yt_dlp_bin);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    let mut cmd = command_for_binary(yt_dlp_bin, args);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -1012,6 +1238,70 @@ fn disambiguated_candidate(dest_dir: &Path, file_name: &OsStr, attempt: usize) -
     dest_dir.join(new_name)
 }
 
+fn is_cross_device_error(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_NOT_SAME_DEVICE: i32 = 17;
+        err.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+fn is_hardlink_unsupported(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::EACCES)
+        )
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_NOT_SUPPORTED: i32 = 50;
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        matches!(
+            err.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED) | Some(ERROR_NOT_SUPPORTED) | Some(ERROR_PRIVILEGE_NOT_HELD)
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        for attempt in 0..5 {
+            match op() {
+                Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && attempt < 4 => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => return other,
+            }
+        }
+        unreachable!("loop returns on final attempt")
+    }
+    #[cfg(not(windows))]
+    {
+        op()
+    }
+}
+
 fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
     if !staged_file.exists() {
         return Err(TermusicError::Download(format!(
@@ -1021,7 +1311,7 @@ fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
     }
 
     if let Some(parent) = staged_file.parent()
-        && fs::canonicalize(parent).ok().as_deref() == Some(dest_dir)
+        && canonicalize_clean(parent).ok().as_deref() == Some(dest_dir)
     {
         return Ok(staged_file.to_path_buf());
     }
@@ -1039,33 +1329,27 @@ fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
             continue;
         }
 
-        match fs::hard_link(staged_file, &candidate) {
+        match retry_on_sharing_violation(|| fs::hard_link(staged_file, &candidate)) {
             Ok(()) => {
-                fs::remove_file(staged_file)?;
+                retry_on_sharing_violation(|| fs::remove_file(staged_file))?;
                 return Ok(candidate);
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
+            Err(err) if is_cross_device_error(&err) => {
                 copy_file_exclusively(staged_file, &candidate)?;
-                fs::remove_file(staged_file)?;
+                retry_on_sharing_violation(|| fs::remove_file(staged_file))?;
                 return Ok(candidate);
             }
-            Err(err)
-                if err.kind() == io::ErrorKind::Unsupported
-                    || matches!(
-                        err.raw_os_error(),
-                        Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::EACCES)
-                    ) =>
-            {
+            Err(err) if is_hardlink_unsupported(&err) => {
                 if fs::symlink_metadata(&candidate).is_ok() {
                     continue;
                 }
-                match fs::rename(staged_file, &candidate) {
+                match retry_on_sharing_violation(|| fs::rename(staged_file, &candidate)) {
                     Ok(()) => return Ok(candidate),
                     Err(ren_err) if ren_err.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(ren_err) if ren_err.raw_os_error() == Some(libc::EXDEV) => {
+                    Err(ren_err) if is_cross_device_error(&ren_err) => {
                         copy_file_exclusively(staged_file, &candidate)?;
-                        fs::remove_file(staged_file)?;
+                        retry_on_sharing_violation(|| fs::remove_file(staged_file))?;
                         return Ok(candidate);
                     }
                     Err(ren_err) => return Err(ren_err.into()),
@@ -1137,7 +1421,7 @@ mod tests {
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(&dir).expect("create temp dir");
-            let canonical = fs::canonicalize(&dir).expect("canonicalize temp dir");
+            let canonical = canonicalize_clean(&dir).expect("canonicalize temp dir");
             Self(canonical)
         }
 
@@ -1187,7 +1471,7 @@ mod tests {
                 Some(xdg_config.into_os_string()),
                 Some(home_dir.clone()),
                 Some(runtime.into_os_string()),
-                1000,
+                "1000",
             )
             .expect("resolve paths");
 
@@ -1205,8 +1489,20 @@ mod tests {
                 home_dir: Some(self.home_dir.clone()),
                 path_var: Some(self.bin_dir.as_os_str().to_os_string()),
                 termusic_dest: termusic_dest.map(str::to_string),
-                wsl_node_path: self.root.join("missing-wsl-node.exe"),
+                pathext: None,
+                extra_search_dirs: Vec::new(),
             }
+        }
+    }
+
+    fn mock_bin_path(dir: &Path, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            dir.join(format!("{name}.cmd"))
+        }
+        #[cfg(not(windows))]
+        {
+            dir.join(name)
         }
     }
 
@@ -1215,9 +1511,74 @@ mod tests {
             fs::create_dir_all(parent).expect("create script parent");
         }
         fs::write(path, content).expect("write script");
-        let mut perms = fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("chmod");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).expect("chmod");
+        }
+    }
+
+    fn write_noop_executable(dir: &Path, name: &str) -> PathBuf {
+        let path = mock_bin_path(dir, name);
+        #[cfg(windows)]
+        let script = "@echo off\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let script = "#!/bin/sh\nexit 0\n";
+        write_executable(&path, script);
+        path
+    }
+
+    fn write_failing_yt_dlp(dir: &Path, exit_code: i32, stderr_msg: &str) {
+        let path = mock_bin_path(dir, "yt-dlp");
+        #[cfg(windows)]
+        let script = format!("@echo off\r\n>&2 echo {stderr_msg}\r\nexit /b {exit_code}\r\n");
+        #[cfg(not(windows))]
+        let script = format!("#!/bin/sh\necho '{stderr_msg}' >&2\nexit {exit_code}\n");
+        write_executable(&path, &script);
+    }
+
+    #[allow(dead_code)]
+    fn js_escape(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    fn write_mock_yt_dlp(bin_dir: &Path, unix_body: &str, win_js_body: &str) {
+        #[cfg(unix)]
+        {
+            let _ = win_js_body;
+            let script = format!(
+                "#!/bin/sh\nset -eu\nPATH=\"/bin:/usr/bin:${{PREFIX:-/usr}}/bin:$PATH\"\nstage=\"\"\nprev=\"\"\nlast=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-P\" ]; then\n    stage=\"$a\"\n  fi\n  prev=\"$a\"\n  last=\"$a\"\ndone\n{unix_body}\n"
+            );
+            write_executable(&bin_dir.join("yt-dlp"), &script);
+        }
+        #[cfg(windows)]
+        {
+            let _ = unix_body;
+            let js_path = bin_dir.join("yt-dlp-mock.js");
+            let js_script = format!(
+                "var fso = new ActiveXObject(\"Scripting.FileSystemObject\");\n\
+                 var allArgs = [];\n\
+                 var stage = \"\";\n\
+                 var prev = \"\";\n\
+                 var last = \"\";\n\
+                 for (var i = 0; i < WScript.Arguments.Length; i++) {{\n\
+                   var a = WScript.Arguments(i);\n\
+                   allArgs.push(a);\n\
+                   if (prev === \"-P\") stage = a;\n\
+                   prev = a;\n\
+                   last = a;\n\
+                 }}\n\
+                 {win_js_body}\n"
+            );
+            fs::write(&js_path, js_script).expect("write js mock");
+            write_executable(
+                &bin_dir.join("yt-dlp.cmd"),
+                "@\"%SystemRoot%\\System32\\cscript.exe\" //Nologo //E:JScript \"%~dp0yt-dlp-mock.js\" %*\r\n",
+            );
+        }
     }
 
     fn write_synthetic_wav(path: &Path, duration_secs: f32) {
@@ -1322,7 +1683,7 @@ mod tests {
         let outcome = run_download_with_env(&ws.paths, &opts, &env)
             .await
             .expect("set_dest");
-        let canonical = fs::canonicalize(&target).expect("canonical");
+        let canonical = canonicalize_clean(&target).expect("canonical");
         assert_eq!(outcome.saved_dest.as_ref(), Some(&canonical));
         assert!(outcome.downloaded_files.is_empty());
         assert!(outcome.failed.is_empty());
@@ -1348,18 +1709,18 @@ mod tests {
         let opts = base_options(vec!["https://example.com/x"]);
         assert_eq!(
             resolve_destination(&ws.paths, &opts, None, &env_without_var).unwrap(),
-            fs::canonicalize(&config_dir).unwrap()
+            canonicalize_clean(&config_dir).unwrap()
         );
 
         // 3rd: TERMUSIC_DEST overrides configured download_dest
         assert_eq!(
             resolve_destination(&ws.paths, &opts, None, &env_with_var).unwrap(),
-            fs::canonicalize(&env_dir).unwrap()
+            canonicalize_clean(&env_dir).unwrap()
         );
 
         // 2nd: saved_dest (--set-dest) overrides TERMUSIC_DEST
         fs::create_dir_all(&set_dir).unwrap();
-        let canonical_set = fs::canonicalize(&set_dir).unwrap();
+        let canonical_set = canonicalize_clean(&set_dir).unwrap();
         assert_eq!(
             resolve_destination(&ws.paths, &opts, Some(&canonical_set), &env_with_var).unwrap(),
             canonical_set
@@ -1371,7 +1732,7 @@ mod tests {
         assert_eq!(
             resolve_destination(&ws.paths, &flag_opts, Some(&canonical_set), &env_with_var)
                 .unwrap(),
-            fs::canonicalize(&flag_dir).unwrap()
+            canonicalize_clean(&flag_dir).unwrap()
         );
 
         // Existing non-directory file is rejected
@@ -1392,39 +1753,54 @@ mod tests {
         assert_eq!(detect_js_runtime(&env), None);
 
         // PATH yt-dlp, overridden when ~/.local/bin/yt-dlp exists
-        let path_yt = ws.bin_dir.join("yt-dlp");
-        write_executable(&path_yt, "#!/bin/sh\nexit 0\n");
+        let path_yt = write_noop_executable(&ws.bin_dir, "yt-dlp");
         assert_eq!(find_yt_dlp(&env).unwrap(), path_yt);
 
-        let local_yt = ws.home_dir.join(".local/bin/yt-dlp");
-        write_executable(&local_yt, "#!/bin/sh\nexit 0\n");
+        let local_yt = write_noop_executable(&ws.home_dir.join(".local/bin"), "yt-dlp");
         assert_eq!(find_yt_dlp(&env).unwrap(), local_yt);
 
         // avconv fallback when ffmpeg absent, ffmpeg preferred when present
-        let avconv = ws.bin_dir.join("avconv");
-        write_executable(&avconv, "#!/bin/sh\nexit 0\n");
+        let avconv = write_noop_executable(&ws.bin_dir, "avconv");
         assert_eq!(find_ffmpeg(&env).unwrap(), avconv);
 
-        let ffmpeg = ws.bin_dir.join("ffmpeg");
-        write_executable(&ffmpeg, "#!/bin/sh\nexit 0\n");
+        let ffmpeg = write_noop_executable(&ws.bin_dir, "ffmpeg");
         assert_eq!(find_ffmpeg(&env).unwrap(), ffmpeg);
 
-        // JS runtime priority: WSL node < node < deno
-        let mut env_wsl = env.clone();
-        env_wsl.wsl_node_path = ws.root.join("scoop-node.exe");
-        write_executable(&env_wsl.wsl_node_path, "#!/bin/sh\nexit 0\n");
+        // extra_search_dirs fallback when binary is not on PATH
+        let fallback_dir = ws.root.join("fallback_bin");
+        let extra_node = write_noop_executable(&fallback_dir, "node");
+        let mut env_extra = env.clone();
+        env_extra.extra_search_dirs = vec![fallback_dir];
         assert_eq!(
-            detect_js_runtime(&env_wsl).as_deref(),
-            Some(format!("node:{}", env_wsl.wsl_node_path.display()).as_str())
+            detect_js_runtime(&env_extra).as_deref(),
+            Some(format!("node:{}", extra_node.display()).as_str())
         );
 
-        let node = ws.bin_dir.join("node");
-        write_executable(&node, "#!/bin/sh\nexit 0\n");
-        assert_eq!(detect_js_runtime(&env_wsl).as_deref(), Some("node"));
+        // JS runtime priority: extra_dir < PATH node < PATH deno
+        let node = write_noop_executable(&ws.bin_dir, "node");
+        assert_eq!(
+            detect_js_runtime(&env_extra).as_deref(),
+            Some(format!("node:{}", node.display()).as_str())
+        );
 
-        let deno = ws.bin_dir.join("deno");
-        write_executable(&deno, "#!/bin/sh\nexit 0\n");
-        assert_eq!(detect_js_runtime(&env_wsl).as_deref(), Some("deno"));
+        let deno = write_noop_executable(&ws.bin_dir, "deno");
+        assert_eq!(
+            detect_js_runtime(&env_extra).as_deref(),
+            Some(format!("deno:{}", deno.display()).as_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pathext_prefers_exe_over_cmd_shim() {
+        let ws = TestWorkspace::new();
+        let env = ws.env(None);
+        let cmd_path = ws.bin_dir.join("yt-dlp.cmd");
+        let exe_path = ws.bin_dir.join("yt-dlp.exe");
+        write_executable(&cmd_path, "@echo off\r\nexit /b 0\r\n");
+        assert_eq!(find_yt_dlp(&env).unwrap(), cmd_path);
+        write_executable(&exe_path, "");
+        assert_eq!(find_yt_dlp(&env).unwrap(), exe_path);
     }
 
     #[tokio::test]
@@ -1434,7 +1810,7 @@ mod tests {
         let stage = ws.root.join("stage");
         fs::create_dir_all(&stage).unwrap();
 
-        // wav and aac never embed thumbnails; ogg checks python3 mutagen
+        // wav and aac never embed thumbnails; ogg checks python3/python mutagen
         let mut wav_opts = base_options(vec!["https://example.com/1"]);
         wav_opts.format = DownloadFormat::Wav;
         assert!(!should_embed_thumbnail(&wav_opts, &env).await);
@@ -1448,14 +1824,14 @@ mod tests {
         assert!(!should_embed_thumbnail(&ogg_opts, &env).await);
 
         // Mock python3 returning success for `import mutagen`
-        let fake_py = ws.bin_dir.join("python3");
-        write_executable(&fake_py, "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "python3");
         assert!(should_embed_thumbnail(&ogg_opts, &env).await);
 
         let args = build_yt_dlp_args(
             ogg_opts.format,
             ogg_opts.playlist,
             &stage,
+            Some(&ws.bin_dir),
             Some("node"),
             false,
             "https://example.com/1",
@@ -1470,7 +1846,17 @@ mod tests {
         assert!(str_args.contains(&"--newline".to_string()));
         assert!(str_args.contains(&"--progress".to_string()));
         assert!(!str_args.contains(&"--embed-thumbnail".to_string()));
+        assert!(
+            str_args
+                .windows(2)
+                .any(|w| w == ["--ffmpeg-location", &ws.bin_dir.display().to_string()])
+        );
         assert!(str_args.windows(2).any(|w| w == ["--js-runtimes", "node"]));
+        #[cfg(any(windows, target_os = "android"))]
+        {
+            assert!(str_args.contains(&"--windows-filenames".to_string()));
+            assert!(str_args.windows(2).any(|w| w == ["--trim-filenames", "180"]));
+        }
         assert!(
             str_args
                 .windows(2)
@@ -1496,6 +1882,7 @@ mod tests {
             true,
             &stage,
             None,
+            None,
             true,
             "https://example.com/list",
         )
@@ -1504,14 +1891,8 @@ mod tests {
         .collect();
         assert!(pl_args.contains(&"--yes-playlist".to_string()));
         assert!(pl_args.contains(&"--embed-thumbnail".to_string()));
+        assert!(!pl_args.contains(&"--ffmpeg-location".to_string()));
         assert!(!pl_args.contains(&"--js-runtimes".to_string()));
-    }
-
-    fn write_mock_yt_dlp(bin_dir: &Path, body: &str) {
-        let script = format!(
-            "#!/bin/sh\nset -eu\nPATH=\"/bin:/usr/bin:$PATH\"\nstage=\"\"\nprev=\"\"\nlast=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-P\" ]; then\n    stage=\"$a\"\n  fi\n  prev=\"$a\"\n  last=\"$a\"\ndone\n{body}\n"
-        );
-        write_executable(&bin_dir.join("yt-dlp"), &script);
     }
 
     #[tokio::test]
@@ -1521,7 +1902,7 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
 
         let args_log = ws.root.join("yt-dlp-args.txt");
         write_mock_yt_dlp(
@@ -1531,10 +1912,20 @@ mod tests {
                 args_log = args_log.display(),
                 template = template_wav.display(),
             ),
+            &format!(
+                "var ts = fso.OpenTextFile(\"{args_log}\", 2, true);\n\
+                 for (var i = 0; i < allArgs.length; i++) ts.WriteLine(allArgs[i]);\n\
+                 ts.Close();\n\
+                 var out = stage + \"\\\\Synthetic Track.wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                args_log = js_escape(&args_log),
+                template = js_escape(&template_wav),
+            ),
         );
 
         let env = ws.env(None);
-        let expected_dest_track = fs::canonicalize(&dest).unwrap().join("Synthetic Track.wav");
+        let expected_dest_track = canonicalize_clean(&dest).unwrap().join("Synthetic Track.wav");
 
         // First run with auto_add = false moves staged track into dest but does not touch library.json
         let mut no_add_opts = base_options(vec!["https://example.com/track"]);
@@ -1568,7 +1959,7 @@ mod tests {
         let add_out = run_download_with_env(&ws.paths, &add_opts, &env)
             .await
             .expect("auto-add run");
-        let second_expected = fs::canonicalize(&dest)
+        let second_expected = canonicalize_clean(&dest)
             .unwrap()
             .join("Synthetic Track (2).wav");
         assert_eq!(add_out.downloaded_files, vec![second_expected.clone()]);
@@ -1592,11 +1983,8 @@ mod tests {
     async fn yt_dlp_non_zero_exit_records_failure_in_outcome() {
         let ws = TestWorkspace::new();
         let dest = ws.root.join("downloads");
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
-        write_executable(
-            &ws.bin_dir.join("yt-dlp"),
-            "#!/bin/sh\necho 'ERROR: video unavailable' >&2\nexit 2\n",
-        );
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
+        write_failing_yt_dlp(&ws.bin_dir, 2, "ERROR: video unavailable");
 
         let env = ws.env(None);
         let mut opts = base_options(vec!["https://example.com/fail"]);
@@ -1622,22 +2010,44 @@ mod tests {
         let active_dir = ws.root.join("active_workers");
         fs::create_dir_all(&active_dir).unwrap();
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
                 r#"name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
-marker="{active}/running.$$"
+marker="{active}/running.$name"
 : > "$marker"
-sleep 0.15
+sleep 0.20
 count=$(find "{active}" -maxdepth 1 -name 'running.*' | wc -l)
-printf '%s\n' "$count" >> "{active}/peaks.log"
+printf '%s\n' "$count" > "{active}/$name.peak"
 rm -f "$marker"
 out="$stage/$name.wav"
 cp "{template}" "$out"
 printf '%s\n' "$out""#,
                 active = active_dir.display(),
                 template = template_wav.display(),
+            ),
+            &format!(
+                "var slash = last.lastIndexOf(\"/\");\n\
+                 var name = slash >= 0 ? last.slice(slash + 1) : last;\n\
+                 var marker = \"{active}\\\\running.\" + name;\n\
+                 var mf = fso.CreateTextFile(marker, true);\n\
+                 mf.Close();\n\
+                 WScript.Sleep(350);\n\
+                 var folder = fso.GetFolder(\"{active}\");\n\
+                 var cnt = 0;\n\
+                 for (var e = new Enumerator(folder.Files); !e.atEnd(); e.moveNext()) {{\n\
+                   if (e.item().Name.indexOf(\"running.\") === 0) cnt++;\n\
+                 }}\n\
+                 var pf = fso.CreateTextFile(\"{active}\\\\\" + name + \".peak\", true);\n\
+                 pf.WriteLine(\"\" + cnt);\n\
+                 pf.Close();\n\
+                 fso.DeleteFile(marker, true);\n\
+                 var out = stage + \"\\\\\" + name + \".wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                active = js_escape(&active_dir),
+                template = js_escape(&template_wav),
             ),
         );
 
@@ -1665,14 +2075,20 @@ printf '%s\n' "$out""#,
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["alpha.wav", "beta.wav", "gamma.wav"]);
+        #[cfg(windows)]
+        let max_elapsed = std::time::Duration::from_millis(950);
+        #[cfg(not(windows))]
+        let max_elapsed = std::time::Duration::from_millis(520);
         assert!(
-            elapsed < std::time::Duration::from_millis(420),
-            "expected concurrent overlap faster than sequential 450ms, took {elapsed:?}"
+            elapsed < max_elapsed,
+            "expected concurrent overlap faster than sequential runs, took {elapsed:?}"
         );
-        let peaks = fs::read_to_string(active_dir.join("peaks.log")).unwrap();
-        let max_peak: usize = peaks
-            .lines()
-            .filter_map(|l| l.trim().parse::<usize>().ok())
+        let max_peak: usize = fs::read_dir(&active_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("peak"))
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .filter_map(|s| s.trim().parse::<usize>().ok())
             .max()
             .unwrap_or(0);
         assert!(max_peak >= 2, "expected overlapping workers, max_peak={max_peak}");
@@ -1685,7 +2101,7 @@ printf '%s\n' "$out""#,
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
         let mutex_dir = ws.root.join("mutex.lock");
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
@@ -1701,6 +2117,23 @@ rmdir "{mutex}"
 printf '%s\n' "$out""#,
                 mutex = mutex_dir.display(),
                 template = template_wav.display(),
+            ),
+            &format!(
+                "try {{\n\
+                   fso.CreateFolder(\"{mutex}\");\n\
+                 }} catch (e) {{\n\
+                   WScript.StdErr.WriteLine(\"ERROR: concurrent execution exceeded jobs=1\");\n\
+                   WScript.Quit(99);\n\
+                 }}\n\
+                 WScript.Sleep(40);\n\
+                 var slash = last.lastIndexOf(\"/\");\n\
+                 var name = slash >= 0 ? last.slice(slash + 1) : last;\n\
+                 var out = stage + \"\\\\\" + name + \".wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 fso.DeleteFolder(\"{mutex}\", true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                mutex = js_escape(&mutex_dir),
+                template = js_escape(&template_wav),
             ),
         );
 
@@ -1727,7 +2160,7 @@ printf '%s\n' "$out""#,
         let dest = ws.root.join("downloads");
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
@@ -1742,6 +2175,18 @@ out="$stage/$name.wav"
 cp "{template}" "$out"
 printf '%s\n' "$out""#,
                 template = template_wav.display(),
+            ),
+            &format!(
+                "if (last.indexOf(\"broken\") >= 0) {{\n\
+                   WScript.StdErr.WriteLine(\"ERROR: broken stream\");\n\
+                   WScript.Quit(3);\n\
+                 }}\n\
+                 var slash = last.lastIndexOf(\"/\");\n\
+                 var name = slash >= 0 ? last.slice(slash + 1) : last;\n\
+                 var out = stage + \"\\\\\" + name + \".wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                template = js_escape(&template_wav),
             ),
         );
 
@@ -1788,12 +2233,18 @@ printf '%s\n' "$out""#,
         let dest = ws.root.join("downloads");
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
                 "out=\"$stage/Same Title.wav\"\ncp \"{}\" \"$out\"\nprintf '%s\\n' \"$out\"",
                 template_wav.display(),
+            ),
+            &format!(
+                "var out = stage + \"\\\\Same Title.wav\";\n\
+                 fso.CopyFile(\"{}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                js_escape(&template_wav),
             ),
         );
 
@@ -1835,7 +2286,7 @@ printf '%s\n' "$out""#,
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
         let invocation_log = ws.root.join("invocations.log");
 
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
@@ -1846,6 +2297,23 @@ cp "{template}" "$out"
 printf '%s\n' "$out""#,
                 log = invocation_log.display(),
                 template = template_wav.display(),
+            ),
+            &format!(
+                "for (var attempt = 0; attempt < 20; attempt++) {{\n\
+                   try {{\n\
+                     var lf = fso.OpenTextFile(\"{log}\", 8, true);\n\
+                     lf.WriteLine(last);\n\
+                     lf.Close();\n\
+                     break;\n\
+                   }} catch (e) {{ WScript.Sleep(15); }}\n\
+                 }}\n\
+                 var slash = last.lastIndexOf(\"/\");\n\
+                 var name = slash >= 0 ? last.slice(slash + 1) : last;\n\
+                 var out = stage + \"\\\\\" + name + \".wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                log = js_escape(&invocation_log),
+                template = js_escape(&template_wav),
             ),
         );
 
@@ -1930,7 +2398,7 @@ printf '%s\n' "$out""#,
         let dest = ws.root.join("downloads");
         fs::create_dir_all(&dest).unwrap();
         let template_wav = write_wav_template(&ws.root.join("template.wav"));
-        write_executable(&ws.bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
 
         write_mock_yt_dlp(
             &ws.bin_dir,
@@ -1941,6 +2409,14 @@ out="$stage/Streamed Song.wav"
 cp "{template}" "$out"
 printf '%s\n' "$out""#,
                 template = template_wav.display(),
+            ),
+            &format!(
+                "WScript.StdOut.WriteLine(\"TERMUSIC_PROG\\tdownloading\\t500\\t1000\\tNA\\t250\\t2\\tStreamed Song\");\n\
+                 WScript.StdOut.WriteLine(\"TERMUSIC_POST\\tstarted\\tExtractAudio\\tStreamed Song\");\n\
+                 var out = stage + \"\\\\Streamed Song.wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                template = js_escape(&template_wav),
             ),
         );
 
@@ -1991,5 +2467,91 @@ printf '%s\n' "$out""#,
             }
         )));
         assert!(matches!(events.last(), Some(DownloadProgressEvent::BatchFinished)));
+    }
+
+    #[test]
+    fn move_staged_file_returns_existing_destination_file_and_classifies_errors() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("dest");
+        let canonical_dest = prepare_directory(&dest).unwrap();
+        let staged_in_dest = canonical_dest.join("AlreadyThere.wav");
+        fs::write(&staged_in_dest, b"audio").unwrap();
+
+        let moved = move_staged_file(&staged_in_dest, &canonical_dest).unwrap();
+        assert_eq!(moved, staged_in_dest);
+
+        assert!(is_hardlink_unsupported(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        #[cfg(unix)]
+        assert!(is_cross_device_error(&io::Error::from_raw_os_error(libc::EXDEV)));
+        #[cfg(windows)]
+        assert!(is_cross_device_error(&io::Error::from_raw_os_error(17)));
+    }
+
+    #[test]
+    fn windows_cmd_batch_quoting_preserves_spaces_tabs_and_outer_quotes() {
+        let bin = Path::new(r"C:\Program Files\yt-dlp\yt-dlp.cmd");
+        let args = vec![
+            OsString::from("--progress-template"),
+            OsString::from(PROGRESS_TEMPLATE_DOWNLOAD),
+            OsString::from("-P"),
+            OsString::from(r"C:\Users\Alice Smith\Music\"),
+            OsString::from("--newline"),
+            OsString::from("https://example.com/?a=1&b=2"),
+        ];
+        let cmdline = format_windows_cmd_batch_line(bin, &args);
+        let rendered = cmdline.to_string_lossy();
+        assert!(rendered.starts_with('"') && rendered.ends_with('"'));
+        assert!(rendered.contains(r#""C:\Program Files\yt-dlp\yt-dlp.cmd""#));
+        assert!(rendered.contains(&format!("\"{PROGRESS_TEMPLATE_DOWNLOAD}\"")));
+        assert!(rendered.contains(r#""C:\Users\Alice Smith\Music\\""#));
+        assert!(rendered.contains(" --newline "));
+        assert!(rendered.contains(r#""https://example.com/?a=1&b=2""#));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cmd_shim_in_spaced_dir_receives_tabbed_progress_template() {
+        let ws = TestWorkspace::new();
+        let spaced_bin = ws.root.join("dir with spaces");
+        let spaced_stage = ws.root.join("stage with spaces");
+        fs::create_dir_all(&spaced_bin).unwrap();
+        fs::create_dir_all(&spaced_stage).unwrap();
+
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        let args_log = ws.root.join("spaced_args.log");
+        write_mock_yt_dlp(
+            &spaced_bin,
+            "",
+            &format!(
+                "var ts = fso.OpenTextFile(\"{args_log}\", 2, true);\n\
+                 for (var i = 0; i < allArgs.length; i++) ts.WriteLine(allArgs[i]);\n\
+                 ts.Close();\n\
+                 var out = stage + \"\\\\Spaced Track.wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                args_log = js_escape(&args_log),
+                template = js_escape(&template_wav),
+            ),
+        );
+
+        let args = build_yt_dlp_args(
+            DownloadFormat::Wav,
+            false,
+            &spaced_stage,
+            None,
+            None,
+            false,
+            "https://example.com/track",
+        );
+        let shim = spaced_bin.join("yt-dlp.cmd");
+        let outputs = execute_yt_dlp(&shim, &args, &spaced_stage, &ws.env(None), 0, None)
+            .await
+            .expect("spaced .cmd shim succeeds");
+        assert_eq!(outputs.len(), 1);
+        let logged = fs::read_to_string(&args_log).unwrap();
+        assert!(logged.lines().any(|l| l == PROGRESS_TEMPLATE_DOWNLOAD));
+        assert!(logged.lines().any(|l| l == spaced_stage.to_string_lossy()));
     }
 }

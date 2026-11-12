@@ -4,16 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::BufReader;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
-use crate::audio::AudioSink;
-use crate::audio::pulse::PulseSimpleSink;
+use crate::audio::{self, AudioSink};
 use crate::error::{Result, TermusicError};
-use crate::ipc::{self, IpcRequest, IpcResponse};
-use crate::paths::{self, AppPaths};
+use crate::ipc::{self, IpcListener, IpcRequest, IpcResponse, IpcStream};
+use crate::paths::{self, AppPaths, IpcEndpoint};
+use crate::platform::ShutdownSignals;
 use crate::player::{self, EngineCommand, EngineHandle};
 
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,55 +19,34 @@ const CLIENT_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct CleanupGuard {
-    socket_path: PathBuf,
+    ipc_endpoint: IpcEndpoint,
     pid_path: PathBuf,
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.socket_path);
+        match &self.ipc_endpoint {
+            #[cfg(unix)]
+            IpcEndpoint::UnixSocket(socket_path) => {
+                let _ = fs::remove_file(socket_path);
+            }
+            #[cfg(windows)]
+            IpcEndpoint::NamedPipe(_) => {}
+        }
         let _ = fs::remove_file(&self.pid_path);
     }
 }
 
-struct ProcessSignals {
-    sigint: Signal,
-    sigterm: Signal,
-}
-
-impl ProcessSignals {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            sigint: signal(SignalKind::interrupt())?,
-            sigterm: signal(SignalKind::terminate())?,
-        })
-    }
-
-    async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.sigint.recv() => {}
-            _ = self.sigterm.recv() => {}
-        }
-    }
-}
-
-/// Start the background playback daemon using PulseAudio (`PulseSimpleSink`) and Tokio Unix
-/// signal handlers (`SIGINT` / `SIGTERM`).
+/// Start the background playback daemon using the default OS audio backend and cross-platform
+/// shutdown signal handlers.
 pub async fn run_daemon(paths: &AppPaths) -> Result<()> {
-    run_daemon_impl(
-        paths,
-        || Ok(Box::new(PulseSimpleSink::new()?)),
-        None,
-        None,
-        true,
-    )
-    .await
+    run_daemon_impl(paths, audio::default_sink, None, None, true).await
 }
 
 /// Start the daemon IPC server and audio engine using a caller-supplied [`AudioSink`].
 ///
 /// If `ready_tx` is provided, signals `()` once `daemon.lock` is held, the PID file is written,
-/// and the `UnixListener` is bound and ready to accept connections. Optional `shutdown_rx` lets
+/// and the `IpcListener` is bound and ready to accept connections. Optional `shutdown_rx` lets
 /// callers trigger graceful shutdown without modifying process-wide signal handlers.
 pub async fn run_daemon_with_sink(
     paths: &AppPaths,
@@ -91,7 +68,7 @@ where
     F: FnOnce() -> Result<Box<dyn AudioSink>> + Send + 'static,
 {
     let mut proc_signals = if watch_process_signals {
-        Some(ProcessSignals::new()?)
+        Some(ShutdownSignals::new()?)
     } else {
         None
     };
@@ -119,15 +96,15 @@ where
     .await
     .map_err(|err| TermusicError::Async(format!("daemon startup task failed: {err}")))??;
 
-    let listener = match UnixListener::bind(&paths.socket_path) {
+    let listener = match IpcListener::bind(&paths.ipc_endpoint) {
         Ok(listener) => listener,
         Err(err) => {
             let _ = fs::remove_file(&paths.pid_path);
-            return Err(err.into());
+            return Err(err);
         }
     };
     let _cleanup = CleanupGuard {
-        socket_path: paths.socket_path.clone(),
+        ipc_endpoint: paths.ipc_endpoint.clone(),
         pid_path: paths.pid_path.clone(),
     };
 
@@ -180,7 +157,11 @@ where
 }
 
 fn prepare_daemon_files(paths: &AppPaths) -> Result<()> {
-    remove_if_exists(&paths.socket_path)?;
+    #[cfg(unix)]
+    {
+        let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+        remove_if_exists(socket_path)?;
+    }
     remove_if_exists(&paths.pid_path)?;
     Ok(())
 }
@@ -212,20 +193,22 @@ async fn wait_optional_watch_true(rx: &mut Option<watch::Receiver<bool>>) {
     }
 }
 
-async fn wait_optional_signals(signals: &mut Option<ProcessSignals>) {
+async fn wait_optional_signals(signals: &mut Option<ShutdownSignals>) {
     match signals {
-        Some(s) => s.recv().await,
+        Some(s) => {
+            let _ = s.recv().await;
+        }
         None => std::future::pending::<()>().await,
     }
 }
 
 async fn run_accept_loop(
-    listener: UnixListener,
+    mut listener: IpcListener,
     engine: &EngineHandle,
     shutdown_tx: &watch::Sender<bool>,
     mut local_shutdown_rx: watch::Receiver<bool>,
     mut ext_shutdown_rx: Option<watch::Receiver<bool>>,
-    proc_signals: &mut Option<ProcessSignals>,
+    proc_signals: &mut Option<ShutdownSignals>,
     client_tasks: &mut JoinSet<()>,
 ) -> Result<()> {
     loop {
@@ -244,7 +227,7 @@ async fn run_accept_loop(
             }
             accept_res = listener.accept() => {
                 match accept_res {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let engine_clone = engine.clone();
                         let shutdown_tx_clone = shutdown_tx.clone();
                         client_tasks.spawn(async move {
@@ -289,7 +272,7 @@ async fn drain_client_tasks(client_tasks: &mut JoinSet<()>) {
 }
 
 async fn handle_client(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     engine: EngineHandle,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<()> {
@@ -394,14 +377,24 @@ fn map_ipc_to_engine_command(req: IpcRequest) -> EngineCommand {
 }
 
 fn is_client_disconnect(err: &TermusicError) -> bool {
-    matches!(
-        err,
-        TermusicError::Io(io_err)
+    match err {
+        TermusicError::Io(io_err) => {
             if matches!(
                 io_err.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            )
-    )
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            ) {
+                return true;
+            }
+            #[cfg(windows)]
+            if io_err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NO_DATA as i32) {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -417,12 +410,28 @@ mod tests {
     use crate::library::Song;
 
     fn temp_workspace(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "termusic-daemon-test-{label}-{}",
-            uuid::Uuid::new_v4()
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::temp_dir();
+
+        let dir = base.join(format!(
+            "tm-dmn-{label}-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn spawn_short_lived_true() -> io::Result<std::process::Child> {
+        #[cfg(windows)]
+        {
+            Command::new("cmd").args(["/C", "exit 0"]).spawn()
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("true").spawn()
+        }
     }
 
     fn write_wav(path: &Path, sample_rate: u32, duration_secs: f64) {
@@ -496,7 +505,11 @@ mod tests {
             .expect("daemon should signal readiness")
             .unwrap();
 
-        assert!(paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(socket_path.exists());
+        }
         assert!(paths.pid_path.exists());
         let recorded_pid: u32 = fs::read_to_string(&paths.pid_path)
             .unwrap()
@@ -586,7 +599,11 @@ mod tests {
         assert_eq!(bye.state, PlaybackState::Stopped);
 
         daemon_task.await.unwrap().unwrap();
-        assert!(!paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(!socket_path.exists());
+        }
         assert!(!paths.pid_path.exists());
         assert!(!stats.is_open());
         assert!(stats.flush_count() >= 1);
@@ -626,8 +643,12 @@ mod tests {
             "unexpected duplicate daemon error: {dup_err:?}"
         );
 
-        // First daemon's socket and PID remain intact and functional.
-        assert!(paths.socket_path.exists());
+        // First daemon's endpoint and PID remain intact and functional.
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(socket_path.exists());
+        }
         assert!(paths.pid_path.exists());
         let status = ipc::send_request(&paths, &IpcRequest::GetStatus)
             .await
@@ -638,7 +659,11 @@ mod tests {
             .await
             .unwrap();
         t1.await.unwrap().unwrap();
-        assert!(!paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(!socket_path.exists());
+        }
         assert!(!paths.pid_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -650,13 +675,17 @@ mod tests {
         let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
         paths.ensure_dirs().unwrap();
 
-        let mut child = Command::new("true").spawn().unwrap();
-        let dead_pid = child.id() as i32;
+        let mut child = spawn_short_lived_true().unwrap();
+        let dead_pid = child.id();
         child.wait().unwrap();
         assert!(!ipc::is_pid_alive(dead_pid));
 
         fs::write(&paths.pid_path, format!("{dead_pid}\n")).unwrap();
-        fs::write(&paths.socket_path, "stale-socket").unwrap();
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            fs::write(socket_path, "stale-socket").unwrap();
+        }
 
         let (ready_tx, ready_rx) = oneshot::channel();
         let p = paths.clone();
@@ -677,7 +706,11 @@ mod tests {
             .await
             .unwrap();
         daemon_task.await.unwrap().unwrap();
-        assert!(!paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(!socket_path.exists());
+        }
         assert!(!paths.pid_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -710,7 +743,7 @@ mod tests {
         .unwrap();
 
         // Connect a stalled peer that sends an incomplete JSON line without `\n`.
-        let mut stalled = UnixStream::connect(&paths.socket_path).await.unwrap();
+        let mut stalled = IpcStream::connect(&paths.ipc_endpoint).await.unwrap();
         stalled.write_all(b"{\"Get").await.unwrap();
 
         // Concurrent GetStatus requests must complete quickly rather than stalling on peer 1.
@@ -757,11 +790,20 @@ mod tests {
         });
 
         ready_rx.await.unwrap();
-        assert!(paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(socket_path.exists());
+        }
+        assert!(paths.pid_path.exists());
 
         shutdown_tx.send(true).unwrap();
         daemon_task.await.unwrap().unwrap();
-        assert!(!paths.socket_path.exists());
+        #[cfg(unix)]
+        {
+            let IpcEndpoint::UnixSocket(socket_path) = &paths.ipc_endpoint;
+            assert!(!socket_path.exists());
+        }
         assert!(!paths.pid_path.exists());
 
         let _ = fs::remove_dir_all(&dir);

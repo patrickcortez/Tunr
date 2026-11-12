@@ -1,10 +1,7 @@
-use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -13,7 +10,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph,
 };
-use tokio::signal::unix::{SignalKind, signal as unix_signal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -22,16 +18,26 @@ use crate::download::{
 };
 use crate::error::{Result, TermusicError};
 use crate::paths::AppPaths;
+use crate::platform::ShutdownSignals;
+use crate::tui_common::{TerminalSession, truncate_to_width, use_ascii_glyphs};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(80);
 
-struct DownloadTerminalGuard;
+fn active_spinner(idx: usize, ascii: bool) -> &'static str {
+    if ascii {
+        ASCII_SPINNER_FRAMES[idx % ASCII_SPINNER_FRAMES.len()]
+    } else {
+        SPINNER_FRAMES[idx % SPINNER_FRAMES.len()]
+    }
+}
 
-impl Drop for DownloadTerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(stdout(), Show);
-        ratatui::restore();
+fn border_type(ascii: bool) -> BorderType {
+    if ascii {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
     }
 }
 
@@ -261,6 +267,10 @@ impl DownloadTuiState {
 
     /// Render the loading interface into `frame`.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.render_with_ascii(frame, use_ascii_glyphs());
+    }
+
+    fn render_with_ascii(&mut self, frame: &mut Frame, ascii: bool) {
         let area = frame.area();
         let [header_area, overall_area, list_area, footer_area] = Layout::vertical([
             Constraint::Length(3),
@@ -270,17 +280,17 @@ impl DownloadTuiState {
         ])
         .areas(area);
 
-        self.render_header(frame, header_area);
-        self.render_overall(frame, overall_area);
-        self.render_items(frame, list_area);
-        self.render_footer(frame, footer_area);
+        self.render_header(frame, header_area, ascii);
+        self.render_overall(frame, overall_area, ascii);
+        self.render_items(frame, list_area, ascii);
+        self.render_footer(frame, footer_area, ascii);
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
+    fn render_header(&self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
-        let spinner = SPINNER_FRAMES[self.spinner_idx % SPINNER_FRAMES.len()];
+        let spinner = active_spinner(self.spinner_idx, ascii);
         let (done, active, _queued, failed) = self.summary_counts();
         let (state_label, state_style) = if self.finished {
             if failed > 0 {
@@ -311,32 +321,43 @@ impl DownloadTuiState {
             )
         };
 
-        let line = Line::from(vec![
-            Span::styled(
-                concat!(" Termusic Downloader v", env!("CARGO_PKG_VERSION")),
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
-            Span::styled(state_label, state_style),
-            Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                format!("Format: {}  Jobs: {}", self.format, self.jobs),
-                Style::new().fg(Color::Magenta),
-            ),
-            Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                format!("Elapsed {}", format_duration(self.elapsed().as_secs())),
-                Style::new().fg(Color::Gray),
-            ),
-        ]);
+        let elapsed = format!("Elapsed {}", format_duration(self.elapsed().as_secs()));
+        let line = if area.width < 80 {
+            Line::from(vec![
+                Span::styled(
+                    " Termusic Downloader",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+                Span::styled(state_label, state_style),
+                Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+                Span::styled(elapsed, Style::new().fg(Color::Gray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    concat!(" Termusic Downloader v", env!("CARGO_PKG_VERSION")),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
+                Span::styled(state_label, state_style),
+                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("Format: {}  Jobs: {}", self.format, self.jobs),
+                    Style::new().fg(Color::Magenta),
+                ),
+                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
+                Span::styled(elapsed, Style::new().fg(Color::Gray)),
+            ])
+        };
 
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::DarkGray));
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
 
-    fn render_overall(&self, frame: &mut Frame, area: Rect) {
+    fn render_overall(&self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
@@ -344,14 +365,20 @@ impl DownloadTuiState {
         let pct = (ratio * 100.0).round() as u16;
         let total = self.items.len();
         let (done, active, queued, failed) = self.summary_counts();
+        let sep = if ascii { " | " } else { " · " };
+        let title = if area.width < 68 {
+            format!(" Progress ({done}/{total} done, {active} active, {failed} failed) ")
+        } else {
+            format!(
+                " Batch Progress ({done}/{total} done{sep}{active} active{sep}{queued} queued{sep}{failed} failed) "
+            )
+        };
 
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::Cyan))
             .title(Span::styled(
-                format!(
-                    " Batch Progress ({done}/{total} done · {active} active · {queued} queued · {failed} failed) "
-                ),
+                title,
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
@@ -368,13 +395,13 @@ impl DownloadTuiState {
         frame.render_widget(gauge, inner);
     }
 
-    fn render_items(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_items(&mut self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
         let total = self.items.len();
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::DarkGray))
             .title(Span::styled(
                 format!(" Downloads ({total}) "),
@@ -382,7 +409,7 @@ impl DownloadTuiState {
             ));
 
         let inner_width = area.width.saturating_sub(4) as usize;
-        let spinner = SPINNER_FRAMES[self.spinner_idx % SPINNER_FRAMES.len()];
+        let spinner = active_spinner(self.spinner_idx, ascii);
 
         let list_items: Vec<ListItem> = self
             .items
@@ -390,24 +417,27 @@ impl DownloadTuiState {
             .enumerate()
             .map(|(idx, item)| {
                 let (icon, icon_color) = match &item.phase {
-                    DownloadPhase::Queued => ("·", Color::DarkGray),
+                    DownloadPhase::Queued => (if ascii { "-" } else { "·" }, Color::DarkGray),
                     DownloadPhase::Starting
                     | DownloadPhase::Downloading { .. }
                     | DownloadPhase::PostProcessing { .. }
                     | DownloadPhase::Finalizing => (spinner, Color::Cyan),
-                    DownloadPhase::Completed { .. } => ("✓", Color::Green),
-                    DownloadPhase::Failed { .. } => ("✗", Color::Red),
+                    DownloadPhase::Completed { .. } => {
+                        (if ascii { "+" } else { "✓" }, Color::Green)
+                    }
+                    DownloadPhase::Failed { .. } => (if ascii { "x" } else { "✗" }, Color::Red),
                 };
 
-                let status_detail = format_item_detail(item);
-                let bar = format_mini_bar(item.fraction(), 10);
+                let status_detail = format_item_detail(item, ascii);
+                let bar = format_mini_bar(item.fraction(), 10, ascii);
                 let prefix = format!("[{}/{}] {icon} ", idx + 1, total);
+                let prefix_width = Span::raw(&prefix).width();
                 let label = item.display_label();
 
                 let header_line = Line::from(vec![
                     Span::styled(prefix, Style::new().fg(icon_color).add_modifier(Modifier::BOLD)),
                     Span::styled(
-                        fit_text(label, inner_width.saturating_sub(10)),
+                        truncate_to_width(label, inner_width.saturating_sub(prefix_width)),
                         Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
                     ),
                 ]);
@@ -417,7 +447,7 @@ impl DownloadTuiState {
                     Span::styled(bar, Style::new().fg(icon_color)),
                     Span::raw(" "),
                     Span::styled(
-                        fit_text(&status_detail, inner_width.saturating_sub(19)),
+                        truncate_to_width(&status_detail, inner_width.saturating_sub(19)),
                         Style::new().fg(if item.is_failed() {
                             Color::Red
                         } else if item.is_done() {
@@ -444,17 +474,17 @@ impl DownloadTuiState {
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
-        let dest_text = self
+        let dest_raw = self
             .dest_dir
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "resolving...".to_string());
         let mut block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(border_type(ascii))
             .border_style(Style::new().fg(Color::DarkGray));
 
         if let Some(notice) = &self.notice {
@@ -467,20 +497,31 @@ impl DownloadTuiState {
             );
         }
 
+        let help_text = if ascii {
+            "Up/Down: Scroll   q / Esc / Ctrl+C: Cancel"
+        } else {
+            "↑/↓: Scroll   q / Esc / Ctrl+C: Cancel"
+        };
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let help_width = Span::raw(help_text).width();
+        let dest_budget = inner_width.saturating_sub(help_width + 14);
+        let dest_text = if dest_budget >= 8 {
+            truncate_to_width(&dest_raw, dest_budget)
+        } else {
+            dest_raw
+        };
+
         let line = Line::from(vec![
             Span::styled(" Dest: ", Style::new().fg(Color::Cyan)),
             Span::styled(dest_text, Style::new().fg(Color::White)),
             Span::styled("   |   ", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                "↑/↓: Scroll   q / Esc / Ctrl+C: Cancel",
-                Style::new().fg(Color::Gray),
-            ),
+            Span::styled(help_text, Style::new().fg(Color::Gray)),
         ]);
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
 }
 
-fn format_item_detail(item: &DownloadItemState) -> String {
+fn format_item_detail(item: &DownloadItemState, ascii: bool) -> String {
     match &item.phase {
         DownloadPhase::Queued => "Queued".to_string(),
         DownloadPhase::Starting => "Fetching media metadata...".to_string(),
@@ -509,7 +550,7 @@ fn format_item_detail(item: &DownloadItemState) -> String {
             if let Some(eta) = eta_secs {
                 parts.push(format!("ETA {}", format_duration(*eta)));
             }
-            parts.join(" · ")
+            parts.join(if ascii { " | " } else { " · " })
         }
         DownloadPhase::PostProcessing { stage } => format!("{stage}..."),
         DownloadPhase::Finalizing => "Moving to destination...".to_string(),
@@ -521,11 +562,12 @@ fn format_item_detail(item: &DownloadItemState) -> String {
     }
 }
 
-fn format_mini_bar(fraction: f64, width: usize) -> String {
+fn format_mini_bar(fraction: f64, width: usize, ascii: bool) -> String {
     let clamped = fraction.clamp(0.0, 1.0);
     let filled = ((clamped * width as f64).round() as usize).min(width);
     let empty = width - filled;
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+    let (fill_ch, empty_ch) = if ascii { ("#", "-") } else { ("█", "░") };
+    format!("[{}{}]", fill_ch.repeat(filled), empty_ch.repeat(empty))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -556,24 +598,12 @@ fn format_duration(total_secs: u64) -> String {
     }
 }
 
-fn fit_text(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 3 {
-        return text.chars().take(max_chars).collect();
-    }
-    let mut out: String = text.chars().take(max_chars - 3).collect();
-    out.push_str("...");
-    out
-}
-
 fn is_cancel_key(key: &KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
         return true;
@@ -589,19 +619,10 @@ pub async fn run_download_tui(
 ) -> Result<DownloadOutcome> {
     let mut state = DownloadTuiState::from_options(opts);
 
-    let mut terminal = match ratatui::try_init() {
-        Ok(term) => term,
-        Err(err) => {
-            ratatui::restore();
-            return Err(err.into());
-        }
-    };
-    let _guard = DownloadTerminalGuard;
+    let mut session = TerminalSession::enter()?;
+    let mut signals = ShutdownSignals::new()?;
 
-    let mut sigint = unix_signal(SignalKind::interrupt())?;
-    let mut sigterm = unix_signal(SignalKind::terminate())?;
-
-    // Instantiate EventStream after DownloadTerminalGuard so EventStream drops before raw mode restores.
+    // Instantiate EventStream after TerminalSession so EventStream drops before raw mode restores.
     let mut events = EventStream::new();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -615,7 +636,9 @@ pub async fn run_download_tui(
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        terminal.draw(|frame| state.render(frame))?;
+        session
+            .terminal_mut()
+            .draw(|frame| state.render(frame))?;
 
         tokio::select! {
             res = &mut download_task => {
@@ -635,7 +658,9 @@ pub async fn run_download_tui(
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Some(Ok(Event::Key(key)))
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         if is_cancel_key(&key) {
                             download_task.abort();
                             let _ = download_task.await;
@@ -643,10 +668,12 @@ pub async fn run_download_tui(
                                 "download cancelled by user".to_string(),
                             ));
                         }
-                        match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => state.move_up(),
-                            KeyCode::Down | KeyCode::Char('j') => state.move_down(),
-                            _ => {}
+                        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => state.move_up(),
+                                KeyCode::Down | KeyCode::Char('j') => state.move_down(),
+                                _ => {}
+                            }
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) | Some(Ok(_)) => {}
@@ -658,19 +685,12 @@ pub async fn run_download_tui(
                     None => {}
                 }
             }
-            _ = sigint.recv() => {
+            sig = signals.recv() => {
                 download_task.abort();
                 let _ = download_task.await;
-                return Err(TermusicError::Download(
-                    "download interrupted (SIGINT)".to_string(),
-                ));
-            }
-            _ = sigterm.recv() => {
-                download_task.abort();
-                let _ = download_task.await;
-                return Err(TermusicError::Download(
-                    "download terminated (SIGTERM)".to_string(),
-                ));
+                return Err(TermusicError::Download(format!(
+                    "download interrupted ({sig})"
+                )));
             }
         }
     }
@@ -872,5 +892,60 @@ mod tests {
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
         assert_eq!(format_duration(65), "01:05");
         assert_eq!(format_duration(3665), "01:01:05");
+    }
+
+    #[test]
+    fn cancel_key_requires_press_and_ignores_altgr_ctrl_alt_c() {
+        assert!(is_cancel_key(&KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert!(is_cancel_key(&KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert!(!is_cancel_key(&KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
+        assert!(!is_cancel_key(&KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyEventKind::Press,
+        )));
+    }
+
+    #[test]
+    fn narrow_terminal_and_ascii_mode_render_cleanly() {
+        let mut state = DownloadTuiState::new(
+            vec!["https://example.com/1".to_string()],
+            DownloadFormat::Mp3,
+            2,
+        );
+        state.elapsed_override = Some(Duration::from_secs(12));
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 0,
+            title: Some("日本語タイトルのとても長い楽曲名".to_string()),
+            phase: DownloadPhase::Completed {
+                files: vec![PathBuf::from("/music/song.mp3")],
+            },
+        });
+        state.finished = true;
+
+        let backend = TestBackend::new(46, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| state.render_with_ascii(frame, true))
+            .unwrap();
+        let rendered = buffer_text(&terminal);
+
+        assert!(rendered.contains("Termusic Downloader"));
+        assert!(rendered.contains("Progress (1/1 done"));
+        assert!(rendered.contains("[##########]"));
+        assert!(!rendered.contains('╭'), "unexpected rounded border:\n{rendered}");
+        assert!(!rendered.contains('✓'), "unexpected unicode check:\n{rendered}");
     }
 }
