@@ -17,6 +17,13 @@ pub enum ListKind {
     Playlists,
 }
 
+/// Target query for `termusic play`: either a text name/number or an explicit 1-based list index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayQuery {
+    Text(String),
+    Index(usize),
+}
+
 /// Optional path overrides accepted by the hidden `__daemon` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
 pub struct DaemonOverrides {
@@ -94,7 +101,7 @@ pub enum RawCommand {
 
     /// Play a song or playlist, or resume paused playback when omitted
     Play {
-        /// Song title or playlist name (omit to resume currently paused playback)
+        /// Song title, playlist name, or 1-based list index (omit to resume currently paused playback)
         target: Option<String>,
         /// Playback ordering mode
         #[arg(value_enum, ignore_case = true)]
@@ -108,6 +115,16 @@ pub enum RawCommand {
         /// Disambiguate song target by artist name
         #[arg(long = "artist", value_name = "ARTIST", conflicts_with = "playlist")]
         artist: Option<String>,
+        /// Play the 1-based index from `termusic list` (disambiguates numeric titles)
+        #[arg(
+            short = 'i',
+            long = "index",
+            value_name = "INDEX",
+            allow_negative_numbers = true,
+            value_parser = parse_one_based_index,
+            conflicts_with = "artist"
+        )]
+        index: Option<usize>,
     },
 
     /// Add an audio file or folder of audio files to the library
@@ -314,7 +331,7 @@ pub enum Command {
     Tui,
     Version,
     Play {
-        target: String,
+        query: PlayQuery,
         mode: PlayMode,
         kind: TargetKind,
         artist: Option<String>,
@@ -352,6 +369,18 @@ pub enum Command {
     Search(SearchOptions),
     DaemonStop,
     Daemon(DaemonOverrides),
+}
+
+fn parse_one_based_index(raw: &str) -> std::result::Result<usize, String> {
+    let val: usize = raw
+        .parse()
+        .map_err(|_| format!("index must be a positive integer (>= 1), got '{raw}'"))?;
+    if val == 0 {
+        return Err(format!(
+            "index must be a positive integer (>= 1), got '{raw}'"
+        ));
+    }
+    Ok(val)
 }
 
 fn parse_non_negative_secs(raw: &str) -> std::result::Result<f64, String> {
@@ -437,46 +466,80 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         RawCommand::Version => Ok(Command::Version),
         RawCommand::Play {
             target,
-            mode,
+            mut mode,
             song,
             playlist,
             artist,
-        } => match target {
-            None => {
-                if song || playlist || mode.is_some() || artist.is_some() {
+            index,
+        } => {
+            if let Some(idx) = index {
+                if artist.is_some() {
                     return Err(TermusicError::InvalidArg(
-                        "play requires a song or playlist name when flags or play mode are specified"
-                            .to_string(),
+                        "--artist cannot be used with --index".to_string(),
                     ));
                 }
-                Ok(Command::Resume)
-            }
-            Some(target) => {
-                if target.trim().is_empty() {
-                    return Err(TermusicError::InvalidArg(
-                        "play target cannot be empty".to_string(),
-                    ));
-                }
-                let clean_artist = match artist {
-                    Some(raw) => {
-                        let trimmed = raw.trim();
-                        if trimmed.is_empty() {
-                            return Err(TermusicError::InvalidArg(
-                                "--artist cannot be empty".to_string(),
-                            ));
+                if let Some(t) = target {
+                    if mode.is_none() {
+                        match PlayMode::from_str(&t, true) {
+                            Ok(parsed_mode) => mode = Some(parsed_mode),
+                            Err(_) => {
+                                return Err(TermusicError::InvalidArg(
+                                    "cannot specify both `--index` and a positional target"
+                                        .to_string(),
+                                ));
+                            }
                         }
-                        Some(trimmed.to_string())
+                    } else {
+                        return Err(TermusicError::InvalidArg(
+                            "cannot specify both `--index` and a positional target".to_string(),
+                        ));
                     }
-                    None => None,
-                };
-                Ok(Command::Play {
-                    target,
+                }
+                return Ok(Command::Play {
+                    query: PlayQuery::Index(idx),
                     mode: mode.unwrap_or_default(),
                     kind: resolve_target_kind(song, playlist)?,
-                    artist: clean_artist,
-                })
+                    artist: None,
+                });
             }
-        },
+
+            match target {
+                None => {
+                    if song || playlist || mode.is_some() || artist.is_some() {
+                        return Err(TermusicError::InvalidArg(
+                            "play requires a song or playlist name when flags or play mode are specified"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(Command::Resume)
+                }
+                Some(target) => {
+                    if target.trim().is_empty() {
+                        return Err(TermusicError::InvalidArg(
+                            "play target cannot be empty".to_string(),
+                        ));
+                    }
+                    let clean_artist = match artist {
+                        Some(raw) => {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                return Err(TermusicError::InvalidArg(
+                                    "--artist cannot be empty".to_string(),
+                                ));
+                            }
+                            Some(trimmed.to_string())
+                        }
+                        None => None,
+                    };
+                    Ok(Command::Play {
+                        query: PlayQuery::Text(target),
+                        mode: mode.unwrap_or_default(),
+                        kind: resolve_target_kind(song, playlist)?,
+                        artist: clean_artist,
+                    })
+                }
+            }
+        }
         RawCommand::Add {
             folder,
             playlist,
@@ -808,7 +871,7 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "play", "My Song"]).unwrap(),
             Command::Play {
-                target: "My Song".to_string(),
+                query: PlayQuery::Text("My Song".to_string()),
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: None,
@@ -817,7 +880,7 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "play", "Chill Mix", "shuffle"]).unwrap(),
             Command::Play {
-                target: "Chill Mix".to_string(),
+                query: PlayQuery::Text("Chill Mix".to_string()),
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Auto,
                 artist: None,
@@ -826,7 +889,7 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "play", "Chill Mix", "NEXT", "--playlist"]).unwrap(),
             Command::Play {
-                target: "Chill Mix".to_string(),
+                query: PlayQuery::Text("Chill Mix".to_string()),
                 mode: PlayMode::Next,
                 kind: TargetKind::Playlist,
                 artist: None,
@@ -835,7 +898,7 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "play", "Track", "--song"]).unwrap(),
             Command::Play {
-                target: "Track".to_string(),
+                query: PlayQuery::Text("Track".to_string()),
                 mode: PlayMode::Next,
                 kind: TargetKind::Song,
                 artist: None,
@@ -844,7 +907,7 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "play", "Track", "--artist", "Artist A"]).unwrap(),
             Command::Play {
-                target: "Track".to_string(),
+                query: PlayQuery::Text("Track".to_string()),
                 mode: PlayMode::Next,
                 kind: TargetKind::Auto,
                 artist: Some("Artist A".to_string()),
@@ -862,7 +925,7 @@ mod tests {
             ])
             .unwrap(),
             Command::Play {
-                target: "Track".to_string(),
+                query: PlayQuery::Text("Track".to_string()),
                 mode: PlayMode::Shuffle,
                 kind: TargetKind::Song,
                 artist: Some("Artist B".to_string()),
@@ -885,6 +948,100 @@ mod tests {
         assert!(parse_cli_from(["termusic", "play", "Track", "random"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "Track", "--song", "--playlist"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "   "]).is_err());
+    }
+
+    #[test]
+    fn play_parses_numeric_targets_and_index_flag() {
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "3"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("3".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "3", "shuffle"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("3".to_string()),
+                mode: PlayMode::Shuffle,
+                kind: TargetKind::Auto,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "--index", "3"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(3),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "-i", "3"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(3),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "--index", "3", "shuffle"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(3),
+                mode: PlayMode::Shuffle,
+                kind: TargetKind::Auto,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "-i", "2", "--playlist"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(2),
+                mode: PlayMode::Next,
+                kind: TargetKind::Playlist,
+                artist: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "--song", "-i", "4"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Index(4),
+                mode: PlayMode::Next,
+                kind: TargetKind::Song,
+                artist: None,
+            }
+        );
+
+        for invalid in [
+            ["termusic", "play", "--index", "0"].as_slice(),
+            ["termusic", "play", "--index", "-1"].as_slice(),
+            ["termusic", "play", "--index", "abc"].as_slice(),
+        ] {
+            let err = parse_cli_from(invalid.iter().copied()).unwrap_err();
+            assert!(
+                matches!(err, TermusicError::InvalidArg(ref msg) if msg.contains("index must be a positive integer (>= 1)")),
+                "unexpected error for {invalid:?}: {err:?}"
+            );
+        }
+
+        for invalid in [
+            ["termusic", "play", "--index", "3", "--artist", "Foo"].as_slice(),
+            ["termusic", "play", "--index", "3", "Some Song"].as_slice(),
+            ["termusic", "play", "--index", "3", "4"].as_slice(),
+            ["termusic", "play", "--index", "3", "Some Song", "shuffle"].as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    parse_cli_from(invalid.iter().copied()),
+                    Err(TermusicError::InvalidArg(_))
+                ),
+                "expected InvalidArg for {invalid:?}"
+            );
+        }
     }
 
     #[test]

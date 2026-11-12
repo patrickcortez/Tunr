@@ -1,6 +1,6 @@
 use std::io::{BufRead, IsTerminal, Write};
 
-use termusic::cli::{Command, ListKind, parse_cli};
+use termusic::cli::{Command, ListKind, PlayQuery, parse_cli};
 use termusic::error::{Result, TermusicError};
 use termusic::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
 use termusic::library::{DeleteOutcome, Library, PlayResolution, SongCandidate};
@@ -194,7 +194,7 @@ async fn run() -> Result<()> {
             tui::run_tui(&paths).await
         }
         Command::Play {
-            target,
+            query,
             mode,
             kind,
             artist,
@@ -202,11 +202,14 @@ async fn run() -> Result<()> {
             let lib_path = paths.library_path.clone();
             let (library, resolution) = run_blocking(move || {
                 let library = Library::load(&lib_path)?;
-                let resolution = library.resolve_play_target_with_artist(
-                    &target,
-                    kind,
-                    artist.as_deref(),
-                )?;
+                let resolution = match &query {
+                    PlayQuery::Text(target) => {
+                        library.resolve_play_target_with_artist(target, kind, artist.as_deref())?
+                    }
+                    PlayQuery::Index(idx) => {
+                        library.resolve_play_index(*idx, kind, artist.as_deref())?
+                    }
+                };
                 Ok((library, resolution))
             })
             .await?;
@@ -472,13 +475,23 @@ fn print_playback_status(status: &PlaybackStatus) {
 }
 
 fn print_library_list(library: &Library, kind: Option<ListKind>) {
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    let _ = write_library_list(library, kind, &mut writer);
+}
+
+fn write_library_list<W: Write>(
+    library: &Library,
+    kind: Option<ListKind>,
+    writer: &mut W,
+) -> std::io::Result<()> {
     let show_songs = matches!(kind, None | Some(ListKind::Songs));
     let show_playlists = matches!(kind, None | Some(ListKind::Playlists));
 
     if show_songs {
-        println!("Songs ({}):", library.songs.len());
+        writeln!(writer, "Songs ({}):", library.songs.len())?;
         if library.songs.is_empty() {
-            println!("  (none)");
+            writeln!(writer, "  (none)")?;
         } else {
             for (idx, song) in library.songs.iter().enumerate() {
                 let artist = song
@@ -490,27 +503,29 @@ fn print_library_list(library: &Library, kind: Option<ListKind>) {
                     .duration_secs
                     .map(format_time)
                     .unwrap_or_else(|| "--:--".to_string());
-                println!("  {}. {}{} [{}]", idx + 1, song.title, artist, dur);
+                writeln!(writer, "  {}. {}{} [{}]", idx + 1, song.title, artist, dur)?;
             }
         }
     }
 
     if show_playlists {
         if show_songs {
-            println!();
+            writeln!(writer)?;
         }
-        println!("Playlists ({}):", library.playlists.len());
+        writeln!(writer, "Playlists ({}):", library.playlists.len())?;
         if library.playlists.is_empty() {
-            println!("  (none)");
+            writeln!(writer, "  (none)")?;
         } else {
-            for playlist in &library.playlists {
+            for (idx, playlist) in library.playlists.iter().enumerate() {
                 let titles: Vec<&str> = playlist
                     .song_ids
                     .iter()
                     .filter_map(|id| library.find_song_by_id(id).map(|s| s.title.as_str()))
                     .collect();
-                println!(
-                    "  {} ({} song(s)): {}",
+                writeln!(
+                    writer,
+                    "  {}. {} ({} song(s)): {}",
+                    idx + 1,
                     playlist.name,
                     titles.len(),
                     if titles.is_empty() {
@@ -518,10 +533,12 @@ fn print_library_list(library: &Library, kind: Option<ListKind>) {
                     } else {
                         titles.join(", ")
                     }
-                );
+                )?;
             }
         }
     }
+
+    Ok(())
 }
 
 fn prompt_song_selection<R: BufRead, W: Write>(
@@ -669,5 +686,109 @@ mod tests {
                 "unexpected error for input {input:?}: {err:?}"
             );
         }
+    }
+
+    fn sample_library() -> Library {
+        use termusic::library::{Playlist, Song};
+
+        Library {
+            songs: vec![
+                Song {
+                    id: "s1".to_string(),
+                    title: "First Track".to_string(),
+                    artist: Some("Artist One".to_string()),
+                    album: None,
+                    path: PathBuf::from("/music/first.mp3"),
+                    duration_secs: Some(125.0),
+                },
+                Song {
+                    id: "s2".to_string(),
+                    title: "Second Track".to_string(),
+                    artist: None,
+                    album: None,
+                    path: PathBuf::from("/music/second.mp3"),
+                    duration_secs: None,
+                },
+            ],
+            playlists: vec![
+                Playlist {
+                    name: "Chill".to_string(),
+                    song_ids: vec!["s1".to_string(), "s2".to_string()],
+                },
+                Playlist {
+                    name: "EmptyMix".to_string(),
+                    song_ids: Vec::new(),
+                },
+            ],
+            ..Library::default()
+        }
+    }
+
+    #[test]
+    fn write_library_list_renders_all_with_one_based_numbering() {
+        let library = sample_library();
+        let mut out = Vec::new();
+
+        write_library_list(&library, None, &mut out).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        let expected = "\
+Songs (2):
+  1. First Track - Artist One [02:05]
+  2. Second Track [--:--]
+
+Playlists (2):
+  1. Chill (2 song(s)): First Track, Second Track
+  2. EmptyMix (0 song(s)): (empty)
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn write_library_list_filters_songs_and_playlists() {
+        let library = sample_library();
+
+        let mut songs_out = Vec::new();
+        write_library_list(&library, Some(ListKind::Songs), &mut songs_out).unwrap();
+        let songs_rendered = String::from_utf8(songs_out).unwrap();
+        assert_eq!(
+            songs_rendered,
+            "\
+Songs (2):
+  1. First Track - Artist One [02:05]
+  2. Second Track [--:--]
+"
+        );
+
+        let mut playlists_out = Vec::new();
+        write_library_list(&library, Some(ListKind::Playlists), &mut playlists_out).unwrap();
+        let playlists_rendered = String::from_utf8(playlists_out).unwrap();
+        assert_eq!(
+            playlists_rendered,
+            "\
+Playlists (2):
+  1. Chill (2 song(s)): First Track, Second Track
+  2. EmptyMix (0 song(s)): (empty)
+"
+        );
+    }
+
+    #[test]
+    fn write_library_list_handles_empty_library_sections() {
+        let empty = Library::default();
+        let mut out = Vec::new();
+
+        write_library_list(&empty, None, &mut out).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(
+            rendered,
+            "\
+Songs (0):
+  (none)
+
+Playlists (0):
+  (none)
+"
+        );
     }
 }

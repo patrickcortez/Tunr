@@ -106,8 +106,8 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic search [OPTIONS] [QUERY...]` | Search supported providers via `yt-dlp`, copy URLs, or download tracks/videos |
 | `termusic download [OPTIONS] <URL...>` | Download media via `yt-dlp` and auto-index audio tracks into the library |
 | `termusic add [-f] [-p] <path> [playlist]` | Add an audio file or directory (`-f`) to the library (and optionally a playlist `-p`) |
-| `termusic list [songs\|playlists]` | List indexed songs and/or playlists |
-| `termusic play [target] [mode]` | Play a song or playlist (`--song`, `--playlist`, `--artist <NAME>`), or resume when omitted |
+| `termusic list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
+| `termusic play [target] [mode]` | Play a song or playlist via `termusic play <target\|index>`, `-i`/`--index <INDEX>`, or `--playlist <index>` (`--song`, `--playlist`, `--artist <NAME>`), or resume when omitted |
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
 | `termusic next` / `prev` | Skip to next or previous track |
 | `termusic rewind <secs>` / `advance <secs>` | Seek backward or forward |

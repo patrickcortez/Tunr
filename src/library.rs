@@ -13,6 +13,7 @@ use crate::paths::{lock_path_for, with_file_lock, write_json_atomic};
 use crate::platform::canonicalize_clean;
 
 pub const LIBRARY_VERSION: u32 = 1;
+const INVALID_ONE_BASED_INDEX_MSG: &str = "index must be >= 1 (1-based from `termusic list`)";
 
 /// Metadata record for a single audio track indexed in `library.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -470,6 +471,10 @@ impl Library {
             None => None,
         };
 
+        if clean_artist.is_none() && q.bytes().all(|b| b.is_ascii_digit()) {
+            return self.resolve_numeric_play_target(q, kind);
+        }
+
         match kind {
             TargetKind::Song => self.resolve_song_play_candidates(q, clean_artist),
             TargetKind::Playlist => {
@@ -515,6 +520,43 @@ impl Library {
         }
     }
 
+    /// Strictly resolve a 1-based list index (`termusic list`) into a playable song or playlist.
+    pub fn resolve_play_index(
+        &self,
+        one_based_index: usize,
+        kind: TargetKind,
+        artist: Option<&str>,
+    ) -> Result<PlayResolution> {
+        if one_based_index == 0 {
+            return Err(TermusicError::InvalidArg(
+                INVALID_ONE_BASED_INDEX_MSG.to_string(),
+            ));
+        }
+        if artist.is_some() {
+            return Err(TermusicError::InvalidArg(
+                "--artist cannot be used with --index".to_string(),
+            ));
+        }
+
+        match kind {
+            TargetKind::Playlist => self
+                .play_target_for_playlist_index(one_based_index - 1)
+                .map(PlayResolution::Ready),
+            TargetKind::Song | TargetKind::Auto => {
+                if one_based_index <= self.songs.len() {
+                    self.play_target_for_song_index(one_based_index - 1)
+                        .map(PlayResolution::Ready)
+                } else {
+                    Err(index_out_of_bounds_error(
+                        "song",
+                        self.songs.len(),
+                        &one_based_index.to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
     /// Build a rotated [`PlayTarget::Song`] queue starting at `self.songs[index]`.
     pub fn play_target_for_song_index(&self, index: usize) -> Result<PlayTarget> {
         let selected = self
@@ -526,6 +568,25 @@ impl Library {
         queue.extend_from_slice(&self.songs[index..]);
         queue.extend_from_slice(&self.songs[..index]);
         Ok(PlayTarget::Song { selected, queue })
+    }
+
+    /// Build a [`PlayTarget::Playlist`] for the playlist at 0-based `index` in `self.playlists`.
+    pub fn play_target_for_playlist_index(&self, index: usize) -> Result<PlayTarget> {
+        let playlist = self.playlists.get(index).cloned().ok_or_else(|| {
+            index_out_of_bounds_error(
+                "playlist",
+                self.playlists.len(),
+                &index.saturating_add(1).to_string(),
+            )
+        })?;
+        let songs = self.songs_for_playlist(&playlist);
+        if songs.is_empty() {
+            return Err(TermusicError::NotFound(format!(
+                "playlist '{}' contains no playable songs",
+                playlist.name
+            )));
+        }
+        Ok(PlayTarget::Playlist { playlist, songs })
     }
 
     fn delete_song_by_query(&mut self, query: &str) -> Result<DeleteOutcome> {
@@ -592,58 +653,39 @@ impl Library {
         if q.is_empty() {
             return (Vec::new(), false);
         }
-        let q_lower = q.to_lowercase();
 
-        let (tier_matches, is_exact_title) = {
-            let exact: Vec<usize> = self
+        let exact_matches = self.lookup_exact_song_indices(q);
+        let (tier_matches, is_exact_title) = if !exact_matches.is_empty() {
+            (exact_matches, true)
+        } else {
+            let q_lower = q.to_lowercase();
+            let substring: Vec<usize> = self
                 .songs
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.title == q)
+                .filter(|(_, s)| s.title.to_lowercase().contains(&q_lower))
                 .map(|(i, _)| i)
                 .collect();
-            if !exact.is_empty() {
-                (exact, true)
+            if !substring.is_empty() {
+                (substring, false)
             } else {
-                let ci_exact: Vec<usize> = self
+                let file_match: Vec<usize> = self
                     .songs
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.title.to_lowercase() == q_lower)
+                    .filter(|(_, s)| {
+                        s.path
+                            .file_stem()
+                            .and_then(|st| st.to_str())
+                            .is_some_and(|st| st.to_lowercase() == q_lower)
+                            || s.path
+                                .file_name()
+                                .and_then(|fnm| fnm.to_str())
+                                .is_some_and(|fnm| fnm.to_lowercase() == q_lower)
+                    })
                     .map(|(i, _)| i)
                     .collect();
-                if !ci_exact.is_empty() {
-                    (ci_exact, true)
-                } else {
-                    let substring: Vec<usize> = self
-                        .songs
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.title.to_lowercase().contains(&q_lower))
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !substring.is_empty() {
-                        (substring, false)
-                    } else {
-                        let file_match: Vec<usize> = self
-                            .songs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, s)| {
-                                s.path
-                                    .file_stem()
-                                    .and_then(|st| st.to_str())
-                                    .is_some_and(|st| st.to_lowercase() == q_lower)
-                                    || s.path
-                                        .file_name()
-                                        .and_then(|fnm| fnm.to_str())
-                                        .is_some_and(|fnm| fnm.to_lowercase() == q_lower)
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
-                        (file_match, false)
-                    }
-                }
+                (file_match, false)
             }
         };
 
@@ -682,17 +724,101 @@ impl Library {
         (sub_artist, is_exact_title)
     }
 
+    fn resolve_numeric_play_target(&self, q: &str, kind: TargetKind) -> Result<PlayResolution> {
+        match q.parse::<usize>() {
+            Ok(n) if n >= 1 => match kind {
+                TargetKind::Playlist => {
+                    if n <= self.playlists.len() {
+                        return self
+                            .play_target_for_playlist_index(n - 1)
+                            .map(PlayResolution::Ready);
+                    }
+                    self.resolve_exact_numeric_fallback(
+                        q,
+                        kind,
+                        index_out_of_bounds_error("playlist", self.playlists.len(), &n.to_string()),
+                    )
+                }
+                TargetKind::Song | TargetKind::Auto => {
+                    if n <= self.songs.len() {
+                        return self
+                            .play_target_for_song_index(n - 1)
+                            .map(PlayResolution::Ready);
+                    }
+                    self.resolve_exact_numeric_fallback(
+                        q,
+                        kind,
+                        index_out_of_bounds_error("song", self.songs.len(), &n.to_string()),
+                    )
+                }
+            },
+            Ok(_) => self.resolve_exact_numeric_fallback(
+                q,
+                kind,
+                TermusicError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string()),
+            ),
+            Err(_) => {
+                let err = match kind {
+                    TargetKind::Playlist => index_out_of_bounds_error(
+                        "playlist",
+                        self.playlists.len(),
+                        &format!("'{q}'"),
+                    ),
+                    TargetKind::Song | TargetKind::Auto => {
+                        index_out_of_bounds_error("song", self.songs.len(), &format!("'{q}'"))
+                    }
+                };
+                self.resolve_exact_numeric_fallback(q, kind, err)
+            }
+        }
+    }
+
+    fn resolve_exact_numeric_fallback(
+        &self,
+        q: &str,
+        kind: TargetKind,
+        on_none: TermusicError,
+    ) -> Result<PlayResolution> {
+        match kind {
+            TargetKind::Playlist => match self.lookup_playlist(q) {
+                LookupMatch::None => Err(on_none),
+                _ => self
+                    .resolve_playlist_play_target(q)
+                    .map(PlayResolution::Ready),
+            },
+            TargetKind::Song => {
+                let song_indices = self.lookup_exact_song_indices(q);
+                if song_indices.is_empty() {
+                    Err(on_none)
+                } else {
+                    self.resolve_song_indices_to_resolution(q, None, song_indices)
+                }
+            }
+            TargetKind::Auto => {
+                let song_indices = self.lookup_exact_song_indices(q);
+                let playlist_match = self.lookup_playlist(q);
+                let has_song = !song_indices.is_empty();
+                let has_playlist = !matches!(playlist_match, LookupMatch::None);
+
+                if has_song && has_playlist {
+                    Err(TermusicError::Ambiguous(format!(
+                        "'{q}' matches both a song and a playlist; specify `--song` or `--playlist`"
+                    )))
+                } else if has_playlist {
+                    self.resolve_playlist_play_target(q)
+                        .map(PlayResolution::Ready)
+                } else if has_song {
+                    self.resolve_song_indices_to_resolution(q, None, song_indices)
+                } else {
+                    Err(on_none)
+                }
+            }
+        }
+    }
+
     fn resolve_playlist_play_target(&self, query: &str) -> Result<PlayTarget> {
         let idx = self.resolve_unique_playlist_index(query)?;
-        let playlist = self.playlists[idx].clone();
-        let songs = self.songs_for_playlist(&playlist);
-        if songs.is_empty() {
-            return Err(TermusicError::NotFound(format!(
-                "playlist '{}' contains no playable songs",
-                playlist.name
-            )));
-        }
-        Ok(PlayTarget::Playlist { playlist, songs })
+        self.play_target_for_playlist_index(idx)
     }
 
     fn resolve_unique_song_index(&self, query: &str) -> Result<usize> {
@@ -721,7 +847,7 @@ impl Library {
         }
     }
 
-    fn lookup_song(&self, query: &str) -> LookupMatch {
+    fn lookup_exact_song_indices(&self, query: &str) -> Vec<usize> {
         let exact: Vec<usize> = self
             .songs
             .iter()
@@ -730,30 +856,26 @@ impl Library {
             .map(|(i, _)| i)
             .collect();
         if !exact.is_empty() {
-            return match exact.len() {
-                1 => LookupMatch::One(exact[0]),
-                _ => LookupMatch::Multiple(
-                    exact
-                        .into_iter()
-                        .map(|i| format!("{} ({})", self.songs[i].title, self.songs[i].path.display()))
-                        .collect(),
-                ),
-            };
+            return exact;
         }
 
         let needle = query.to_lowercase();
-        let ci: Vec<usize> = self
-            .songs
+        self.songs
             .iter()
             .enumerate()
             .filter(|(_, s)| s.title.to_lowercase() == needle)
             .map(|(i, _)| i)
-            .collect();
-        match ci.len() {
+            .collect()
+    }
+
+    fn lookup_song(&self, query: &str) -> LookupMatch {
+        let matches = self.lookup_exact_song_indices(query);
+        match matches.len() {
             0 => LookupMatch::None,
-            1 => LookupMatch::One(ci[0]),
+            1 => LookupMatch::One(matches[0]),
             _ => LookupMatch::Multiple(
-                ci.into_iter()
+                matches
+                    .into_iter()
                     .map(|i| format!("{} ({})", self.songs[i].title, self.songs[i].path.display()))
                     .collect(),
             ),
@@ -903,6 +1025,16 @@ pub(crate) fn normalize_track_metadata(
     }
 
     (base_title, base_artist)
+}
+
+fn index_out_of_bounds_error(
+    target_label: &str,
+    count: usize,
+    index_display: &str,
+) -> TermusicError {
+    TermusicError::NotFound(format!(
+        "{target_label} index {index_display} out of bounds (library has {count} {target_label}(s))"
+    ))
 }
 
 fn format_ambiguous_candidate(candidate: &SongCandidate) -> String {
@@ -1517,6 +1649,290 @@ mod tests {
         assert!(matches!(
             lib.play_target_for_song_index(99),
             Err(TermusicError::NotFound(_))
+        ));
+    }
+
+    fn make_test_song(id: &str, title: &str, artist: Option<&str>, path: &str) -> Song {
+        Song {
+            id: id.to_string(),
+            title: title.to_string(),
+            artist: artist.map(ToOwned::to_owned),
+            album: None,
+            path: PathBuf::from(path),
+            duration_secs: Some(120.0),
+        }
+    }
+
+    #[test]
+    fn positional_numeric_query_resolves_one_based_index_before_exact_names() {
+        let lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                make_test_song("s1", "Alpha", Some("Artist A"), "/music/alpha.mp3"),
+                make_test_song("s2", "1", Some("Artist B"), "/music/one.mp3"),
+                make_test_song("s3", "Summer 2024", Some("Artist C"), "/music/2024.mp3"),
+            ],
+            playlists: vec![
+                Playlist {
+                    name: "Roadtrip".to_string(),
+                    song_ids: vec!["s1".to_string(), "s3".to_string()],
+                },
+                Playlist {
+                    name: "1".to_string(),
+                    song_ids: vec!["s2".to_string()],
+                },
+            ],
+        };
+
+        // Positional "1" picks song at 1-based index 1 (id "s1"), ahead of song titled "1" and playlist "1".
+        for kind in [TargetKind::Auto, TargetKind::Song] {
+            let res = lib.resolve_play_target_with_artist("1", kind, None).unwrap();
+            match res {
+                PlayResolution::Ready(PlayTarget::Song { selected, queue }) => {
+                    assert_eq!(selected.id, "s1");
+                    assert_eq!(
+                        queue.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                        vec!["s1", "s2", "s3"]
+                    );
+                }
+                other => panic!("expected Ready rotated song queue for {kind}, got {other:?}"),
+            }
+        }
+
+        // Positional "2" rotates library starting at index 1 ("s2").
+        let res2 = lib
+            .resolve_play_target_with_artist("2", TargetKind::Auto, None)
+            .unwrap();
+        match res2 {
+            PlayResolution::Ready(PlayTarget::Song { selected, queue }) => {
+                assert_eq!(selected.id, "s2");
+                assert_eq!(
+                    queue.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                    vec!["s2", "s3", "s1"]
+                );
+            }
+            other => panic!("expected Ready song s2, got {other:?}"),
+        }
+
+        // With --playlist, "1" picks playlist at 1-based index 1 ("Roadtrip"), ahead of playlist named "1".
+        let pl_res = lib
+            .resolve_play_target_with_artist("1", TargetKind::Playlist, None)
+            .unwrap();
+        match pl_res {
+            PlayResolution::Ready(PlayTarget::Playlist { playlist, songs }) => {
+                assert_eq!(playlist.name, "Roadtrip");
+                assert_eq!(
+                    songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                    vec!["s1", "s3"]
+                );
+            }
+            other => panic!("expected Ready playlist Roadtrip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn positional_out_of_bounds_falls_back_only_to_exact_title_or_playlist() {
+        let lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                make_test_song("s1", "1984", Some("Artist A"), "/music/nineteen84.mp3"),
+                make_test_song("s2", "Summer 2024", Some("Artist B"), "/music/2024.mp3"),
+            ],
+            playlists: vec![
+                Playlist {
+                    name: "1984".to_string(),
+                    song_ids: vec!["s1".to_string()],
+                },
+                Playlist {
+                    name: "1999".to_string(),
+                    song_ids: vec!["s2".to_string()],
+                },
+                Playlist {
+                    name: "EmptyList".to_string(),
+                    song_ids: vec!["missing-id".to_string()],
+                },
+            ],
+        };
+
+        // Out-of-bounds "1984" falls back to exact song title in Song mode.
+        let song_exact = lib
+            .resolve_play_target_with_artist("1984", TargetKind::Song, None)
+            .unwrap();
+        assert!(matches!(
+            song_exact,
+            PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "s1"
+        ));
+
+        // Out-of-bounds "1984" falls back to exact playlist in Playlist mode.
+        let pl_exact = lib
+            .resolve_play_target_with_artist("1984", TargetKind::Playlist, None)
+            .unwrap();
+        assert!(matches!(
+            pl_exact,
+            PlayResolution::Ready(PlayTarget::Playlist { ref playlist, .. }) if playlist.name == "1984"
+        ));
+
+        // Out-of-bounds "1984" in Auto mode reports Ambiguous when both exact song and playlist exist.
+        assert!(matches!(
+            lib.resolve_play_target_with_artist("1984", TargetKind::Auto, None),
+            Err(TermusicError::Ambiguous(_))
+        ));
+
+        // Out-of-bounds "1999" in Auto mode falls back to exact playlist "1999".
+        let auto_pl = lib
+            .resolve_play_target_with_artist("1999", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(
+            auto_pl,
+            PlayResolution::Ready(PlayTarget::Playlist { ref playlist, .. }) if playlist.name == "1999"
+        ));
+
+        // Out-of-bounds "2024" must NOT match substring "Summer 2024" or stem "2024.mp3".
+        for kind in [TargetKind::Auto, TargetKind::Song] {
+            let err = lib
+                .resolve_play_target_with_artist("2024", kind, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, TermusicError::NotFound(ref msg) if msg.contains("song index 2024 out of bounds")),
+                "expected song out-of-bounds NotFound for {kind}, got {err:?}"
+            );
+        }
+
+        // Out-of-bounds playlist index returns playlist out-of-bounds NotFound.
+        let pl_oob = lib
+            .resolve_play_target_with_artist("99", TargetKind::Playlist, None)
+            .unwrap_err();
+        assert!(
+            matches!(pl_oob, TermusicError::NotFound(ref msg) if msg.contains("playlist index 99 out of bounds"))
+        );
+
+        // Selecting an empty playlist by 1-based index fails with empty-playlist NotFound.
+        let pl_empty = lib
+            .resolve_play_target_with_artist("3", TargetKind::Playlist, None)
+            .unwrap_err();
+        assert!(
+            matches!(pl_empty, TermusicError::NotFound(ref msg) if msg.contains("contains no playable songs"))
+        );
+
+        // Overflowing numeric string returns NotFound out-of-bounds when no exact match exists.
+        let overflow_err = lib
+            .resolve_play_target_with_artist("999999999999999999999999999999", TargetKind::Auto, None)
+            .unwrap_err();
+        assert!(matches!(overflow_err, TermusicError::NotFound(_)));
+    }
+
+    #[test]
+    fn positional_zero_and_artist_numeric_queries_behave_consistently() {
+        let mut lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                make_test_song("s1", "First", Some("Artist A"), "/music/first.mp3"),
+                make_test_song("s2", "1", Some("Artist B"), "/music/one.mp3"),
+                make_test_song("s3", "1", Some("Artist C"), "/music/one_alt.mp3"),
+            ],
+            playlists: Vec::new(),
+        };
+
+        // Positional "0" without an exact song/playlist named "0" returns InvalidArg.
+        for kind in [TargetKind::Auto, TargetKind::Song, TargetKind::Playlist] {
+            let err = lib
+                .resolve_play_target_with_artist("0", kind, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, TermusicError::InvalidArg(_)),
+                "expected InvalidArg for '0' in {kind}, got {err:?}"
+            );
+        }
+
+        // --artist with numeric query resolves via song lookup + artist filter rather than index.
+        let with_artist = lib
+            .resolve_play_target_with_artist("1", TargetKind::Auto, Some("Artist C"))
+            .unwrap();
+        assert!(matches!(
+            with_artist,
+            PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "s3"
+        ));
+
+        // If an exact song titled "0" exists, positional "0" resolves it in Song/Auto modes.
+        lib.songs.push(make_test_song("s0", "0", Some("ZeroArtist"), "/music/zero.mp3"));
+        let zero_song = lib
+            .resolve_play_target_with_artist("0", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(
+            zero_song,
+            PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "s0"
+        ));
+    }
+
+    #[test]
+    fn resolve_play_index_is_strict_and_validates_bounds_zero_and_artist() {
+        let lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                make_test_song("s1", "1984", Some("Artist A"), "/music/1984.mp3"),
+                make_test_song("s2", "Two", Some("Artist B"), "/music/two.mp3"),
+            ],
+            playlists: vec![
+                Playlist {
+                    name: "1984".to_string(),
+                    song_ids: vec!["s2".to_string()],
+                },
+                Playlist {
+                    name: "Empty".to_string(),
+                    song_ids: vec!["missing".to_string()],
+                },
+            ],
+        };
+
+        // Valid 1-based song index in Auto and Song modes.
+        for kind in [TargetKind::Auto, TargetKind::Song] {
+            let res = lib.resolve_play_index(2, kind, None).unwrap();
+            match res {
+                PlayResolution::Ready(PlayTarget::Song { selected, queue }) => {
+                    assert_eq!(selected.id, "s2");
+                    assert_eq!(
+                        queue.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                        vec!["s2", "s1"]
+                    );
+                }
+                other => panic!("expected Ready song s2, got {other:?}"),
+            }
+        }
+
+        // Valid 1-based playlist index.
+        let pl = lib.resolve_play_index(1, TargetKind::Playlist, None).unwrap();
+        assert!(matches!(
+            pl,
+            PlayResolution::Ready(PlayTarget::Playlist { ref playlist, ref songs })
+            if playlist.name == "1984" && songs.len() == 1 && songs[0].id == "s2"
+        ));
+
+        // Empty playlist by index returns NotFound.
+        assert!(matches!(
+            lib.resolve_play_index(2, TargetKind::Playlist, None),
+            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no playable songs")
+        ));
+
+        // Strict index-only: out-of-bounds 1984 does NOT fall back to song/playlist named "1984".
+        assert!(matches!(
+            lib.resolve_play_index(1984, TargetKind::Auto, None),
+            Err(TermusicError::NotFound(ref msg)) if msg.contains("song index 1984 out of bounds")
+        ));
+        assert!(matches!(
+            lib.resolve_play_index(1984, TargetKind::Playlist, None),
+            Err(TermusicError::NotFound(ref msg)) if msg.contains("playlist index 1984 out of bounds")
+        ));
+
+        // Index 0 is rejected with InvalidArg even if a song/playlist named "0" existed.
+        assert!(matches!(
+            lib.resolve_play_index(0, TargetKind::Auto, None),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        // artist.is_some() is rejected with InvalidArg.
+        assert!(matches!(
+            lib.resolve_play_index(1, TargetKind::Song, Some("Artist A")),
+            Err(TermusicError::InvalidArg(ref msg)) if msg.contains("--artist cannot be used with --index")
         ));
     }
 }
