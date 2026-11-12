@@ -1,0 +1,20 @@
+[package]
+name = "termusic"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line music player with interactive TUI"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29.0"
+dirs = "6.0"
+libc = "0.2"
+libloading = "0.8"
+rand = "0.10"
+ratatui = "0.30.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "flac", "wav", "ogg", "vorbis", "pcm"] }
+thiserror = "2.0"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2.5"
