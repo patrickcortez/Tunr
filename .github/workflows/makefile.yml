@@ -14,14 +14,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: configure
-      run: ./configure
-
-    - name: Install dependencies
-      run: make
+    - name: Install runtime dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse0
 
     - name: Run check
       run: make check
 
-    - name: Run distcheck
-      run: make distcheck
+    - name: Run tests
+      run: make test
+
+    - name: Build
+      run: make build
