@@ -504,6 +504,6 @@ Please read [`LEGAL.md`](LEGAL.md) for the full legal notice, acceptable-use ter
 
 ## License
 
-Termusic's source code is licensed under the **PolyForm Noncommercial License 1.0.0** (`Copyright (c) 2026 Tezzzieee`). See [`LICENSE`](LICENSE) for the full license text.
+Termusic's source code is licensed under the **PolyForm Noncommercial License 1.0.0** (`Copyright (c) 2026 Tezzzeee`). See [`LICENSE`](LICENSE) for the full lcense text.
 
-[`LICENSE`](LICENSE) governs the Termusic software itself, while [`LEGAL.md`](LEGAL.md) covers the project's personal-use, non-commercial-distribution, and acceptable-use terms (including user responsibility for third-party copyright and platform compliance).
+[`LICENSE`](LICENSE.md) governs the Termusc software tself, while [`LEGAL.md`](LEGAL.md) covers the project's personal-use, non-commercial-distribution, and acceptable-use terms (including user responsibility for third-party copyright and platform compliance).
