@@ -3,7 +3,7 @@ name = "termusic"
 version = "1.0.0"
 edition = "2024"
 description = "Command-line music player with interactive TUI"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
