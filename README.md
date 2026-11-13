@@ -2,7 +2,7 @@
 
 A fast, cross-platform command-line music player with a background playback daemon, `yt-dlp` search and download integration, and an interactive terminal UI (TUI).
 
-> **Personal Use Only:** Termusic (including `termusic download`, `.link` batch downloading, and `termusic search`) is meant for personal, non-commercial use only and not for commercial distribution. See [`LEGAL.md`](LEGAL.md) for details; source code is licensed under the PolyForm Noncommercial License 1.0.0 ([`LICENSE`](LICENSE)).
+> **Personal Use Only:** Termusic (including `termusic download`, `.link` batch downloading, and `termusic search`) is meant for personal, non-commercial use only and not for commercial distribution. See [`LEGAL.md`](LEGAL.md) for details; source code is licensed under the PolyForm Noncommercial License 1.0.0 ([`LICENSE`](LICENSE.md)).
 
 ## Prerequisites
 
@@ -504,6 +504,6 @@ Please read [`LEGAL.md`](LEGAL.md) for the full legal notice, acceptable-use ter
 
 ## License
 
-Termusic's source code is licensed under the **PolyForm Noncommercial License 1.0.0** (`Copyright (c) 2026 Tezzzeee`). See [`LICENSE`](LICENSE.md) for the full lcense text.
+Termusic's source code is licensed under the **PolyForm Noncommercial License 1.0.0** (`Copyright (c) 2026 Tezzzieee`). See [`LICENSE`](LICENSE.md) for the full license text.
 
-[`LICENSE`](LICENSE.md) governs the Termusc software tself, while [`LEGAL.md`](LEGAL.md) covers the project's personal-use, non-commercial-distribution, and acceptable-use terms (including user responsibility for third-party copyright and platform compliance).
+[`LICENSE`](LICENSE.md) governs the Termusic software itself, while [`LEGAL.md`](LEGAL.md) covers the project's personal-use, non-commercial-distribution, and acceptable-use terms (including user responsibility for third-party copyright and platform compliance).
