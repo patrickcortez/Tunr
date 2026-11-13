@@ -222,6 +222,74 @@ impl Library {
             .collect()
     }
 
+    /// Append non-duplicate `song_ids` to `playlist`, returning `(canonical_playlist_name, added_count)`.
+    fn append_unique_song_ids(
+        playlist: &mut Playlist,
+        song_ids: &[String],
+    ) -> (String, usize) {
+        let mut added = 0;
+        for song_id in song_ids {
+            if !playlist.song_ids.contains(song_id) {
+                playlist.song_ids.push(song_id.clone());
+                added += 1;
+            }
+        }
+        (playlist.name.clone(), added)
+    }
+
+    /// Resolve a target playlist index by name (or 1-based list index when enabled),
+    /// creating a new empty playlist when a non-numeric name does not exist yet.
+    fn resolve_or_create_playlist_index(
+        &mut self,
+        playlist_name: &str,
+        allow_numeric_index: bool,
+    ) -> Result<usize> {
+        if allow_numeric_index && playlist_name.bytes().all(|b| b.is_ascii_digit()) {
+            match playlist_name.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= self.playlists.len() => return Ok(n - 1),
+                parsed => {
+                    match self.lookup_playlist(playlist_name) {
+                        LookupMatch::One(idx) => return Ok(idx),
+                        LookupMatch::Multiple(names) => {
+                            return Err(TermusicError::Ambiguous(format!(
+                                "playlist '{playlist_name}' matched multiple entries: {}",
+                                names.join(", ")
+                            )));
+                        }
+                        LookupMatch::None => {
+                            return if matches!(parsed, Ok(0)) {
+                                Err(TermusicError::InvalidArg(
+                                    INVALID_ONE_BASED_INDEX_MSG.to_string(),
+                                ))
+                            } else {
+                                Err(index_out_of_bounds_error(
+                                    "playlist",
+                                    self.playlists.len(),
+                                    playlist_name,
+                                ))
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        match self.lookup_playlist(playlist_name) {
+            LookupMatch::One(idx) => Ok(idx),
+            LookupMatch::Multiple(names) => Err(TermusicError::Ambiguous(format!(
+                "playlist '{playlist_name}' matched multiple entries: {}",
+                names.join(", ")
+            ))),
+            LookupMatch::None => {
+                self.playlists.push(Playlist {
+                    name: playlist_name.to_string(),
+                    song_ids: Vec::new(),
+                });
+                Ok(self.playlists.len() - 1)
+            }
+        }
+    }
+
     /// Append non-duplicate `song_ids` to an existing or newly created playlist, returning
     /// `(canonical_playlist_name, added_count)`.
     fn add_song_ids_to_playlist(
@@ -229,32 +297,22 @@ impl Library {
         playlist_name: &str,
         song_ids: &[String],
     ) -> Result<(String, usize)> {
-        let pl_idx = match self.lookup_playlist(playlist_name) {
-            LookupMatch::One(idx) => idx,
-            LookupMatch::Multiple(names) => {
-                return Err(TermusicError::Ambiguous(format!(
-                    "playlist '{playlist_name}' matched multiple entries: {}",
-                    names.join(", ")
-                )));
-            }
-            LookupMatch::None => {
-                self.playlists.push(Playlist {
-                    name: playlist_name.to_string(),
-                    song_ids: Vec::new(),
-                });
-                self.playlists.len() - 1
-            }
-        };
+        let pl_idx = self.resolve_or_create_playlist_index(playlist_name, false)?;
+        Ok(Self::append_unique_song_ids(&mut self.playlists[pl_idx], song_ids))
+    }
 
-        let pl = &mut self.playlists[pl_idx];
-        let mut added = 0;
-        for song_id in song_ids {
-            if !pl.song_ids.contains(song_id) {
-                pl.song_ids.push(song_id.clone());
-                added += 1;
-            }
+    /// Resolve an existing library song query via `resolve_create_song_match`.
+    fn resolve_existing_song_index(&self, trimmed: &str) -> Result<usize> {
+        match self.resolve_create_song_match(trimmed)? {
+            LookupMatch::One(idx) => Ok(idx),
+            LookupMatch::None => Err(TermusicError::NotFound(format!(
+                "no song found matching '{trimmed}'"
+            ))),
+            LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
+                "ambiguous song '{trimmed}': {} (use \"Title - Artist\" or list index)",
+                matches.join(", ")
+            ))),
         }
-        Ok((pl.name.clone(), added))
     }
 
     /// Add a file or recursive folder (`folder = true`) to the library index,
@@ -350,30 +408,56 @@ impl Library {
         }
 
         if let Some(pl_name) = clean_playlist {
-            match self.resolve_create_song_match(trimmed)? {
-                LookupMatch::One(idx) => {
-                    let song_id = self.songs[idx].id.clone();
-                    let (resolved_pl, playlist_added_count) =
-                        self.add_song_ids_to_playlist(&pl_name, &[song_id])?;
-                    Ok(AddSummary {
-                        added_count: 0,
-                        existing_count: 1,
-                        playlist_name: Some(resolved_pl),
-                        playlist_added_count,
-                        ..AddSummary::default()
-                    })
+            let idx = self.resolve_existing_song_index(trimmed).map_err(|err| match err {
+                TermusicError::NotFound(_) => {
+                    TermusicError::NotFound(format!("song or audio file '{trimmed}' not found"))
                 }
-                LookupMatch::None => Err(TermusicError::NotFound(format!(
-                    "song or audio file '{trimmed}' not found"
-                ))),
-                LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
-                    "ambiguous song '{trimmed}': {} (use \"Title - Artist\" or list index)",
-                    matches.join(", ")
-                ))),
-            }
+                other => other,
+            })?;
+            let song_id = self.songs[idx].id.clone();
+            let (resolved_pl, playlist_added_count) =
+                self.add_song_ids_to_playlist(&pl_name, &[song_id])?;
+            Ok(AddSummary {
+                added_count: 0,
+                existing_count: 1,
+                playlist_name: Some(resolved_pl),
+                playlist_added_count,
+                ..AddSummary::default()
+            })
         } else {
             self.add_files(path, false, None)
         }
+    }
+
+    /// Add an existing library song (by title, display string, filename/stem, or 1-based index)
+    /// to a playlist identified by name (creating it if absent) or 1-based playlist index.
+    pub fn add_existing_song(
+        &mut self,
+        query: &str,
+        playlist_target: &str,
+    ) -> Result<AddSummary> {
+        let trimmed_song = query.trim();
+        if trimmed_song.is_empty() {
+            return Err(TermusicError::InvalidArg(
+                "song cannot be empty".to_string(),
+            ));
+        }
+        let clean_playlist = normalize_playlist_name(Some(playlist_target))?
+            .expect("non-empty Some playlist yields Some");
+
+        let song_idx = self.resolve_existing_song_index(trimmed_song)?;
+        let song_id = self.songs[song_idx].id.clone();
+        let pl_idx = self.resolve_or_create_playlist_index(&clean_playlist, true)?;
+        let (resolved_pl, playlist_added_count) =
+            Self::append_unique_song_ids(&mut self.playlists[pl_idx], &[song_id]);
+
+        Ok(AddSummary {
+            added_count: 0,
+            existing_count: 1,
+            playlist_name: Some(resolved_pl),
+            playlist_added_count,
+            ..AddSummary::default()
+        })
     }
 
     /// Create a new playlist from existing song specifiers (titles, `"Title - Artist"` display
@@ -3094,5 +3178,91 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_existing_song_resolves_playlist_and_song_by_name_or_index() {
+        let mut lib = Library::default();
+        lib.songs.push(make_test_song(
+            "id-1",
+            "Alpha",
+            Some("Artist A"),
+            "/music/alpha.mp3",
+        ));
+        lib.songs.push(make_test_song(
+            "id-2",
+            "Beta",
+            Some("Artist B"),
+            "/music/beta.mp3",
+        ));
+        lib.songs.push(make_test_song(
+            "id-3",
+            "Echoes",
+            Some("One"),
+            "/music/echoes1.mp3",
+        ));
+        lib.songs.push(make_test_song(
+            "id-4",
+            "Echoes",
+            Some("Two"),
+            "/music/echoes2.mp3",
+        ));
+        lib.playlists.push(Playlist {
+            name: "Favorites".to_string(),
+            song_ids: vec!["id-1".to_string()],
+        });
+
+        // Target playlist by 1-based index and song by 1-based index.
+        let added = lib.add_existing_song("2", "1").unwrap();
+        assert_eq!(added.added_count, 0);
+        assert_eq!(added.existing_count, 1);
+        assert_eq!(added.playlist_name.as_deref(), Some("Favorites"));
+        assert_eq!(added.playlist_added_count, 1);
+        assert_eq!(
+            lib.playlists[0].song_ids,
+            vec!["id-1".to_string(), "id-2".to_string()]
+        );
+
+        // Duplicate song in same playlist is skipped cleanly.
+        let dup = lib.add_existing_song("Alpha", "favorites").unwrap();
+        assert_eq!(dup.playlist_name.as_deref(), Some("Favorites"));
+        assert_eq!(dup.playlist_added_count, 0);
+
+        // Non-numeric missing playlist name creates the playlist and adds song.
+        let created = lib.add_existing_song("Echoes - Two", "Chill").unwrap();
+        assert_eq!(created.playlist_name.as_deref(), Some("Chill"));
+        assert_eq!(created.playlist_added_count, 1);
+        assert_eq!(lib.playlists.len(), 2);
+        assert_eq!(lib.playlists[1].song_ids, vec!["id-4".to_string()]);
+
+        // Error cases: index 0, out-of-bounds playlist index, missing song, ambiguous song, empty args.
+        assert!(matches!(
+            lib.add_existing_song("1", "0"),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("0", "1"),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("1", "9"),
+            Err(TermusicError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("MissingSong", "1"),
+            Err(TermusicError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("Echoes", "1"),
+            Err(TermusicError::Ambiguous(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("   ", "1"),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_existing_song("Alpha", "   "),
+            Err(TermusicError::InvalidArg(_))
+        ));
     }
 }

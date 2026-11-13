@@ -138,15 +138,18 @@ pub enum RawCommand {
     /// Add an audio file, folder, or existing library song to the library and/or a playlist
     Add {
         /// Recursively scan a folder for supported audio files
-        #[arg(short = 'f', long = "folder", conflicts_with = "song")]
+        #[arg(short = 'f', long = "folder", conflicts_with_all = ["song", "existing"])]
         folder: bool,
-        /// Audio file path to import, or existing library song when `-p` is set
+        /// Add an existing library song to a playlist (e.g. `add -p -e <PLAYLIST> <SONG>` or `add -e <SONG> -p <PLAYLIST>`)
+        #[arg(short = 'e', long = "existing", conflicts_with = "folder")]
+        existing: bool,
+        /// Audio file path to import, or existing library song when `-p` / `-e` is set
         #[arg(short = 's', long = "song", value_name = "SONG")]
         song: Option<String>,
-        /// Target playlist name (created if absent)
+        /// Target playlist name (created if absent; `-e` also accepts a 1-based playlist index)
         #[arg(short = 'p', long = "playlist", value_name = "PLAYLIST")]
         playlist_name: Option<String>,
-        /// Path to audio file (or directory when `-f` is set)
+        /// Path to audio file/folder, or existing library song name/index when `-e` is set
         #[arg(value_name = "PATH", conflicts_with = "song")]
         path: Option<PathBuf>,
     },
@@ -334,11 +337,12 @@ pub enum DaemonAction {
     Stop,
 }
 
-/// Source input for `termusic add`: a filesystem path or a `-s <SONG>` query/path.
+/// Source input for `termusic add`: a filesystem path, `-s <SONG>`, or `-e`/`--existing` library song.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddInput {
     Path { path: PathBuf, folder: bool },
     Song(String),
+    ExistingSong(String),
 }
 
 /// Validated application command ready for dispatch.
@@ -795,6 +799,7 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         }
         RawCommand::Add {
             folder,
+            existing,
             song,
             playlist_name,
             path,
@@ -803,6 +808,40 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 .as_deref()
                 .map(validate_playlist_name)
                 .transpose()?;
+            if existing {
+                if folder {
+                    return Err(TermusicError::InvalidArg(
+                        "cannot combine `--folder` with `--existing`".to_string(),
+                    ));
+                }
+                if clean_playlist.is_none() {
+                    return Err(TermusicError::InvalidArg(
+                        "`-e`/`--existing` requires a target playlist (`-p <PLAYLIST>`)"
+                            .to_string(),
+                    ));
+                }
+                let query = match (song, path) {
+                    (Some(raw_song), None) => trim_non_empty(&raw_song, "song cannot be empty")?,
+                    (None, Some(path)) => {
+                        let raw = path.to_string_lossy();
+                        trim_non_empty(&raw, "song cannot be empty")?
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(TermusicError::InvalidArg(
+                            "cannot specify both `--song` and `<PATH>`".to_string(),
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(TermusicError::InvalidArg(
+                            "provide an existing song name or index with `-e`".to_string(),
+                        ));
+                    }
+                };
+                return Ok(Command::Add {
+                    input: AddInput::ExistingSong(query),
+                    playlist_name: clean_playlist,
+                });
+            }
             let input = match (song, path) {
                 (Some(raw_song), None) => {
                     AddInput::Song(trim_non_empty(&raw_song, "song cannot be empty")?)
@@ -1077,6 +1116,84 @@ where
     out
 }
 
+/// Normalize `-p -e` / `--playlist --existing` / `-pe` / `-ep` in `termusic add` so both
+/// `add -p -e <PLAYLIST> <SONG>` and `add -e <SONG> -p <PLAYLIST>` parse unambiguously.
+pub fn normalize_add_args<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let raw: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if raw.get(1).and_then(|s| s.to_str()) != Some("add") {
+        return raw;
+    }
+
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(raw[0].clone());
+    out.push(raw[1].clone());
+
+    let mut after_double_dash = false;
+    let mut expect_value = false;
+    let mut i = 2;
+
+    while i < raw.len() {
+        let arg = &raw[i];
+        if after_double_dash {
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        if expect_value {
+            expect_value = false;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        let Some(text) = arg.to_str() else {
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        };
+
+        if text == "--" {
+            after_double_dash = true;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if matches!(text, "-pe" | "-ep") {
+            out.push(OsString::from("-e"));
+            out.push(OsString::from("-p"));
+            expect_value = true;
+            i += 1;
+            continue;
+        }
+
+        if matches!(text, "-p" | "--playlist")
+            && raw
+                .get(i + 1)
+                .and_then(|next| next.to_str())
+                .is_some_and(|next| matches!(next, "-e" | "--existing"))
+        {
+            out.push(raw[i + 1].clone());
+            out.push(arg.clone());
+            expect_value = true;
+            i += 2;
+            continue;
+        }
+
+        if matches!(text, "-p" | "--playlist" | "-s" | "--song") {
+            expect_value = true;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+
+    out
+}
+
 fn validate_cli_with_matches(cli: Cli, matches: &ArgMatches) -> Result<Command> {
     if let Some(RawCommand::Create { playlist, .. }) = &cli.command {
         let playlist = validate_playlist_name(playlist)?;
@@ -1091,7 +1208,7 @@ fn validate_cli_with_matches(cli: Cli, matches: &ArgMatches) -> Result<Command> 
 
 /// Parse and validate CLI arguments from `std::env::args_os()`, exiting cleanly on `--help`/`--version`.
 pub fn parse_cli() -> Result<Command> {
-    let args = normalize_search_args(std::env::args_os());
+    let args = normalize_add_args(normalize_search_args(std::env::args_os()));
     let matches = match Cli::command().try_get_matches_from(args) {
         Ok(m) => m,
         Err(err) => match err.kind() {
@@ -1110,7 +1227,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let normalized = normalize_search_args(args);
+    let normalized = normalize_add_args(normalize_search_args(args));
     let matches = Cli::command()
         .try_get_matches_from(normalized)
         .map_err(|err| TermusicError::InvalidArg(err.to_string()))?;
@@ -1551,10 +1668,52 @@ mod tests {
             }
         );
 
+        for valid_existing in [
+            ["termusic", "add", "-p", "-e", "Favorites", "Mundo"].as_slice(),
+            ["termusic", "add", "-pe", "Favorites", "Mundo"].as_slice(),
+            ["termusic", "add", "-ep", "Favorites", "Mundo"].as_slice(),
+            ["termusic", "add", "-e", "-p", "Favorites", "Mundo"].as_slice(),
+            [
+                "termusic",
+                "add",
+                "--playlist",
+                "--existing",
+                "Favorites",
+                "Mundo",
+            ]
+            .as_slice(),
+            ["termusic", "add", "-p", "Favorites", "-e", "Mundo"].as_slice(),
+            ["termusic", "add", "-e", "Mundo", "-p", "Favorites"].as_slice(),
+            ["termusic", "add", "-e", "-s", "Mundo", "-p", "Favorites"].as_slice(),
+        ] {
+            assert_eq!(
+                parse_cli_from(valid_existing.iter().copied()).unwrap(),
+                Command::Add {
+                    input: AddInput::ExistingSong("Mundo".to_string()),
+                    playlist_name: Some("Favorites".to_string()),
+                },
+                "failed for {valid_existing:?}"
+            );
+        }
+        assert_eq!(
+            parse_cli_from(["termusic", "add", "-p", "-e", "1", "5"]).unwrap(),
+            Command::Add {
+                input: AddInput::ExistingSong("5".to_string()),
+                playlist_name: Some("1".to_string()),
+            }
+        );
+
         for invalid in [
             ["termusic", "add"].as_slice(),
             ["termusic", "add", "-f"].as_slice(),
             ["termusic", "add", "-p", "Favorites"].as_slice(),
+            ["termusic", "add", "-e", "Mundo"].as_slice(),
+            ["termusic", "add", "-p", "Favorites", "-e"].as_slice(),
+            ["termusic", "add", "-p", "-e"].as_slice(),
+            ["termusic", "add", "-p", "-e", "", "Mundo"].as_slice(),
+            ["termusic", "add", "-p", "-e", "Favorites", "   "].as_slice(),
+            ["termusic", "add", "-f", "-e", "-p", "Favorites", "Mundo"].as_slice(),
+            ["termusic", "add", "-p", "-e", "1", "5", "extra"].as_slice(),
             ["termusic", "add", "-s", ""].as_slice(),
             ["termusic", "add", "-s", "   "].as_slice(),
             ["termusic", "add", "-s", "song.mp3", "-p", ""].as_slice(),

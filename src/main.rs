@@ -274,6 +274,15 @@ async fn run() -> Result<()> {
                             library.add_files(&path, folder, target_pl)
                         }
                         AddInput::Song(query) => library.add_song(&query, target_pl),
+                        AddInput::ExistingSong(query) => {
+                            let pl = target_pl.ok_or_else(|| {
+                                TermusicError::InvalidArg(
+                                    "`-e`/`--existing` requires a target playlist (`-p <PLAYLIST>`)"
+                                        .to_string(),
+                                )
+                            })?;
+                            library.add_existing_song(&query, pl)
+                        }
                     }
                 })
             })

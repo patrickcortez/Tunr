@@ -107,7 +107,7 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic tui` (or `termusic`) | Launch the interactive player TUI |
 | `termusic search [OPTIONS] [QUERY...]` | Search supported providers via `yt-dlp`, copy URLs, or download tracks/videos |
 | `termusic download [OPTIONS] <URL...>` | Download media via `yt-dlp` and auto-index audio tracks into the library |
-| `termusic add [-p <PLAYLIST>] [-f] [<PATH> \| -s <SONG>]` | Add an audio file, folder (`-f`), or existing library song (`-s` with `-p`) to the library and/or a playlist |
+| `termusic add [-p <PLAYLIST>] [-f \| -e] [<PATH> \| -s <SONG>]` | Add an audio file, folder (`-f`), or existing library song (`-e` / `-s` with `-p`) to the library and/or a playlist |
 | `termusic list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
 | `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song, playlist, `<playlist>[<index>]` (1-based start track), or 1-based `list` index, or resume paused playback when omitted |
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
@@ -127,15 +127,17 @@ Import an audio file or directory into the library index, or add a file or exist
 
 | Flag / Argument | Description |
 | --- | --- |
-| `[PATH]` | Path to an audio file (or a directory when `-f` / `--folder` is set). Conflicts with `-s` / `--song` |
-| `-f`, `--folder` | Recursively scan `<PATH>` as a directory for supported audio files. Conflicts with `-s` / `--song` |
-| `-s`, `--song <SONG>` | Audio file path to import, or (when `-p` / `--playlist` is set) an existing library song specified by title, `"Title - Artist"` display string, filename/stem, 1-based `termusic list` index, or unique substring. Conflicts with `<PATH>` and `-f` |
-| `-p`, `--playlist <PLAYLIST>` | Target playlist name (created automatically if absent; duplicate song IDs are skipped) |
+| `[PATH]` | Path to an audio file (or a directory when `-f` / `--folder` is set), or existing library song name/1-based index when `-e` / `--existing` is set. Conflicts with `-s` / `--song` |
+| `-f`, `--folder` | Recursively scan `<PATH>` as a directory for supported audio files. Conflicts with `-s` / `--song` and `-e` / `--existing` |
+| `-e`, `--existing` | Add an existing library song (never imports from disk) to the target playlist. Accepts `<playlist>` by name (created if absent) or 1-based playlist index (`termusic add -p -e <playlist> <song>` or `termusic add -e <song> -p <playlist>`) |
+| `-s`, `--song <SONG>` | Audio file path to import, or (when `-p` / `--playlist` or `-e` / `--existing` is set) an existing library song specified by title, `"Title - Artist"` display string, filename/stem, 1-based `termusic list` index, or unique substring. Conflicts with `<PATH>` and `-f` |
+| `-p`, `--playlist <PLAYLIST>` | Target playlist name (created automatically if absent; `-e` also accepts a 1-based playlist index; duplicate song IDs are skipped) |
 
 ### Behavior
 
-- **`-s` / `--song <SONG>`**: If `<SONG>` exists on disk, `termusic` imports it as an audio file (and adds it to `<PLAYLIST>` if `-p` is provided). Otherwise, when `-p <PLAYLIST>` is provided, `<SONG>` is matched against existing library songs using the same specifiers as `termusic create` and appended to `<PLAYLIST>`.
-- **`-p` / `--playlist <PLAYLIST>`**: Accepts `<PLAYLIST>` directly as its flag argument (so flags can appear in any order, such as `termusic add -p Favorites ~/Music/track.mp3` or `termusic add -fp Favorites ~/Music/Album`).
+- **`-e` / `--existing`**: Requires `-p` / `--playlist` and matches `<SONG>` solely against songs already in the library (without reading disk paths). Works cleanly as `termusic add -p -e <playlist-name-or-index> <song-name-or-index>`, `termusic add -e <song> -p <playlist>`, or `termusic add -p <playlist> -e <song>`.
+- **`-s` / `--song <SONG>`**: If `<SONG>` exists on disk (and `-e` is not set), `termusic` imports it as an audio file (and adds it to `<PLAYLIST>` if `-p` is provided). Otherwise, when `-p <PLAYLIST>` is provided, `<SONG>` is matched against existing library songs using the same specifiers as `termusic create` and appended to `<PLAYLIST>`.
+- **`-p` / `--playlist <PLAYLIST>`**: Accepts `<PLAYLIST>` directly as its flag argument (so flags can appear in any order, such as `termusic add -p Favorites ~/Music/track.mp3` or `termusic add -fp Favorites ~/Music/Album`), and also pairs cleanly with `-p -e <playlist> <song>`.
 
 ### Examples
 
@@ -152,9 +154,13 @@ termusic add -p Favorites -s ~/Music/track.mp3
 termusic add -f ~/Music/Album
 termusic add -fp "Road Trip" ~/Music/Album
 
-# Add an existing library song to a playlist by title, display string, or 1-based list index
+# Add an existing library song to a playlist using -e / --existing (playlist & song accept name or 1-based index)
+termusic add -p -e Favorites "Mundo"
+termusic add -p -e 1 5
+termusic add -e "Mundo - IV Of Spades" -p Favorites
+
+# Or via -s / --song with -p
 termusic add -s "Mundo" -p Favorites
-termusic add -s "Mundo - IV Of Spades" -p Favorites
 termusic add -p Favorites -s 5
 ```
 
