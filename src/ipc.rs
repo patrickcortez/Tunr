@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -696,10 +696,10 @@ async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
     Ok(Some(child))
 }
 
-async fn acquire_spawn_lock(paths: &AppPaths) -> Result<File> {
+async fn acquire_spawn_lock(paths: &AppPaths) -> Result<paths::FileLock> {
     let spawn_lock_path = paths.daemon_spawn_lock_path();
     let paths_clone = paths.clone();
-    tokio::task::spawn_blocking(move || -> Result<File> {
+    tokio::task::spawn_blocking(move || -> Result<paths::FileLock> {
         paths_clone.ensure_dirs()?;
         paths::acquire_file_lock(&spawn_lock_path, true, true)?.ok_or_else(|| {
             TermusicError::Daemon("failed to acquire daemon spawn lock".to_string())

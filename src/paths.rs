@@ -302,12 +302,26 @@ pub fn lock_path_for(target: &Path) -> PathBuf {
     suffix_path(target, "lock")
 }
 
+/// RAII guard for an OS advisory file lock acquired via [`acquire_file_lock`].
+///
+/// Explicitly calls `unlock()` on drop before closing the file descriptor so any forked child
+/// process that temporarily inherited the descriptor between `fork` and `exec` cannot keep the
+/// advisory lock held after the owner releases it.
+#[derive(Debug)]
+pub struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Open or create `lock_path` and acquire an OS advisory lock without truncating or unlinking it.
 pub fn acquire_file_lock(
     lock_path: &Path,
     exclusive: bool,
     blocking: bool,
-) -> Result<Option<File>> {
+) -> Result<Option<FileLock>> {
     if let Some(parent) = lock_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -342,7 +356,7 @@ pub fn acquire_file_lock(
     };
 
     if acquired {
-        Ok(Some(file))
+        Ok(Some(FileLock(file)))
     } else {
         Ok(None)
     }
@@ -1233,6 +1247,105 @@ mod tests {
 
         assert!(acquire_file_lock(&lock_path, true, false).unwrap().is_some());
         assert!(lock_path.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_unlocks_immediately_even_if_forked_child_inherits_fd() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        struct FdGuard(libc::c_int);
+        impl Drop for FdGuard {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    // SAFETY: `self.0` is an owned pipe file descriptor.
+                    unsafe {
+                        libc::close(self.0);
+                    }
+                }
+            }
+        }
+
+        let root = temp_dir("fork-unlock");
+        let lock_path = root.join("daemon.lock");
+
+        let lock = acquire_file_lock(&lock_path, true, false)
+            .unwrap()
+            .expect("initial exclusive lock should succeed");
+
+        let mut ready_pipe = [-1 as libc::c_int; 2];
+        let mut release_pipe = [-1 as libc::c_int; 2];
+        // SAFETY: Valid 2-element `c_int` arrays passed to `pipe`.
+        assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+        // SAFETY: Valid 2-element `c_int` arrays passed to `pipe`.
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
+        for fd in [
+            ready_pipe[0],
+            ready_pipe[1],
+            release_pipe[0],
+            release_pipe[1],
+        ] {
+            // SAFETY: Valid pipe file descriptors.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        }
+
+        let ready_r = ready_pipe[0];
+        let ready_w = ready_pipe[1];
+        let release_r = release_pipe[0];
+        let release_w = release_pipe[1];
+
+        let mut cmd = Command::new("true");
+        // SAFETY: `pre_exec` uses only async-signal-safe `libc` functions (`close`, `write`,
+        // `read`) to pause the forked child before `exec` closes `FD_CLOEXEC` descriptors.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::close(ready_r);
+                libc::close(release_w);
+                let byte = [1u8; 1];
+                if libc::write(ready_w, byte.as_ptr().cast(), 1) != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::close(ready_w);
+                let mut buf = [0u8; 1];
+                let _ = libc::read(release_r, buf.as_mut_ptr().cast(), 1);
+                libc::close(release_r);
+                Ok(())
+            });
+        }
+
+        let spawn_handle = std::thread::spawn(move || cmd.spawn());
+        // Keep all four pipe ends alive in guards until the helper thread has forked and
+        // `read(ready_r)` confirms the child is paused inside `pre_exec`.
+        let _ready_r_guard = FdGuard(ready_r);
+        let _ready_w_guard = FdGuard(ready_w);
+        let _release_r_guard = FdGuard(release_r);
+        let release_w_guard = FdGuard(release_w);
+
+        let mut byte = [0u8; 1];
+        // SAFETY: Reading 1 byte from the valid `ready_r` pipe descriptor.
+        let n = unsafe { libc::read(ready_r, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(n, 1, "child should signal from pre_exec before exec");
+
+        // The forked child is now paused between fork() and exec(), holding an inherited FD
+        // referencing the same open file description. Dropping `lock` must explicitly unlock
+        // it so re-acquisition succeeds immediately without waiting for the child to exec.
+        drop(lock);
+        let reacquired = acquire_file_lock(&lock_path, true, false).unwrap();
+
+        // Release the child before asserting so panicking still lets the child exit cleanly.
+        drop(release_w_guard);
+        let mut child = spawn_handle.join().unwrap().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+
+        assert!(
+            reacquired.is_some(),
+            "lock should be re-acquirable immediately after drop while a forked child holds the old FD"
+        );
+        drop(reacquired);
 
         let _ = fs::remove_dir_all(&root);
     }

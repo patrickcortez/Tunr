@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -74,7 +74,8 @@ where
     };
 
     let startup_paths = paths.clone();
-    let (_daemon_lock, sink): (File, Box<dyn AudioSink>) = tokio::task::spawn_blocking(move || {
+    let (_daemon_lock, sink): (paths::FileLock, Box<dyn AudioSink>) =
+        tokio::task::spawn_blocking(move || {
         startup_paths.ensure_dirs()?;
 
         // Acquire exclusive ownership of `daemon.lock` BEFORE inspecting or deleting any socket/PID
