@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::download::{DownloadFormat, DownloadOptions, normalize_urls, parse_download_format_str};
 use crate::error::{Result, TermusicError};
@@ -179,18 +179,20 @@ pub enum RawCommand {
         playlist: bool,
     },
 
-    /// Create a playlist from existing library songs: create <name> songs=<s1,s2,...>
+    /// Create a playlist from existing library songs: create <name> [songs=<s1,s2,...>]... [-s <SONG>]...
     Create {
         /// Name of the new playlist
         playlist: String,
-        /// Comma-separated song list prefixed with `songs=`
+        /// Add a song (repeatable; takes one literal song specifier without comma-splitting)
         #[arg(
-            required = true,
-            num_args = 1..,
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "songs=<s1,s2,...>"
+            short = 's',
+            long = "song",
+            action = clap::ArgAction::Append,
+            value_name = "SONG"
         )]
+        song: Vec<String>,
+        /// Comma-separated song list prefixed with `songs=` (supports multiple `songs=` tokens)
+        #[arg(num_args = 0.., value_name = "songs=<s1,s2,...>")]
         raw_songs: Vec<String>,
     },
 
@@ -402,24 +404,260 @@ fn parse_non_negative_secs(raw: &str) -> std::result::Result<f64, String> {
     Ok(if val == 0.0 { 0.0 } else { val })
 }
 
-/// Parse `songs=<s1,s2,...>` from trailing CLI tokens (supporting both quoted and unquoted forms).
-pub fn parse_songs_kv(tokens: &[String]) -> Result<Vec<String>> {
-    let joined = tokens.join(" ");
-    let rhs = joined.strip_prefix("songs=").ok_or_else(|| {
-        TermusicError::InvalidArg("expected `songs=<song1,song2,...>` argument".to_string())
-    })?;
-    let titles: Vec<String> = rhs
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    if titles.is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvFieldState {
+    FieldStart,
+    InQuotes,
+    AfterClosingQuote,
+    Unquoted,
+}
+
+#[derive(Debug)]
+enum CreateToken<'a> {
+    Flag(&'a str),
+    Kv(&'a str),
+}
+
+/// Push an escaped `,`, `"`, or `\` when preceded by `\`, or keep `\` literally for other characters.
+fn push_escaped_or_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    buf: &mut String,
+) {
+    match chars.peek().copied() {
+        Some(esc @ (',' | '"' | '\\')) => {
+            chars.next();
+            buf.push(esc);
+        }
+        _ => buf.push('\\'),
+    }
+}
+
+fn push_quoted_song(buf: &str, songs: &mut Vec<String>) -> Result<()> {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Err(TermusicError::InvalidArg(if songs.is_empty() {
+            "songs list cannot be empty".to_string()
+        } else {
+            "song entry in `songs=` cannot be empty".to_string()
+        }));
+    }
+    songs.push(trimmed.to_string());
+    Ok(())
+}
+
+fn push_unquoted_song(buf: &str, songs: &mut Vec<String>) {
+    let trimmed = buf.trim();
+    if !trimmed.is_empty() {
+        songs.push(trimmed.to_string());
+    }
+}
+
+/// Parse the RHS of a single `songs=...` value supporting escaped commas (`\,`) and CSV quotes (`"..."`).
+fn parse_songs_rhs(rhs: &str) -> Result<Vec<String>> {
+    let mut songs = Vec::new();
+    let mut state = CsvFieldState::FieldStart;
+    let mut buf = String::new();
+    let mut chars = rhs.chars().peekable();
+
+    loop {
+        match state {
+            CsvFieldState::FieldStart => match chars.peek().copied() {
+                None => break,
+                Some(ch) if ch.is_whitespace() => {
+                    chars.next();
+                }
+                Some(',') => {
+                    chars.next();
+                }
+                Some('"') => {
+                    chars.next();
+                    buf.clear();
+                    state = CsvFieldState::InQuotes;
+                }
+                Some(_) => {
+                    buf.clear();
+                    state = CsvFieldState::Unquoted;
+                }
+            },
+            CsvFieldState::InQuotes => match chars.next() {
+                None => {
+                    return Err(TermusicError::InvalidArg(
+                        "unclosed quote in `songs=` argument".to_string(),
+                    ));
+                }
+                Some('"') => {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        buf.push('"');
+                    } else {
+                        state = CsvFieldState::AfterClosingQuote;
+                    }
+                }
+                Some('\\') => push_escaped_or_literal(&mut chars, &mut buf),
+                Some(ch) => buf.push(ch),
+            },
+            CsvFieldState::AfterClosingQuote => match chars.next() {
+                None => {
+                    push_quoted_song(&buf, &mut songs)?;
+                    break;
+                }
+                Some(',') => {
+                    push_quoted_song(&buf, &mut songs)?;
+                    buf.clear();
+                    state = CsvFieldState::FieldStart;
+                }
+                Some(ch) if ch.is_whitespace() => {}
+                Some(ch) => {
+                    return Err(TermusicError::InvalidArg(format!(
+                        "unexpected character '{ch}' after closing quote in `songs=` argument"
+                    )));
+                }
+            },
+            CsvFieldState::Unquoted => match chars.next() {
+                None => {
+                    push_unquoted_song(&buf, &mut songs);
+                    break;
+                }
+                Some(',') => {
+                    push_unquoted_song(&buf, &mut songs);
+                    buf.clear();
+                    state = CsvFieldState::FieldStart;
+                }
+                Some('\\') => push_escaped_or_literal(&mut chars, &mut buf),
+                Some(ch) => buf.push(ch),
+            },
+        }
+    }
+
+    if songs.is_empty() {
         return Err(TermusicError::InvalidArg(
             "songs list cannot be empty".to_string(),
         ));
     }
-    Ok(titles)
+    Ok(songs)
+}
+
+/// Parse `songs=<s1,s2,...>` from CLI tokens (supporting multiple `songs=` tokens,
+/// escaped commas `\,`, and CSV-quoted fields `"..."`).
+pub fn parse_songs_kv(tokens: &[String]) -> Result<Vec<String>> {
+    if tokens.is_empty() {
+        return Err(TermusicError::InvalidArg(
+            "expected `songs=<song1,song2,...>` argument".to_string(),
+        ));
+    }
+
+    let mut groups: Vec<Vec<&str>> = Vec::new();
+    for token in tokens {
+        if token.starts_with("songs=") {
+            groups.push(vec![token.as_str()]);
+        } else if let Some(current) = groups.last_mut() {
+            current.push(token.as_str());
+        } else {
+            return Err(TermusicError::InvalidArg(
+                "expected `songs=<song1,song2,...>` argument".to_string(),
+            ));
+        }
+    }
+
+    let mut songs = Vec::new();
+    for group in groups {
+        let joined = group.join(" ");
+        let rhs = joined
+            .strip_prefix("songs=")
+            .expect("group always starts with `songs=`");
+        songs.extend(parse_songs_rhs(rhs)?);
+    }
+    Ok(songs)
+}
+
+fn validate_playlist_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(TermusicError::InvalidArg(
+            "playlist name cannot be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_song_flag_value(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(TermusicError::InvalidArg(
+            "--song value cannot be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn flush_kv_batch(batch: &mut Vec<String>, out: &mut Vec<String>) -> Result<()> {
+    if !batch.is_empty() {
+        out.extend(parse_songs_kv(batch)?);
+        batch.clear();
+    }
+    Ok(())
+}
+
+/// Extract `create` songs in exact CLI occurrence order across `-s`/`--song` and `songs=...` tokens,
+/// flushing contiguous `raw_songs` batches whenever `-s` or a non-contiguous index intervenes.
+fn extract_create_songs(sub: &ArgMatches) -> Result<Vec<String>> {
+    let mut items: Vec<(usize, CreateToken<'_>)> = Vec::new();
+
+    if let (Some(indices), Some(values)) =
+        (sub.indices_of("song"), sub.get_many::<String>("song"))
+    {
+        for (idx, val) in indices.zip(values) {
+            items.push((idx, CreateToken::Flag(val.as_str())));
+        }
+    }
+
+    if let (Some(indices), Some(values)) = (
+        sub.indices_of("raw_songs"),
+        sub.get_many::<String>("raw_songs"),
+    ) {
+        for (idx, val) in indices.zip(values) {
+            items.push((idx, CreateToken::Kv(val.as_str())));
+        }
+    }
+
+    if items.is_empty() {
+        return Err(TermusicError::InvalidArg(
+            "missing songs: pass `songs=<s1,s2,...>` or `-s <SONG>`".to_string(),
+        ));
+    }
+
+    items.sort_by_key(|(idx, _)| *idx);
+
+    let mut songs = Vec::new();
+    let mut kv_batch: Vec<String> = Vec::new();
+    let mut prev_kv_idx: Option<usize> = None;
+
+    for (idx, token) in items {
+        match token {
+            CreateToken::Flag(val) => {
+                flush_kv_batch(&mut kv_batch, &mut songs)?;
+                prev_kv_idx = None;
+                songs.push(validate_song_flag_value(val)?);
+            }
+            CreateToken::Kv(val) => {
+                if let Some(prev) = prev_kv_idx
+                    && idx != prev + 1
+                {
+                    flush_kv_batch(&mut kv_batch, &mut songs)?;
+                }
+                kv_batch.push(val.to_string());
+                prev_kv_idx = Some(idx);
+            }
+        }
+    }
+    flush_kv_batch(&mut kv_batch, &mut songs)?;
+
+    if songs.is_empty() {
+        return Err(TermusicError::InvalidArg(
+            "songs list cannot be empty".to_string(),
+        ));
+    }
+    Ok(songs)
 }
 
 /// Validate filesystem preconditions for `termusic add`:
@@ -602,19 +840,23 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         }
         RawCommand::Create {
             playlist,
+            song,
             raw_songs,
         } => {
-            let trimmed_playlist = playlist.trim();
-            if trimmed_playlist.is_empty() {
+            let playlist = validate_playlist_name(&playlist)?;
+            let mut songs = Vec::new();
+            for s in &song {
+                songs.push(validate_song_flag_value(s)?);
+            }
+            if !raw_songs.is_empty() {
+                songs.extend(parse_songs_kv(&raw_songs)?);
+            }
+            if songs.is_empty() {
                 return Err(TermusicError::InvalidArg(
-                    "playlist name cannot be empty".to_string(),
+                    "missing songs: pass `songs=<s1,s2,...>` or `-s <SONG>`".to_string(),
                 ));
             }
-            let songs = parse_songs_kv(&raw_songs)?;
-            Ok(Command::Create {
-                playlist: trimmed_playlist.to_string(),
-                songs,
-            })
+            Ok(Command::Create { playlist, songs })
         }
         RawCommand::Pause => Ok(Command::Pause),
         RawCommand::Resume => Ok(Command::Resume),
@@ -821,16 +1063,31 @@ where
     out
 }
 
+fn validate_cli_with_matches(cli: Cli, matches: &ArgMatches) -> Result<Command> {
+    if let Some(RawCommand::Create { playlist, .. }) = &cli.command {
+        let playlist = validate_playlist_name(playlist)?;
+        let sub = matches
+            .subcommand_matches("create")
+            .expect("matched RawCommand::Create must have `create` subcommand matches");
+        let songs = extract_create_songs(sub)?;
+        return Ok(Command::Create { playlist, songs });
+    }
+    validate_cli(cli)
+}
+
 /// Parse and validate CLI arguments from `std::env::args_os()`, exiting cleanly on `--help`/`--version`.
 pub fn parse_cli() -> Result<Command> {
     let args = normalize_search_args(std::env::args_os());
-    match Cli::try_parse_from(args) {
-        Ok(cli) => validate_cli(cli),
+    let matches = match Cli::command().try_get_matches_from(args) {
+        Ok(m) => m,
         Err(err) => match err.kind() {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
-            _ => Err(TermusicError::InvalidArg(err.to_string())),
+            _ => return Err(TermusicError::InvalidArg(err.to_string())),
         },
-    }
+    };
+    let cli = Cli::from_arg_matches(&matches)
+        .map_err(|err| TermusicError::InvalidArg(err.to_string()))?;
+    validate_cli_with_matches(cli, &matches)
 }
 
 /// Parse and validate CLI arguments from an arbitrary iterator (for tests).
@@ -840,9 +1097,12 @@ where
     T: Into<OsString> + Clone,
 {
     let normalized = normalize_search_args(args);
-    let cli = Cli::try_parse_from(normalized)
+    let matches = Cli::command()
+        .try_get_matches_from(normalized)
         .map_err(|err| TermusicError::InvalidArg(err.to_string()))?;
-    validate_cli(cli)
+    let cli = Cli::from_arg_matches(&matches)
+        .map_err(|err| TermusicError::InvalidArg(err.to_string()))?;
+    validate_cli_with_matches(cli, &matches)
 }
 
 /// Render clap's `-V` / `--version` string.
@@ -1322,6 +1582,394 @@ mod tests {
         assert!(parse_cli_from(["termusic", "create", "Mix", "songs= , "]).is_err());
         assert!(parse_cli_from(["termusic", "create", "Mix", "tracks=A,B"]).is_err());
         assert!(parse_cli_from(["termusic", "create", "  ", "songs=A"]).is_err());
+    }
+
+    #[test]
+    fn create_supports_escaped_commas_csv_quotes_and_multi_songs_kv() {
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r"songs=Sanctuary - Joji\, Justin Raisen,Circles",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Sanctuary - Joji, Justin Raisen".to_string(),
+                    "Circles".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", r"songs=Alpha\\,Beta"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r"Alpha\".to_string(), "Beta".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", r"songs=Alpha\\\,Beta"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r"Alpha\,Beta".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r"songs=C:\Music\Track.mp3,Circles",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r"C:\Music\Track.mp3".to_string(), "Circles".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", r#"songs="Alpha\\""#]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r"Alpha\".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", r#"songs=\"Alpha,Beta\""#]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r#""Alpha"#.to_string(), r#"Beta""#.to_string()],
+            }
+        );
+
+        // CSV-quoted items (including leading whitespace after comma and inner quotes)
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r#"songs="Sanctuary - Joji, Justin Raisen",Circles"#,
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Sanctuary - Joji, Justin Raisen".to_string(),
+                    "Circles".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r#"songs="Sanctuary - Joji, Justin Raisen", "Circles - Post Malone""#,
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Sanctuary - Joji, Justin Raisen".to_string(),
+                    "Circles - Post Malone".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r#"songs="Skrillex and Diplo - ""Where Are Ü Now"" with Justin Bieber",Circles"#,
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    r#"Skrillex and Diplo - "Where Are Ü Now" with Justin Bieber"#.to_string(),
+                    "Circles".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r#"songs="Skrillex and Diplo - \"Where Are Ü Now\" with Justin Bieber",Circles"#,
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    r#"Skrillex and Diplo - "Where Are Ü Now" with Justin Bieber"#.to_string(),
+                    "Circles".to_string(),
+                ],
+            }
+        );
+
+        // Unquoted fields with mid-title quotes remain literal
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                r#"songs=Skrillex and Diplo - "Where Are Ü Now" with Justin Bieber (Official Video),Circles"#,
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    r#"Skrillex and Diplo - "Where Are Ü Now" with Justin Bieber (Official Video)"#
+                        .to_string(),
+                    "Circles".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", r#"songs=12" Remix,Circles"#]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![r#"12" Remix"#.to_string(), "Circles".to_string()],
+            }
+        );
+
+        // Multiple `songs=` tokens (quoted and unquoted multi-token) and literal `songs=` inside a title
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "songs=Mundo - IV Of Spades",
+                "songs=After Dark - Mr.Kitty",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Mundo - IV Of Spades".to_string(),
+                    "After Dark - Mr.Kitty".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "songs=Song",
+                "One",
+                "songs=Song",
+                "Two,",
+                "Song",
+                "Three",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Song One".to_string(),
+                    "Song Two".to_string(),
+                    "Song Three".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", "songs=My songs=cool,Circles"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["My songs=cool".to_string(), "Circles".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn create_supports_repeatable_song_flag_and_interleaving() {
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "-s",
+                "Sanctuary - Joji, Justin Raisen",
+                "-s",
+                "Circles - Post Malone",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "Sanctuary - Joji, Justin Raisen".to_string(),
+                    "Circles - Post Malone".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "--song",
+                r#"Skrillex and Diplo - "Where Are Ü Now""#,
+                "-s",
+                "  After Dark  ",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    r#"Skrillex and Diplo - "Where Are Ü Now""#.to_string(),
+                    "After Dark".to_string(),
+                ],
+            }
+        );
+
+        // Interleaving -s/--song with songs= preserves exact CLI order
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "songs=Alpha,Beta",
+                "-s",
+                "Gamma",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "Mix",
+                "-s",
+                "First",
+                "songs=Second,Third",
+                "-s",
+                "Fourth",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec![
+                    "First".to_string(),
+                    "Second".to_string(),
+                    "Third".to_string(),
+                    "Fourth".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "-s",
+                "First",
+                "Mix",
+                "songs=Second",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["First".to_string(), "Second".to_string()],
+            }
+        );
+
+        // Bare '-' and hyphen-leading song titles via attached '=' or '--'
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "create",
+                "New-List",
+                "songs=Mundo",
+                "-",
+                "IV",
+                "Of",
+                "Spades,",
+                "After",
+                "Dark",
+                "-",
+                "Mr.Kitty",
+            ])
+            .unwrap(),
+            Command::Create {
+                playlist: "New-List".to_string(),
+                songs: vec![
+                    "Mundo - IV Of Spades".to_string(),
+                    "After Dark - Mr.Kitty".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", "-s=-Track", "--song=-Other"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["-Track".to_string(), "-Other".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", "-s", "-"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["-".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", "--", "songs=-Track"]).unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["-Track".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "create", "Mix", "-s", "Alpha", "--", "songs=-Beta"])
+                .unwrap(),
+            Command::Create {
+                playlist: "Mix".to_string(),
+                songs: vec!["Alpha".to_string(), "-Beta".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn create_rejects_malformed_quotes_unknown_flags_and_invalid_args() {
+        for invalid in [
+            ["termusic", "create", "Mix", r#"songs="""#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs="",Alpha"#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs=Alpha,"""#].as_slice(),
+            ["termusic", "create", "Mix", "songs=Alpha", "songs="].as_slice(),
+            ["termusic", "create", "Mix", "-s", ""].as_slice(),
+            ["termusic", "create", "Mix", "-s", "   "].as_slice(),
+            ["termusic", "create", "Mix", r#"songs="Unclosed"#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs=Alpha, "Unclosed"#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs="Alpha\""#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs="Alpha"Beta"#].as_slice(),
+            ["termusic", "create", "Mix", r#"songs="Alpha" "Beta""#].as_slice(),
+            ["termusic", "create", "Mix", "--unknown"].as_slice(),
+            ["termusic", "create", "Mix", "-x", "Alpha"].as_slice(),
+            ["termusic", "create", "Mix", "-s", "Alpha", "--unknown"].as_slice(),
+            ["termusic", "create", "Mix", "songs=Alpha", "--unknown"].as_slice(),
+            ["termusic", "create", "Mix", "-s", "--unknown"].as_slice(),
+            ["termusic", "create", "Mix", "-s", "-s", "Alpha"].as_slice(),
+            ["termusic", "create", "Mix", "Alpha"].as_slice(),
+            ["termusic", "create", "Mix", "-s", "Alpha", "Beta"].as_slice(),
+            ["termusic", "create", "Mix", "songs=Alpha", "-s", "Beta", "Gamma"].as_slice(),
+            ["termusic", "create", "Mix", "--", "-Track"].as_slice(),
+            ["termusic", "create", "Mix", "-s", "Alpha", "--", "-s", "Beta"].as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    parse_cli_from(invalid.iter().copied()),
+                    Err(TermusicError::InvalidArg(_))
+                ),
+                "expected InvalidArg for {invalid:?}"
+            );
+        }
     }
 
     #[test]

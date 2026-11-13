@@ -113,8 +113,8 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
 | `termusic next` / `prev` | Skip to next or previous track |
 | `termusic rewind [secs]` / `advance <secs>` | Seek backward (omitting `<secs>` rewinds to the beginning of the song) or forward |
-| `termusic create <name> songs=<s1,s2,...>` | Create a playlist from existing library songs |
-| `termusic delete <target>` | Remove a song or playlist from the library index (leaves files on disk untouched) |
+| `termusic create <name> [songs=<s1,s2,...>]... [-s <song>]...` | Create a playlist from existing library songs |
+| `termusic delete <target>` | Remove a song or playlist from the library index (`<target>` also accepts `"Title - Artist"` display format; leaves files on disk untouched) |
 | `termusic status` | Show current daemon playback status |
 | `termusic daemon stop` | Gracefully stop the background playback daemon |
 | `termusic version` | Print version information |
@@ -127,7 +127,7 @@ Play a song or playlist by title/name or by its 1-based index from `termusic lis
 
 | Flag / Argument | Description |
 | --- | --- |
-| `[TARGET]` | Song title, playlist name, or 1-based index from `termusic list` |
+| `[TARGET]` | Song title, `"Title - Artist"` display string (with optional `[MM:SS]`), playlist name, or 1-based index from `termusic list` |
 | `[MODE]` | Playback ordering mode: `next` (default) or `shuffle` |
 | `-i`, `--index <INDEX>` | Force strict 1-based list index lookup (cannot be combined with `[TARGET]` or `--artist`) |
 | `--song` | Force interpreting `[TARGET]` / `--index` as a song |
@@ -173,6 +173,56 @@ termusic play --playlist -i 2 shuffle
 
 # Play by title with artist disambiguation
 termusic play "Echoes" --artist "Artist Two"
+```
+
+> **Tip:** Both `termusic play` and `termusic delete` accept `"Title - Artist"` (as well as `"Artist - Title"`, `—`/`–` dashes, and optional `[MM:SS]`/`[--:--]` suffixes from `termusic list`) to disambiguate tracks with identical titles. `termusic delete` intentionally excludes substring and bare numeric index auto-matching.
+
+## `termusic create`
+
+Create a new playlist from existing library songs using `songs=<s1,s2,...>`, repeatable `-s` / `--song` flags, or a combination of both (preserving the order given on the command line).
+
+### Syntax & Options
+
+| Flag / Argument | Description |
+| --- | --- |
+| `<name>` | Name of the new playlist (must be unique in the library) |
+| `songs=<s1,s2,...>` | Comma-separated song specifiers (multiple `songs=` tokens allowed) |
+| `-s`, `--song <SONG>` | Repeatable flag taking a single literal song specifier without comma splitting (`-s=-Track` or `--song="-Track"` for titles starting with `-`) |
+
+### Escaping Commas & Quotes in `songs=`
+
+- **Escaped commas**: prefix a literal comma inside a song title or multi-artist field with `\,` (for example, `songs=Sanctuary - Joji\, Justin Raisen,Circles`).
+- **CSV double quotes**: wrap an item containing commas in `"..."` (for example, `'songs="Sanctuary - Joji, Justin Raisen",Circles'`); inside CSV quotes, represent literal `"` as `""` or `\"`.
+- **Literal `-s` / `--song`**: `-s` never splits on commas or strips inner quotes, making it the simplest choice for titles or artist credits containing commas or quotes.
+
+### Supported Song Specifiers
+
+Each entry in `songs=` or `-s` resolves against indexed library songs using:
+
+1. Exact or case-insensitive song title (e.g. `Mundo`)
+2. Display format from `termusic list` / `termusic status` (`"Title - Artist"`, `"Artist - Title"`, `-`/`–`/`—` dashes, optional leading `N. `, and optional trailing `[MM:SS]`/`[--:--]`)
+3. Exact audio filename or stem (e.g. `Mundo.mp3` or `Mundo`)
+4. 1-based index from `termusic list` (e.g. `songs=5,6`)
+5. Unique case-insensitive title substring (or `"Title - Artist"` substring when `" - "` is present)
+
+### Examples
+
+```bash
+# Create a playlist by song titles or display strings from `termusic list`
+termusic create Favorites songs="Mundo - IV Of Spades, After Dark - Mr.Kitty"
+
+# Copy-paste full `termusic list` lines including duration tags, or pass 1-based list indices
+termusic create QuickMix songs="5. Mundo - IV Of Spades [05:49], 6. After Dark - Mr.Kitty [04:19]"
+termusic create QuickMix songs=5,6
+
+# Pass multiple `songs=` tokens or escape commas inside artist credits
+termusic create NightDrive songs="Mundo - IV Of Spades" songs="After Dark - Mr.Kitty"
+termusic create Chill songs='Sanctuary - Joji\, Justin Raisen,Circles'
+termusic create Chill 'songs="Sanctuary - Joji, Justin Raisen",Circles'
+
+# Use repeatable -s / --song (commas and quotes are preserved literally)
+termusic create Mix -s "Sanctuary - Joji, Justin Raisen" -s "Circles - Post Malone"
+termusic create Mix -s "Mundo - IV Of Spades" songs=6,7 -s=-Track
 ```
 
 ## Playback & Seeking Controls
