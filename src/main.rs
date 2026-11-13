@@ -1,6 +1,6 @@
 use std::io::{BufRead, IsTerminal, Write};
 
-use termusic::cli::{Command, ListKind, PlayQuery, parse_cli};
+use termusic::cli::{AddInput, Command, ListKind, PlayQuery, parse_cli};
 use termusic::error::{Result, TermusicError};
 use termusic::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
 use termusic::library::{DeleteOutcome, Library, PlayResolution, SongCandidate};
@@ -262,20 +262,19 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Add {
-            folder,
-            playlist,
-            path,
+            input,
             playlist_name,
         } => {
             let lib_path = paths.library_path.clone();
             let summary = run_blocking(move || {
                 Library::update(&lib_path, |library| {
-                    let target_pl = if playlist {
-                        playlist_name.as_deref()
-                    } else {
-                        None
-                    };
-                    library.add_files(&path, folder, target_pl)
+                    let target_pl = playlist_name.as_deref();
+                    match input {
+                        AddInput::Path { path, folder } => {
+                            library.add_files(&path, folder, target_pl)
+                        }
+                        AddInput::Song(query) => library.add_song(&query, target_pl),
+                    }
                 })
             })
             .await?;
@@ -331,6 +330,16 @@ async fn run() -> Result<()> {
                 }
                 DeleteOutcome::Playlist(playlist) => {
                     println!("Deleted playlist '{}' from library.", playlist.name);
+                }
+                DeleteOutcome::PlaylistSong {
+                    playlist,
+                    song,
+                    index,
+                } => {
+                    println!(
+                        "Removed song '{}' (#{}) from playlist '{}' (kept in library).",
+                        song.title, index, playlist.name
+                    );
                 }
             }
             Ok(())

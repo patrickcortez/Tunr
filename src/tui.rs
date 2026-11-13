@@ -372,6 +372,19 @@ impl TuiApp {
                                     false,
                                 );
                             }
+                            DeleteOutcome::PlaylistSong {
+                                playlist,
+                                song,
+                                index,
+                            } => {
+                                self.set_message(
+                                    format!(
+                                        "Removed song '{}' (#{}) from playlist '{}'.",
+                                        song.title, index, playlist.name
+                                    ),
+                                    false,
+                                );
+                            }
                         }
                     }
                     Err(err) => {
@@ -1966,7 +1979,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
 
         let screen = terminal.backend().to_string();
-        assert!(screen.contains("Termusic v0.1.0"), "missing header title:\n{screen}");
+        assert!(screen.contains("Termusic v1.0.0"), "missing header title:\n{screen}");
         assert!(screen.contains("[Mode: Shuffle]"), "missing mode:\n{screen}");
         assert!(screen.contains("Playing"), "missing playback state:\n{screen}");
         assert!(screen.contains("[All Songs] (3)"), "missing [All Songs]:\n{screen}");

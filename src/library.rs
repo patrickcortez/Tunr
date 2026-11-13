@@ -67,6 +67,11 @@ pub struct AddSummary {
 pub enum DeleteOutcome {
     Song(Song),
     Playlist(Playlist),
+    PlaylistSong {
+        playlist: Playlist,
+        song: Song,
+        index: usize,
+    },
 }
 
 /// Disambiguation candidate describing a matching song entry in [`Library::songs`].
@@ -109,6 +114,7 @@ pub enum PlayTarget {
     Playlist {
         playlist: Playlist,
         songs: Vec<Song>,
+        start_index: Option<usize>,
     },
     Song {
         selected: Song,
@@ -120,7 +126,11 @@ impl PlayTarget {
     /// Convert into `(queue, start_index, playlist_name)` for `IpcRequest::Play`.
     pub fn into_play_parts(self) -> (Vec<Song>, Option<usize>, Option<String>) {
         match self {
-            PlayTarget::Playlist { playlist, songs } => (songs, None, Some(playlist.name)),
+            PlayTarget::Playlist {
+                playlist,
+                songs,
+                start_index,
+            } => (songs, start_index, Some(playlist.name)),
             PlayTarget::Song { queue, .. } => (queue, Some(0), None),
         }
     }
@@ -201,6 +211,52 @@ impl Library {
             .collect()
     }
 
+    /// Resolve `(raw_song_ids_pos, Song)` entries for a playlist, preserving 1-based list order
+    /// even when dangling IDs exist in `song_ids`.
+    fn resolve_playable_playlist_entries(&self, pl_idx: usize) -> Vec<(usize, Song)> {
+        self.playlists[pl_idx]
+            .song_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, id)| self.find_song_by_id(id).cloned().map(|song| (pos, song)))
+            .collect()
+    }
+
+    /// Append non-duplicate `song_ids` to an existing or newly created playlist, returning
+    /// `(canonical_playlist_name, added_count)`.
+    fn add_song_ids_to_playlist(
+        &mut self,
+        playlist_name: &str,
+        song_ids: &[String],
+    ) -> Result<(String, usize)> {
+        let pl_idx = match self.lookup_playlist(playlist_name) {
+            LookupMatch::One(idx) => idx,
+            LookupMatch::Multiple(names) => {
+                return Err(TermusicError::Ambiguous(format!(
+                    "playlist '{playlist_name}' matched multiple entries: {}",
+                    names.join(", ")
+                )));
+            }
+            LookupMatch::None => {
+                self.playlists.push(Playlist {
+                    name: playlist_name.to_string(),
+                    song_ids: Vec::new(),
+                });
+                self.playlists.len() - 1
+            }
+        };
+
+        let pl = &mut self.playlists[pl_idx];
+        let mut added = 0;
+        for song_id in song_ids {
+            if !pl.song_ids.contains(song_id) {
+                pl.song_ids.push(song_id.clone());
+                added += 1;
+            }
+        }
+        Ok((pl.name.clone(), added))
+    }
+
     /// Add a file or recursive folder (`folder = true`) to the library index,
     /// optionally appending the added/existing songs to `playlist_name`.
     pub fn add_files(
@@ -211,18 +267,7 @@ impl Library {
     ) -> Result<AddSummary> {
         validate_add_path(path, folder)?;
 
-        let clean_playlist = match playlist_name {
-            Some(name) => {
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    return Err(TermusicError::InvalidArg(
-                        "playlist name cannot be empty".to_string(),
-                    ));
-                }
-                Some(trimmed.to_string())
-            }
-            None => None,
-        };
+        let clean_playlist = normalize_playlist_name(playlist_name)?;
 
         let (candidates, walk_skipped) = collect_candidate_files(path, folder)?;
         let mut summary = AddSummary {
@@ -280,34 +325,55 @@ impl Library {
         }
 
         if let Some(pl_name) = clean_playlist {
-            let pl_idx = match self.lookup_playlist(&pl_name) {
-                LookupMatch::One(idx) => idx,
-                LookupMatch::Multiple(names) => {
-                    return Err(TermusicError::Ambiguous(format!(
-                        "playlist '{pl_name}' matched multiple entries: {}",
-                        names.join(", ")
-                    )));
-                }
-                LookupMatch::None => {
-                    self.playlists.push(Playlist {
-                        name: pl_name.clone(),
-                        song_ids: Vec::new(),
-                    });
-                    self.playlists.len() - 1
-                }
-            };
-
-            let pl = &mut self.playlists[pl_idx];
-            summary.playlist_name = Some(pl.name.clone());
-            for song_id in resolved_ids {
-                if !pl.song_ids.contains(&song_id) {
-                    pl.song_ids.push(song_id);
-                    summary.playlist_added_count += 1;
-                }
-            }
+            let (resolved_name, added) = self.add_song_ids_to_playlist(&pl_name, &resolved_ids)?;
+            summary.playlist_name = Some(resolved_name);
+            summary.playlist_added_count = added;
         }
 
         Ok(summary)
+    }
+
+    /// Add an audio file on disk (optionally to `playlist_name`), or add an existing library
+    /// song matched by `query` into `playlist_name`.
+    pub fn add_song(&mut self, query: &str, playlist_name: Option<&str>) -> Result<AddSummary> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Err(TermusicError::InvalidArg(
+                "song cannot be empty".to_string(),
+            ));
+        }
+
+        let clean_playlist = normalize_playlist_name(playlist_name)?;
+        let path = Path::new(trimmed);
+        if path.exists() {
+            return self.add_files(path, false, clean_playlist.as_deref());
+        }
+
+        if let Some(pl_name) = clean_playlist {
+            match self.resolve_create_song_match(trimmed)? {
+                LookupMatch::One(idx) => {
+                    let song_id = self.songs[idx].id.clone();
+                    let (resolved_pl, playlist_added_count) =
+                        self.add_song_ids_to_playlist(&pl_name, &[song_id])?;
+                    Ok(AddSummary {
+                        added_count: 0,
+                        existing_count: 1,
+                        playlist_name: Some(resolved_pl),
+                        playlist_added_count,
+                        ..AddSummary::default()
+                    })
+                }
+                LookupMatch::None => Err(TermusicError::NotFound(format!(
+                    "song or audio file '{trimmed}' not found"
+                ))),
+                LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
+                    "ambiguous song '{trimmed}': {} (use \"Title - Artist\" or list index)",
+                    matches.join(", ")
+                ))),
+            }
+        } else {
+            self.add_files(path, false, None)
+        }
     }
 
     /// Create a new playlist from existing song specifiers (titles, `"Title - Artist"` display
@@ -393,8 +459,10 @@ impl Library {
         Ok(playlist)
     }
 
-    /// Delete a song or playlist from the library index WITHOUT deleting audio files from disk.
-    /// Deleting a song strips its ID from every playlist.
+    /// Delete a song, playlist, or 1-based playlist entry (`<playlist>[<index>]`) from the
+    /// library index WITHOUT deleting audio files from disk.
+    /// Deleting a whole song strips its ID from every playlist; deleting a playlist entry keeps
+    /// the song in `self.songs` and leaves empty playlists intact.
     pub fn delete_target(&mut self, query: &str, kind: TargetKind) -> Result<DeleteOutcome> {
         let q = query.trim();
         if q.is_empty() {
@@ -405,7 +473,18 @@ impl Library {
 
         match kind {
             TargetKind::Song => self.delete_song_by_query(q),
-            TargetKind::Playlist => self.delete_playlist_by_query(q),
+            TargetKind::Playlist => {
+                if !matches!(self.lookup_playlist(q), LookupMatch::None) {
+                    return self.delete_playlist_by_query(q);
+                }
+                match parse_validated_bracket_index(q)? {
+                    BracketIndexLookup::Target {
+                        playlist_name,
+                        one_based_index,
+                    } => self.delete_playlist_song_by_index(playlist_name, one_based_index),
+                    BracketIndexLookup::None => self.delete_playlist_by_query(q),
+                }
+            }
             TargetKind::Auto => {
                 let song_match = self.lookup_song(q);
                 let playlist_match = self.lookup_playlist(q);
@@ -419,13 +498,19 @@ impl Library {
                     )));
                 }
                 if has_song {
-                    self.delete_song_by_query(q)
-                } else if has_playlist {
-                    self.delete_playlist_by_query(q)
-                } else {
-                    Err(TermusicError::NotFound(format!(
+                    return self.delete_song_by_query(q);
+                }
+                if has_playlist {
+                    return self.delete_playlist_by_query(q);
+                }
+                match parse_validated_bracket_index(q)? {
+                    BracketIndexLookup::Target {
+                        playlist_name,
+                        one_based_index,
+                    } => self.delete_playlist_song_by_index(playlist_name, one_based_index),
+                    BracketIndexLookup::None => Err(TermusicError::NotFound(format!(
                         "no song or playlist found matching '{q}'"
-                    )))
+                    ))),
                 }
             }
         }
@@ -490,19 +575,49 @@ impl Library {
                         "--artist cannot be used with --playlist".to_string(),
                     ));
                 }
-                self.resolve_playlist_play_target(q)
-                    .map(PlayResolution::Ready)
+                if !matches!(self.lookup_playlist(q), LookupMatch::None) {
+                    return self
+                        .resolve_playlist_play_target(q)
+                        .map(PlayResolution::Ready);
+                }
+                match parse_validated_bracket_index(q)? {
+                    BracketIndexLookup::Target {
+                        playlist_name,
+                        one_based_index,
+                    } => self
+                        .resolve_playlist_play_target_at(playlist_name, Some(one_based_index))
+                        .map(PlayResolution::Ready),
+                    BracketIndexLookup::None => self
+                        .resolve_playlist_play_target(q)
+                        .map(PlayResolution::Ready),
+                }
             }
             TargetKind::Auto => {
                 if clean_artist.is_some() {
                     return self.resolve_song_play_candidates(q, clean_artist);
                 }
+                let has_strict_song = !self
+                    .lookup_song_indices_with_tier(q, None, SongLookupMode::Strict)
+                    .0
+                    .is_empty();
+                let playlist_match = self.lookup_playlist(q);
+                let has_playlist = !matches!(playlist_match, LookupMatch::None);
+
+                if !has_strict_song
+                    && !has_playlist
+                    && let BracketIndexLookup::Target {
+                        playlist_name,
+                        one_based_index,
+                    } = parse_validated_bracket_index(q)?
+                {
+                    return self
+                        .resolve_playlist_play_target_at(playlist_name, Some(one_based_index))
+                        .map(PlayResolution::Ready);
+                }
+
                 let (song_indices, song_is_exact_title) =
                     self.lookup_song_indices_with_tier(q, None, SongLookupMode::Flexible);
-                let playlist_match = self.lookup_playlist(q);
-
                 let has_song = !song_indices.is_empty();
-                let has_playlist = !matches!(playlist_match, LookupMatch::None);
 
                 if has_song && has_playlist && song_is_exact_title {
                     return Err(TermusicError::Ambiguous(format!(
@@ -580,21 +695,14 @@ impl Library {
 
     /// Build a [`PlayTarget::Playlist`] for the playlist at 0-based `index` in `self.playlists`.
     pub fn play_target_for_playlist_index(&self, index: usize) -> Result<PlayTarget> {
-        let playlist = self.playlists.get(index).cloned().ok_or_else(|| {
-            index_out_of_bounds_error(
+        if index >= self.playlists.len() {
+            return Err(index_out_of_bounds_error(
                 "playlist",
                 self.playlists.len(),
                 &index.saturating_add(1).to_string(),
-            )
-        })?;
-        let songs = self.songs_for_playlist(&playlist);
-        if songs.is_empty() {
-            return Err(TermusicError::NotFound(format!(
-                "playlist '{}' contains no playable songs",
-                playlist.name
-            )));
+            ));
         }
-        Ok(PlayTarget::Playlist { playlist, songs })
+        self.playlist_play_target_at(index, None)
     }
 
     fn delete_song_by_query(&mut self, query: &str) -> Result<DeleteOutcome> {
@@ -610,6 +718,43 @@ impl Library {
         let idx = self.resolve_unique_playlist_index(query)?;
         let playlist = self.playlists.remove(idx);
         Ok(DeleteOutcome::Playlist(playlist))
+    }
+
+    fn delete_playlist_song_by_index(
+        &mut self,
+        playlist_query: &str,
+        one_based_index: usize,
+    ) -> Result<DeleteOutcome> {
+        if one_based_index == 0 {
+            return Err(TermusicError::InvalidArg(
+                INVALID_ONE_BASED_INDEX_MSG.to_string(),
+            ));
+        }
+        let pl_idx = self.resolve_unique_playlist_index(playlist_query)?;
+        let playable = self.resolve_playable_playlist_entries(pl_idx);
+        let pl_name = &self.playlists[pl_idx].name;
+        if playable.is_empty() {
+            return Err(TermusicError::NotFound(format!(
+                "playlist '{pl_name}' contains no songs"
+            )));
+        }
+        if one_based_index > playable.len() {
+            return Err(TermusicError::NotFound(format!(
+                "playlist '{pl_name}' track index {one_based_index} out of bounds (playlist has {} track(s))",
+                playable.len()
+            )));
+        }
+
+        let (raw_pos, song) = playable
+            .into_iter()
+            .nth(one_based_index - 1)
+            .expect("bounds checked above");
+        self.playlists[pl_idx].song_ids.remove(raw_pos);
+        Ok(DeleteOutcome::PlaylistSong {
+            playlist: self.playlists[pl_idx].clone(),
+            song,
+            index: one_based_index,
+        })
     }
 
     fn resolve_song_play_candidates(
@@ -923,8 +1068,58 @@ impl Library {
     }
 
     fn resolve_playlist_play_target(&self, query: &str) -> Result<PlayTarget> {
+        self.resolve_playlist_play_target_at(query, None)
+    }
+
+    fn resolve_playlist_play_target_at(
+        &self,
+        query: &str,
+        one_based_index: Option<usize>,
+    ) -> Result<PlayTarget> {
         let idx = self.resolve_unique_playlist_index(query)?;
-        self.play_target_for_playlist_index(idx)
+        self.playlist_play_target_at(idx, one_based_index)
+    }
+
+    fn playlist_play_target_at(
+        &self,
+        pl_idx: usize,
+        one_based_index: Option<usize>,
+    ) -> Result<PlayTarget> {
+        let playlist = self.playlists[pl_idx].clone();
+        let songs: Vec<Song> = self
+            .resolve_playable_playlist_entries(pl_idx)
+            .into_iter()
+            .map(|(_, song)| song)
+            .collect();
+        if songs.is_empty() {
+            return Err(TermusicError::NotFound(format!(
+                "playlist '{}' contains no playable songs",
+                playlist.name
+            )));
+        }
+        let start_index = match one_based_index {
+            Some(idx) => {
+                if idx == 0 {
+                    return Err(TermusicError::InvalidArg(
+                        INVALID_ONE_BASED_INDEX_MSG.to_string(),
+                    ));
+                }
+                if idx > songs.len() {
+                    return Err(TermusicError::NotFound(format!(
+                        "playlist '{}' track index {idx} out of bounds (playlist has {} track(s))",
+                        playlist.name,
+                        songs.len()
+                    )));
+                }
+                Some(idx - 1)
+            }
+            None => None,
+        };
+        Ok(PlayTarget::Playlist {
+            playlist,
+            songs,
+            start_index,
+        })
     }
 
     fn resolve_unique_song_index(&self, query: &str) -> Result<usize> {
@@ -1302,6 +1497,94 @@ fn clean_opt(value: Option<String>) -> Option<String> {
     value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn normalize_playlist_name(playlist_name: Option<&str>) -> Result<Option<String>> {
+    match playlist_name {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err(TermusicError::InvalidArg(
+                    "playlist name cannot be empty".to_string(),
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+enum PlaylistBracketIndex<'a> {
+    Index {
+        name: &'a str,
+        one_based_index: usize,
+    },
+    InvalidIndex {
+        name: &'a str,
+    },
+}
+
+enum BracketIndexLookup<'a> {
+    Target {
+        playlist_name: &'a str,
+        one_based_index: usize,
+    },
+    None,
+}
+
+/// Parse trailing `<playlist>[<index>]` bracket syntax when `[...]` is empty or numeric
+/// (`+`/`-` + ASCII digits, or all ASCII digits). Non-numeric tags return `None`.
+fn parse_playlist_bracket_index(raw: &str) -> Option<PlaylistBracketIndex<'_>> {
+    let trimmed = raw.trim();
+    let without_close = trimmed.strip_suffix(']')?;
+    let open = without_close.rfind('[')?;
+    let name = without_close[..open].trim();
+    let inside = without_close[open + 1..].trim();
+
+    let digits = inside.strip_prefix(['+', '-']).unwrap_or(inside);
+    let is_numeric = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    if !inside.is_empty() && !is_numeric {
+        return None;
+    }
+
+    match inside.parse::<usize>() {
+        Ok(one_based_index) if one_based_index >= 1 => Some(PlaylistBracketIndex::Index {
+            name,
+            one_based_index,
+        }),
+        _ => Some(PlaylistBracketIndex::InvalidIndex { name }),
+    }
+}
+
+fn invalid_bracket_index_error(name: &str) -> TermusicError {
+    if name.trim().is_empty() {
+        TermusicError::InvalidArg("playlist name cannot be empty".to_string())
+    } else {
+        TermusicError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string())
+    }
+}
+
+fn parse_validated_bracket_index(raw: &str) -> Result<BracketIndexLookup<'_>> {
+    match parse_playlist_bracket_index(raw) {
+        None => Ok(BracketIndexLookup::None),
+        Some(PlaylistBracketIndex::InvalidIndex { name }) => {
+            Err(invalid_bracket_index_error(name))
+        }
+        Some(PlaylistBracketIndex::Index {
+            name,
+            one_based_index,
+        }) => {
+            if name.trim().is_empty() {
+                return Err(TermusicError::InvalidArg(
+                    "playlist name cannot be empty".to_string(),
+                ));
+            }
+            Ok(BracketIndexLookup::Target {
+                playlist_name: name,
+                one_based_index,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1959,8 +2242,13 @@ mod tests {
             .resolve_play_target_with_artist("1", TargetKind::Playlist, None)
             .unwrap();
         match pl_res {
-            PlayResolution::Ready(PlayTarget::Playlist { playlist, songs }) => {
+            PlayResolution::Ready(PlayTarget::Playlist {
+                playlist,
+                songs,
+                start_index,
+            }) => {
                 assert_eq!(playlist.name, "Roadtrip");
+                assert_eq!(start_index, None);
                 assert_eq!(
                     songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
                     vec!["s1", "s3"]
@@ -2143,7 +2431,11 @@ mod tests {
         let pl = lib.resolve_play_index(1, TargetKind::Playlist, None).unwrap();
         assert!(matches!(
             pl,
-            PlayResolution::Ready(PlayTarget::Playlist { ref playlist, ref songs })
+            PlayResolution::Ready(PlayTarget::Playlist {
+                ref playlist,
+                ref songs,
+                start_index: None,
+            })
             if playlist.name == "1984" && songs.len() == 1 && songs[0].id == "s2"
         ));
 
@@ -2502,5 +2794,305 @@ mod tests {
             ),
             Err(TermusicError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn play_playlist_bracket_index_starts_at_track_and_preserves_literals_and_edge_cases() {
+        let lib = Library {
+            version: LIBRARY_VERSION,
+            songs: vec![
+                make_test_song("s1", "One", Some("Artist A"), "/music/one.mp3"),
+                make_test_song("s2", "Two", Some("Artist B"), "/music/two.mp3"),
+                make_test_song("s3", "Three", Some("Artist C"), "/music/three.mp3"),
+                make_test_song("s4", "Song [2024]", Some("Artist D"), "/music/song_2024.mp3"),
+                make_test_song("s5", "Song [Remix]", Some("Artist E"), "/music/song_remix.mp3"),
+            ],
+            playlists: vec![
+                Playlist {
+                    name: "MyList".to_string(),
+                    song_ids: vec![
+                        "dangling-id".to_string(),
+                        "s1".to_string(),
+                        "s2".to_string(),
+                        "s3".to_string(),
+                    ],
+                },
+                Playlist {
+                    name: "Mix [2]".to_string(),
+                    song_ids: vec!["s2".to_string(), "s3".to_string()],
+                },
+                Playlist {
+                    name: "EmptyList".to_string(),
+                    song_ids: vec!["missing-id".to_string()],
+                },
+            ],
+        };
+
+        // Both Auto and Playlist resolve 1-based track index while keeping the full playable queue.
+        for kind in [TargetKind::Auto, TargetKind::Playlist] {
+            let res = lib
+                .resolve_play_target_with_artist("mylist[2]", kind, None)
+                .unwrap();
+            match res {
+                PlayResolution::Ready(target @ PlayTarget::Playlist { .. }) => {
+                    let (queue, start_index, pl_name) = target.into_play_parts();
+                    assert_eq!(pl_name.as_deref(), Some("MyList"));
+                    assert_eq!(start_index, Some(1));
+                    assert_eq!(
+                        queue.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                        vec!["s1", "s2", "s3"]
+                    );
+                }
+                other => panic!("expected Ready playlist for {kind}, got {other:?}"),
+            }
+        }
+
+        // Invalid bracket indices return InvalidArg.
+        for bad in [
+            "MyList[0]",
+            "MyList[-1]",
+            "MyList[]",
+            "MyList[999999999999999999999999999999]",
+            "[1]",
+            "[]",
+        ] {
+            for kind in [TargetKind::Auto, TargetKind::Playlist] {
+                assert!(
+                    matches!(
+                        lib.resolve_play_target_with_artist(bad, kind, None),
+                        Err(TermusicError::InvalidArg(_))
+                    ),
+                    "expected InvalidArg for {bad} in {kind}"
+                );
+            }
+        }
+
+        // Out-of-bounds and empty playlists return NotFound.
+        let oob = lib
+            .resolve_play_target_with_artist("MyList[4]", TargetKind::Playlist, None)
+            .unwrap_err();
+        assert!(
+            matches!(oob, TermusicError::NotFound(ref msg) if msg.contains("MyList") && msg.contains("3 track(s)"))
+        );
+        let empty = lib
+            .resolve_play_target_with_artist("EmptyList[1]", TargetKind::Auto, None)
+            .unwrap_err();
+        assert!(
+            matches!(empty, TermusicError::NotFound(ref msg) if msg.contains("contains no playable songs"))
+        );
+
+        // Literal song titles with brackets and literal playlists with numeric brackets are preserved.
+        let literal_song = lib
+            .resolve_play_target_with_artist("Song [2024]", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(
+            literal_song,
+            PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "s4"
+        ));
+        let remix_song = lib
+            .resolve_play_target_with_artist("Song [Remix]", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(
+            remix_song,
+            PlayResolution::Ready(PlayTarget::Song { ref selected, .. }) if selected.id == "s5"
+        ));
+        let literal_pl = lib
+            .resolve_play_target_with_artist("Mix [2]", TargetKind::Auto, None)
+            .unwrap();
+        assert!(matches!(
+            literal_pl,
+            PlayResolution::Ready(PlayTarget::Playlist {
+                ref playlist,
+                start_index: None,
+                ..
+            }) if playlist.name == "Mix [2]"
+        ));
+
+        // --song and --artist never treat bracket syntax as playlist traversal.
+        assert!(matches!(
+            lib.resolve_play_target_with_artist("MyList[1]", TargetKind::Song, None),
+            Err(TermusicError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.resolve_play_target_with_artist("MyList[1]", TargetKind::Auto, Some("Artist A")),
+            Err(TermusicError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_playlist_song_by_bracket_index_keeps_song_disk_and_empty_playlist() {
+        let dir = temp_workspace("delete-pl-song");
+        let f1 = dir.join("First.wav");
+        let f2 = dir.join("Second.wav");
+        write_synthetic_wav(&f1, 44_100, 0.1);
+        write_synthetic_wav(&f2, 44_100, 0.1);
+
+        let mut lib = Library::default();
+        lib.add_files(&dir, true, Some("MyList")).unwrap();
+        // Prepend a dangling ID to verify 1-based indexing aligns with playable songs only.
+        lib.playlists[0].song_ids.insert(0, "dangling-id".to_string());
+        lib.playlists.push(Playlist {
+            name: "Mix [2]".to_string(),
+            song_ids: vec![lib.songs[0].id.clone()],
+        });
+        lib.playlists.push(Playlist {
+            name: "EmptyList".to_string(),
+            song_ids: vec!["missing".to_string()],
+        });
+        lib.songs.push(make_test_song(
+            "s-bracket",
+            "Title[1]",
+            Some("BracketArtist"),
+            "/music/title_bracket.mp3",
+        ));
+
+        // Delete 2nd playable track ("Second") via TargetKind::Playlist.
+        let out = lib.delete_target("MyList[2]", TargetKind::Playlist).unwrap();
+        match out {
+            DeleteOutcome::PlaylistSong {
+                playlist,
+                song,
+                index,
+            } => {
+                assert_eq!(playlist.name, "MyList");
+                assert_eq!(song.title, "Second");
+                assert_eq!(index, 2);
+            }
+            other => panic!("expected PlaylistSong outcome, got {other:?}"),
+        }
+        assert_eq!(lib.songs.len(), 3);
+        assert!(f1.exists());
+        assert!(f2.exists());
+        assert_eq!(
+            lib.playlists[0].song_ids,
+            vec!["dangling-id".to_string(), lib.songs[0].id.clone()]
+        );
+
+        // Delete remaining playable track ("First") via Auto fallback; empty playlist remains intact.
+        let out_last = lib.delete_target("mylist[1]", TargetKind::Auto).unwrap();
+        assert!(matches!(
+            out_last,
+            DeleteOutcome::PlaylistSong { ref song, index: 1, .. } if song.title == "First"
+        ));
+        assert_eq!(lib.playlists[0].name, "MyList");
+        assert_eq!(lib.playlists[0].song_ids, vec!["dangling-id".to_string()]);
+        assert!(f1.exists());
+
+        // Invalid indices, out-of-bounds, and empty playlist error as expected.
+        for bad in ["MyList[0]", "MyList[-1]", "MyList[]", "[1]"] {
+            assert!(matches!(
+                lib.delete_target(bad, TargetKind::Playlist),
+                Err(TermusicError::InvalidArg(_))
+            ));
+        }
+        assert!(matches!(
+            lib.delete_target("MyList[1]", TargetKind::Playlist),
+            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no songs")
+        ));
+        assert!(matches!(
+            lib.delete_target("EmptyList[1]", TargetKind::Auto),
+            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no songs")
+        ));
+
+        // Literal playlist "Mix [2]" deletes the whole playlist; literal song "Title[1]" deletes the song.
+        let del_pl = lib.delete_target("Mix [2]", TargetKind::Playlist).unwrap();
+        assert!(matches!(del_pl, DeleteOutcome::Playlist(ref p) if p.name == "Mix [2]"));
+        let del_song = lib.delete_target("Title[1]", TargetKind::Auto).unwrap();
+        assert!(matches!(del_song, DeleteOutcome::Song(ref s) if s.id == "s-bracket"));
+        assert!(matches!(
+            lib.delete_target("MyList[1]", TargetKind::Song),
+            Err(TermusicError::NotFound(_))
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_song_handles_files_and_existing_library_songs_with_playlists() {
+        let dir = temp_workspace("add-song");
+        let f1 = dir.join("Alpha.wav");
+        let f2 = dir.join("Beta.wav");
+        write_synthetic_wav(&f1, 44_100, 0.1);
+        write_synthetic_wav(&f2, 44_100, 0.1);
+
+        let mut lib = Library::default();
+
+        // Import audio file directly without a playlist.
+        let s1 = lib.add_song(f1.to_str().unwrap(), None).unwrap();
+        assert_eq!(s1.added_count, 1);
+        assert_eq!(s1.existing_count, 0);
+        assert_eq!(s1.playlist_name, None);
+        assert_eq!(lib.songs.len(), 1);
+
+        // Import audio file and create/add to playlist.
+        let s2 = lib.add_song(f2.to_str().unwrap(), Some("Roadtrip")).unwrap();
+        assert_eq!(s2.added_count, 1);
+        assert_eq!(s2.playlist_name.as_deref(), Some("Roadtrip"));
+        assert_eq!(s2.playlist_added_count, 1);
+        assert_eq!(lib.playlists.len(), 1);
+
+        // Add existing library song by 1-based index to existing playlist (case-insensitive) and deduplicate.
+        let by_idx = lib.add_song("1", Some("roadtrip")).unwrap();
+        assert_eq!(by_idx.added_count, 0);
+        assert_eq!(by_idx.existing_count, 1);
+        assert_eq!(by_idx.playlist_name.as_deref(), Some("Roadtrip"));
+        assert_eq!(by_idx.playlist_added_count, 1);
+        assert_eq!(lib.playlists[0].song_ids.len(), 2);
+
+        let dup = lib.add_song("Alpha", Some("Roadtrip")).unwrap();
+        assert_eq!(dup.added_count, 0);
+        assert_eq!(dup.existing_count, 1);
+        assert_eq!(dup.playlist_added_count, 0);
+        assert_eq!(lib.playlists[0].song_ids.len(), 2);
+
+        // Add by "Title - Artist" display string into a new playlist.
+        lib.songs.push(make_test_song(
+            "s-dup-1",
+            "Echoes",
+            Some("Artist One"),
+            "/music/echoes_1.mp3",
+        ));
+        lib.songs.push(make_test_song(
+            "s-dup-2",
+            "Echoes",
+            Some("Artist Two"),
+            "/music/echoes_2.mp3",
+        ));
+        let amb = lib.add_song("Echoes", Some("Chill")).unwrap_err();
+        assert!(matches!(amb, TermusicError::Ambiguous(_)));
+        assert_eq!(lib.playlists.len(), 1);
+
+        let disamb = lib.add_song("Echoes - Artist Two", Some("Chill")).unwrap();
+        assert_eq!(disamb.playlist_name.as_deref(), Some("Chill"));
+        assert_eq!(disamb.playlist_added_count, 1);
+        assert_eq!(lib.playlists[1].song_ids, vec!["s-dup-2".to_string()]);
+
+        // Error cases: empty query, empty playlist, directory path, missing file, missing song, index 0.
+        assert!(matches!(
+            lib.add_song("   ", None),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_song("Alpha", Some("   ")),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_song(dir.to_str().unwrap(), None),
+            Err(TermusicError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            lib.add_song("/nonexistent/track.wav", None),
+            Err(TermusicError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.add_song("NoSuchSong", Some("Chill")),
+            Err(TermusicError::NotFound(_))
+        ));
+        assert!(matches!(
+            lib.add_song("0", Some("Chill")),
+            Err(TermusicError::InvalidArg(_))
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -101,7 +101,7 @@ pub enum RawCommand {
 
     /// Play a song or playlist, or resume paused playback when omitted
     Play {
-        /// Song title, playlist name, or 1-based list index (omit to resume currently paused playback)
+        /// Song title, playlist name (optionally `<playlist>[<index>]` for 1-based start track), or 1-based list index (omit to resume currently paused playback)
         target: Option<String>,
         /// Playback ordering mode
         #[arg(value_enum, ignore_case = true)]
@@ -135,18 +135,20 @@ pub enum RawCommand {
         loop_playback: Option<bool>,
     },
 
-    /// Add an audio file or folder of audio files to the library
+    /// Add an audio file, folder, or existing library song to the library and/or a playlist
     Add {
         /// Recursively scan a folder for supported audio files
-        #[arg(short = 'f', long = "folder")]
+        #[arg(short = 'f', long = "folder", conflicts_with = "song")]
         folder: bool,
-        /// Add imported song(s) to the named playlist (creating it if absent)
-        #[arg(short = 'p', long = "playlist")]
-        playlist: bool,
-        /// Path to audio file (or directory when -f is set)
-        path: PathBuf,
-        /// Target playlist name (required when -p is set)
+        /// Audio file path to import, or existing library song when `-p` is set
+        #[arg(short = 's', long = "song", value_name = "SONG")]
+        song: Option<String>,
+        /// Target playlist name (created if absent)
+        #[arg(short = 'p', long = "playlist", value_name = "PLAYLIST")]
         playlist_name: Option<String>,
+        /// Path to audio file (or directory when `-f` is set)
+        #[arg(value_name = "PATH", conflicts_with = "song")]
+        path: Option<PathBuf>,
     },
 
     /// Skip to the next track
@@ -167,15 +169,15 @@ pub enum RawCommand {
         seconds: f64,
     },
 
-    /// Remove a song or playlist from the library index (never deletes audio files on disk)
+    /// Remove a song, playlist, or indexed playlist entry (`-p <playlist>[<index>]`) from the library index (never deletes audio files on disk)
     Delete {
-        /// Song title or playlist name
+        /// Song title, playlist name, or `<playlist>[<index>]` (1-based playlist track)
         target: String,
         /// Force deleting a song
-        #[arg(long, conflicts_with = "playlist")]
+        #[arg(short = 's', long, conflicts_with = "playlist")]
         song: bool,
-        /// Force deleting a playlist
-        #[arg(long, conflicts_with = "song")]
+        /// Force deleting a playlist (or a 1-based entry via `<playlist>[<index>]`)
+        #[arg(short = 'p', long, conflicts_with = "song")]
         playlist: bool,
     },
 
@@ -332,6 +334,13 @@ pub enum DaemonAction {
     Stop,
 }
 
+/// Source input for `termusic add`: a filesystem path or a `-s <SONG>` query/path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddInput {
+    Path { path: PathBuf, folder: bool },
+    Song(String),
+}
+
 /// Validated application command ready for dispatch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -348,9 +357,7 @@ pub enum Command {
         loop_playback: bool,
     },
     Add {
-        folder: bool,
-        playlist: bool,
-        path: PathBuf,
+        input: AddInput,
         playlist_name: Option<String>,
     },
     Next,
@@ -570,24 +577,20 @@ pub fn parse_songs_kv(tokens: &[String]) -> Result<Vec<String>> {
     Ok(songs)
 }
 
-fn validate_playlist_name(raw: &str) -> Result<String> {
+fn trim_non_empty(raw: &str, empty_msg: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(TermusicError::InvalidArg(
-            "playlist name cannot be empty".to_string(),
-        ));
+        return Err(TermusicError::InvalidArg(empty_msg.to_string()));
     }
     Ok(trimmed.to_string())
 }
 
+fn validate_playlist_name(raw: &str) -> Result<String> {
+    trim_non_empty(raw, "playlist name cannot be empty")
+}
+
 fn validate_song_flag_value(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(TermusicError::InvalidArg(
-            "--song value cannot be empty".to_string(),
-        ));
-    }
-    Ok(trimmed.to_string())
+    trim_non_empty(raw, "--song value cannot be empty")
 }
 
 fn flush_kv_batch(batch: &mut Vec<String>, out: &mut Vec<String>) -> Result<()> {
@@ -792,31 +795,42 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         }
         RawCommand::Add {
             folder,
-            playlist,
-            path,
+            song,
             playlist_name,
+            path,
         } => {
-            if playlist {
-                let Some(name) = playlist_name.as_deref().map(str::trim) else {
+            let clean_playlist = playlist_name
+                .as_deref()
+                .map(validate_playlist_name)
+                .transpose()?;
+            let input = match (song, path) {
+                (Some(raw_song), None) => {
+                    AddInput::Song(trim_non_empty(&raw_song, "song cannot be empty")?)
+                }
+                (None, Some(path)) => {
+                    if path.as_os_str().is_empty()
+                        || path.to_str().is_some_and(|s| s.trim().is_empty())
+                    {
+                        return Err(TermusicError::InvalidArg(
+                            "add path cannot be empty".to_string(),
+                        ));
+                    }
+                    AddInput::Path { path, folder }
+                }
+                (Some(_), Some(_)) => {
                     return Err(TermusicError::InvalidArg(
-                        "`-p` requires a `<playlist-name>` argument".to_string(),
-                    ));
-                };
-                if name.is_empty() {
-                    return Err(TermusicError::InvalidArg(
-                        "playlist name cannot be empty".to_string(),
+                        "cannot specify both `--song` and `<PATH>`".to_string(),
                     ));
                 }
-            } else if playlist_name.is_some() {
-                return Err(TermusicError::InvalidArg(
-                    "unexpected `<playlist-name>` argument without `-p`".to_string(),
-                ));
-            }
+                (None, None) => {
+                    return Err(TermusicError::InvalidArg(
+                        "provide a song via `-s <SONG>` or a path `<PATH>`".to_string(),
+                    ));
+                }
+            };
             Ok(Command::Add {
-                folder,
-                playlist,
-                path,
-                playlist_name: playlist_name.map(|s| s.trim().to_string()),
+                input,
+                playlist_name: clean_playlist,
             })
         }
         RawCommand::Next => Ok(Command::Next),
@@ -1128,10 +1142,10 @@ mod tests {
             parse_cli_from(["termusic", "version"]).unwrap(),
             Command::Version
         );
-        assert_eq!(rendered_version().trim(), "termusic 0.1.0");
+        assert_eq!(rendered_version().trim(), "termusic 1.0.0");
         let err = Cli::try_parse_from(["termusic", "-V"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
-        assert_eq!(err.to_string().trim(), "termusic 0.1.0");
+        assert_eq!(err.to_string().trim(), "termusic 1.0.0");
     }
 
     #[test]
@@ -1209,6 +1223,40 @@ mod tests {
                 loop_playback: false,
             }
         );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyList[2]"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyList[2]".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: false,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyList[2]", "shuffle"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyList[2]".to_string()),
+                mode: PlayMode::Shuffle,
+                kind: TargetKind::Auto,
+                artist: None,
+                loop_playback: false,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "play", "MyList[2]", "--playlist"]).unwrap(),
+            Command::Play {
+                query: PlayQuery::Text("MyList[2]".to_string()),
+                mode: PlayMode::Next,
+                kind: TargetKind::Playlist,
+                artist: None,
+                loop_playback: false,
+            }
+        );
+        assert!(matches!(
+            parse_cli_from(["termusic", "play", "-i", "2", "MyList[1]"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
         assert!(parse_cli_from(["termusic", "play", "--song"]).is_err());
         assert!(parse_cli_from(["termusic", "play", "--playlist"]).is_err());
         assert!(matches!(
@@ -1416,55 +1464,118 @@ mod tests {
         assert_eq!(
             parse_cli_from(["termusic", "add", "song.mp3"]).unwrap(),
             Command::Add {
-                folder: false,
-                playlist: false,
-                path: PathBuf::from("song.mp3"),
+                input: AddInput::Path {
+                    path: PathBuf::from("song.mp3"),
+                    folder: false,
+                },
                 playlist_name: None,
             }
         );
         assert_eq!(
             parse_cli_from(["termusic", "add", "-f", "./music"]).unwrap(),
             Command::Add {
-                folder: true,
-                playlist: false,
-                path: PathBuf::from("./music"),
+                input: AddInput::Path {
+                    path: PathBuf::from("./music"),
+                    folder: true,
+                },
                 playlist_name: None,
             }
         );
         assert_eq!(
-            parse_cli_from(["termusic", "add", "-p", "song.mp3", "Favorites"]).unwrap(),
+            parse_cli_from(["termusic", "add", "-p", "Favorites", "song.mp3"]).unwrap(),
             Command::Add {
-                folder: false,
-                playlist: true,
-                path: PathBuf::from("song.mp3"),
+                input: AddInput::Path {
+                    path: PathBuf::from("song.mp3"),
+                    folder: false,
+                },
                 playlist_name: Some("Favorites".to_string()),
             }
         );
         assert_eq!(
-            parse_cli_from(["termusic", "add", "-fp", "./music", "Roadtrip"]).unwrap(),
+            parse_cli_from(["termusic", "add", "song.mp3", "-p", "  Favorites  "]).unwrap(),
             Command::Add {
-                folder: true,
-                playlist: true,
-                path: PathBuf::from("./music"),
+                input: AddInput::Path {
+                    path: PathBuf::from("song.mp3"),
+                    folder: false,
+                },
+                playlist_name: Some("Favorites".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "add", "-fp", "Roadtrip", "./music"]).unwrap(),
+            Command::Add {
+                input: AddInput::Path {
+                    path: PathBuf::from("./music"),
+                    folder: true,
+                },
+                playlist_name: Some("Roadtrip".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "add",
+                "--folder",
+                "./music",
+                "--playlist",
+                "Roadtrip",
+            ])
+            .unwrap(),
+            Command::Add {
+                input: AddInput::Path {
+                    path: PathBuf::from("./music"),
+                    folder: true,
+                },
+                playlist_name: Some("Roadtrip".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "add", "-s", "song.mp3"]).unwrap(),
+            Command::Add {
+                input: AddInput::Song("song.mp3".to_string()),
+                playlist_name: None,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "add", "-s", "  My Song  ", "-p", "Favorites"]).unwrap(),
+            Command::Add {
+                input: AddInput::Song("My Song".to_string()),
+                playlist_name: Some("Favorites".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "add", "--playlist", " Roadtrip ", "--song", "1"]).unwrap(),
+            Command::Add {
+                input: AddInput::Song("1".to_string()),
                 playlist_name: Some("Roadtrip".to_string()),
             }
         );
 
-        // -p without playlist name must fail
-        assert!(matches!(
-            parse_cli_from(["termusic", "add", "-p", "song.mp3"]),
-            Err(TermusicError::InvalidArg(_))
-        ));
-        // empty playlist name must fail
-        assert!(matches!(
-            parse_cli_from(["termusic", "add", "-p", "song.mp3", "  "]),
-            Err(TermusicError::InvalidArg(_))
-        ));
-        // playlist name without -p must fail
-        assert!(matches!(
-            parse_cli_from(["termusic", "add", "song.mp3", "Favorites"]),
-            Err(TermusicError::InvalidArg(_))
-        ));
+        for invalid in [
+            ["termusic", "add"].as_slice(),
+            ["termusic", "add", "-f"].as_slice(),
+            ["termusic", "add", "-p", "Favorites"].as_slice(),
+            ["termusic", "add", "-s", ""].as_slice(),
+            ["termusic", "add", "-s", "   "].as_slice(),
+            ["termusic", "add", "-s", "song.mp3", "-p", ""].as_slice(),
+            ["termusic", "add", "-s", "song.mp3", "-p", "   "].as_slice(),
+            ["termusic", "add", "song.mp3", "-p", "   "].as_slice(),
+            ["termusic", "add", ""].as_slice(),
+            ["termusic", "add", "   "].as_slice(),
+            ["termusic", "add", "-f", "-s", "song.mp3"].as_slice(),
+            ["termusic", "add", "song.mp3", "-s", "other.mp3"].as_slice(),
+            ["termusic", "add", "-s", "other.mp3", "song.mp3"].as_slice(),
+            ["termusic", "add", "song.mp3", "Favorites"].as_slice(),
+            ["termusic", "add", "-p", "Favorites", "song.mp3", "Extra"].as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    parse_cli_from(invalid.iter().copied()),
+                    Err(TermusicError::InvalidArg(_))
+                ),
+                "expected InvalidArg for {invalid:?}"
+            );
+        }
 
         // Filesystem validation for -f vs non--f
         let tmp = std::env::temp_dir().join(format!("termusic-cli-test-{}", uuid::Uuid::new_v4()));
@@ -1534,14 +1645,56 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_cli_from(["termusic", "delete", "-s", "Chill"]).unwrap(),
+            Command::Delete {
+                target: "Chill".to_string(),
+                kind: TargetKind::Song,
+            }
+        );
+        assert_eq!(
             parse_cli_from(["termusic", "delete", "Chill", "--playlist"]).unwrap(),
             Command::Delete {
                 target: "Chill".to_string(),
                 kind: TargetKind::Playlist,
             }
         );
-        assert!(parse_cli_from(["termusic", "delete", "Chill", "--song", "--playlist"]).is_err());
-        assert!(parse_cli_from(["termusic", "delete", ""]).is_err());
+        assert_eq!(
+            parse_cli_from(["termusic", "delete", "-p", "Chill"]).unwrap(),
+            Command::Delete {
+                target: "Chill".to_string(),
+                kind: TargetKind::Playlist,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "delete", "-p", "MyList[2]"]).unwrap(),
+            Command::Delete {
+                target: "MyList[2]".to_string(),
+                kind: TargetKind::Playlist,
+            }
+        );
+        assert_eq!(
+            parse_cli_from(["termusic", "delete", "MyList[2]"]).unwrap(),
+            Command::Delete {
+                target: "MyList[2]".to_string(),
+                kind: TargetKind::Auto,
+            }
+        );
+
+        for invalid in [
+            ["termusic", "delete", "Chill", "--song", "--playlist"].as_slice(),
+            ["termusic", "delete", "-s", "-p", "Chill"].as_slice(),
+            ["termusic", "delete", ""].as_slice(),
+            ["termusic", "delete", "   "].as_slice(),
+            ["termusic", "delete", "-p"].as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    parse_cli_from(invalid.iter().copied()),
+                    Err(TermusicError::InvalidArg(_))
+                ),
+                "expected InvalidArg for {invalid:?}"
+            );
+        }
     }
 
     #[test]

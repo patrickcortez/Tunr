@@ -1,6 +1,6 @@
 [package]
 name = "termusic"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Command-line music player with interactive TUI"
 

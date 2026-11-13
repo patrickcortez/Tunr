@@ -107,31 +107,70 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic tui` (or `termusic`) | Launch the interactive player TUI |
 | `termusic search [OPTIONS] [QUERY...]` | Search supported providers via `yt-dlp`, copy URLs, or download tracks/videos |
 | `termusic download [OPTIONS] <URL...>` | Download media via `yt-dlp` and auto-index audio tracks into the library |
-| `termusic add [-f] [-p] <path> [playlist]` | Add an audio file or directory (`-f`) to the library (and optionally a playlist `-p`) |
+| `termusic add [-p <PLAYLIST>] [-f] [<PATH> \| -s <SONG>]` | Add an audio file, folder (`-f`), or existing library song (`-s` with `-p`) to the library and/or a playlist |
 | `termusic list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
-| `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song or playlist by name or 1-based `list` index, or resume paused playback when omitted |
+| `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song, playlist, `<playlist>[<index>]` (1-based start track), or 1-based `list` index, or resume paused playback when omitted |
 | `termusic pause` / `resume` / `stop` | Control daemon playback |
 | `termusic next` / `prev` | Skip to next or previous track |
 | `termusic rewind [secs]` / `advance <secs>` | Seek backward (omitting `<secs>` rewinds to the beginning of the song) or forward |
 | `termusic create <name> [songs=<s1,s2,...>]... [-s <song>]...` | Create a playlist from existing library songs |
-| `termusic delete <target>` | Remove a song or playlist from the library index (`<target>` also accepts `"Title - Artist"` display format; leaves files on disk untouched) |
+| `termusic delete [-s \| -p] <target>` | Remove a song or playlist from the library index (`-p MyList[<index>]` removes only that track from `MyList`; leaves files on disk untouched) |
 | `termusic status` | Show current daemon playback status |
 | `termusic daemon stop` | Gracefully stop the background playback daemon |
 | `termusic version` | Print version information |
 
-## `termusic play`
+## `termusic add`
 
-Play a song or playlist by title/name or by its 1-based index from `termusic list`, or omit all arguments to resume paused playback.
+Import an audio file or directory into the library index, or add a file or existing library song to a playlist (creating the playlist if it does not exist).
 
 ### Options
 
 | Flag / Argument | Description |
 | --- | --- |
-| `[TARGET]` | Song title, `"Title - Artist"` display string (with optional `[MM:SS]`), playlist name, or 1-based index from `termusic list` |
+| `[PATH]` | Path to an audio file (or a directory when `-f` / `--folder` is set). Conflicts with `-s` / `--song` |
+| `-f`, `--folder` | Recursively scan `<PATH>` as a directory for supported audio files. Conflicts with `-s` / `--song` |
+| `-s`, `--song <SONG>` | Audio file path to import, or (when `-p` / `--playlist` is set) an existing library song specified by title, `"Title - Artist"` display string, filename/stem, 1-based `termusic list` index, or unique substring. Conflicts with `<PATH>` and `-f` |
+| `-p`, `--playlist <PLAYLIST>` | Target playlist name (created automatically if absent; duplicate song IDs are skipped) |
+
+### Behavior
+
+- **`-s` / `--song <SONG>`**: If `<SONG>` exists on disk, `termusic` imports it as an audio file (and adds it to `<PLAYLIST>` if `-p` is provided). Otherwise, when `-p <PLAYLIST>` is provided, `<SONG>` is matched against existing library songs using the same specifiers as `termusic create` and appended to `<PLAYLIST>`.
+- **`-p` / `--playlist <PLAYLIST>`**: Accepts `<PLAYLIST>` directly as its flag argument (so flags can appear in any order, such as `termusic add -p Favorites ~/Music/track.mp3` or `termusic add -fp Favorites ~/Music/Album`).
+
+### Examples
+
+```bash
+# Import a single audio file into the library
+termusic add ~/Music/track.mp3
+termusic add -s ~/Music/track.mp3
+
+# Import a file and add it to a playlist (created automatically if absent)
+termusic add ~/Music/track.mp3 -p Favorites
+termusic add -p Favorites -s ~/Music/track.mp3
+
+# Recursively import all supported audio files from a folder (and add to a playlist)
+termusic add -f ~/Music/Album
+termusic add -fp "Road Trip" ~/Music/Album
+
+# Add an existing library song to a playlist by title, display string, or 1-based list index
+termusic add -s "Mundo" -p Favorites
+termusic add -s "Mundo - IV Of Spades" -p Favorites
+termusic add -p Favorites -s 5
+```
+
+## `termusic play`
+
+Play a song, playlist, or `<playlist>[<index>]` track by title/name or by its 1-based index from `termusic list`, or omit all arguments to resume paused playback.
+
+### Options
+
+| Flag / Argument | Description |
+| --- | --- |
+| `[TARGET]` | Song title, `"Title - Artist"` display string (with optional `[MM:SS]`), playlist name, `<playlist>[<index>]` (e.g., `'MyList[2]'`), or 1-based index from `termusic list` |
 | `[MODE]` | Playback ordering mode: `next` (default) or `shuffle` |
 | `-i`, `--index <INDEX>` | Force strict 1-based list index lookup (cannot be combined with `[TARGET]` or `--artist`) |
 | `--song` | Force interpreting `[TARGET]` / `--index` as a song |
-| `--playlist` | Force interpreting `[TARGET]` / `--index` as a playlist |
+| `--playlist` | Force interpreting `[TARGET]` / `--index` as a playlist (also accepts `<playlist>[<index>]`) |
 | `--artist <ARTIST>` | Disambiguate song title matches by artist name |
 | `-l`, `--loop <BOOL>` | Loop back to the first song after the last song finishes (`true`/`false`, defaults to `false`) |
 
@@ -140,6 +179,13 @@ Play a song or playlist by title/name or by its 1-based index from `termusic lis
 - **Positional integers** (such as `termusic play 3` or `termusic play --playlist 2`) resolve **index-first** when `1 <= N <= len`.
 - If a positional integer exceeds the list length (for example, playing a song literally titled `"1984"` in a smaller library), `termusic` checks for an exact title or playlist name match before reporting an out-of-bounds error.
 - **`-i` / `--index <INDEX>`** always performs strict 1-based index lookup with no title or playlist fallback.
+
+### Playlist Track Traversal (`<playlist>[<index>]`)
+
+- Append `[<index>]` to a playlist name (for example, `termusic play 'MyList[2]'`) to start playback at the 1-based `<index>` track within that playlist (matching the track numbering in `termusic list`, where `MyList[1]` is the first playable song).
+- **Full queue preserved**: Playback keeps all tracks of `<playlist>` in the active queue. In default `next` mode, `termusic next`, `termusic prev`, and `-l` / `--loop` traverse the entire playlist starting from `<index>`; in `shuffle` mode (`termusic play 'MyList[2]' shuffle`), `<index>` is pinned as the first track played and the remaining tracks are shuffled after it.
+- Non-numeric bracket suffixes (such as `[Remix]` or `[2024]`) and literal playlist/song names continue to match normally. `[0]`, negative indices, or empty `[]` return an invalid-argument error, and out-of-range indices return a not-found error.
+- **Shell quoting**: In `zsh` and other shells that expand `[` and `]` as glob patterns, quote the target (for example, `termusic play 'MyList[2]'` or `termusic play "MyList[2]"`).
 
 ### Loop Behavior (`-l` / `--loop`)
 
@@ -159,6 +205,11 @@ termusic play 3 shuffle
 
 # Play playlist #2 from `termusic list`
 termusic play --playlist 2
+
+# Start playing a playlist from 1-based track #2 (keeps full queue for next/prev/loop)
+termusic play 'MyList[2]'
+termusic play 'MyList[2]' shuffle
+termusic play --playlist 'MyList[2]' --loop true
 
 # Play a playlist or song index and loop back to track 1 when it finishes
 termusic play MyPlaylist --loop true
@@ -223,6 +274,45 @@ termusic create Chill 'songs="Sanctuary - Joji, Justin Raisen",Circles'
 # Use repeatable -s / --song (commas and quotes are preserved literally)
 termusic create Mix -s "Sanctuary - Joji, Justin Raisen" -s "Circles - Post Malone"
 termusic create Mix -s "Mundo - IV Of Spades" songs=6,7 -s=-Track
+```
+
+## `termusic delete`
+
+Remove a song or playlist from the library index, or remove a single track entry from a playlist. **Audio files on disk are never deleted.**
+
+### Options
+
+| Flag / Argument | Description |
+| --- | --- |
+| `<TARGET>` | Song specifier (title or `"Title - Artist"` display string), playlist name, or `<playlist>[<index>]` |
+| `-s`, `--song` | Force interpreting `<TARGET>` as a library song (removes the song from the library index and strips it from all playlists). Conflicts with `-p` / `--playlist` |
+| `-p`, `--playlist` | Force interpreting `<TARGET>` as a playlist name or `<playlist>[<index>]` entry. Conflicts with `-s` / `--song` |
+
+### Behavior
+
+- **Bare auto-detection**: Without `-s` or `-p`, `termusic delete <target>` checks literal song and playlist matches first (returning an ambiguity error if both match, which you can disambiguate with `-s` or `-p`). If neither matches literally and `<target>` uses `<playlist>[<index>]`, it removes that track entry from the playlist.
+- **Strict song matching**: Song lookups match exact/case-insensitive titles and `"Title - Artist"` / `"Artist - Title"` display strings (with `-`/`–`/`—` dashes and optional `[MM:SS]`/`[--:--]` suffixes), intentionally excluding substring and bare numeric index auto-matching.
+- **Removing a track from a playlist (`delete -p 'MyList[<index>]'`)**:
+  - `<index>` is the 1-based track position within `MyList` (matching `termusic list`).
+  - Removes **only** that track entry from `MyList` — the song stays in your library index and on disk, and `MyList` remains intact even if its last song is removed.
+  - Quote `'MyList[2]'` in shells such as `zsh` where `[` and `]` are glob characters.
+
+### Examples
+
+```bash
+# Auto-detect whether <target> is a song or playlist
+termusic delete "Echoes"
+termusic delete "Echoes - Artist Two"
+
+# Explicitly delete a song from the library index (and strip it from all playlists)
+termusic delete -s "Echoes"
+
+# Explicitly delete a playlist (songs remain in the library)
+termusic delete -p Favorites
+
+# Remove only track #2 from MyList (keeps the song in the library and on disk)
+termusic delete -p 'MyList[2]'
+termusic delete 'MyList[2]'
 ```
 
 ## Playback & Seeking Controls
