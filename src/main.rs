@@ -3,7 +3,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use tunr::cli::{AddInput, Command, ListKind, PlayQuery, parse_cli};
 use tunr::error::{Result, TunrError};
 use tunr::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
-use tunr::library::{DeleteOutcome, Library, PlayResolution, SongCandidate};
+use tunr::library::{DeleteOutcome, Library, PlayResolution, SongCandidate, UpdateSummary};
 use tunr::paths::{self, AppPaths};
 use tunr::{daemon, download, download_tui, search, search_tui, tui};
 
@@ -327,6 +327,40 @@ async fn run() -> Result<()> {
             print_playback_status(&status);
             Ok(())
         }
+        Command::Volume { level } => match level {
+            Some(vol) => {
+                let p = paths.clone();
+                run_blocking(move || paths::set_workspace_volume(&p, vol)).await?;
+                match ipc::send_request(&paths, &IpcRequest::SetVolume(vol)).await {
+                    Ok(status) => {
+                        println!("Volume: {}%", status.volume);
+                        Ok(())
+                    }
+                    Err(TunrError::Ipc(_)) => {
+                        println!("Volume: {vol}%");
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            None => match ipc::send_request(&paths, &IpcRequest::GetStatus).await {
+                Ok(status) => {
+                    println!("Volume: {}%", status.volume);
+                    Ok(())
+                }
+                Err(TunrError::Ipc(_)) => {
+                    let p = paths.clone();
+                    let vol = run_blocking(move || {
+                        let cfg = paths::load_workspace_config(&p)?;
+                        Ok(paths::effective_volume(&cfg))
+                    })
+                    .await?;
+                    println!("Volume: {vol}%");
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+        },
         Command::Delete { target, kind } => {
             let lib_path = paths.library_path.clone();
             let outcome = run_blocking(move || {
@@ -411,6 +445,14 @@ async fn run() -> Result<()> {
             print_library_list(&library, kind);
             Ok(())
         }
+        Command::Update => {
+            let summary = run_blocking(move || execute_workspace_update(&paths)).await?;
+            println!("{}", format_update_summary(&summary));
+            for skipped in summary.skipped_files {
+                eprintln!("warning: skipped {skipped}");
+            }
+            Ok(())
+        }
         Command::Download(opts) => {
             let opts_for_plan = opts.clone();
             let plan =
@@ -467,6 +509,31 @@ async fn run() -> Result<()> {
     }
 }
 
+fn execute_workspace_update(paths: &AppPaths) -> Result<UpdateSummary> {
+    let cfg = paths::load_workspace_config(paths)?;
+    Library::update_workspace(
+        &paths.library_path,
+        &paths.working_dir,
+        &cfg.config_dir,
+        &cfg.playlists_dir,
+        cfg.download_dest.as_deref(),
+    )
+}
+
+fn format_update_summary(summary: &UpdateSummary) -> String {
+    if summary.added_count == 0 && summary.relinked_count == 0 && summary.removed_count == 0 {
+        format!("Library is up to date ({} song(s)).", summary.unchanged_count)
+    } else {
+        format!(
+            "Updated library: {} added, {} relinked, {} removed ({} unchanged).",
+            summary.added_count,
+            summary.relinked_count,
+            summary.removed_count,
+            summary.unchanged_count,
+        )
+    }
+}
+
 fn print_playback_status(status: &PlaybackStatus) {
     let text = format_playback_status(status);
     println!("{text}");
@@ -474,7 +541,10 @@ fn print_playback_status(status: &PlaybackStatus) {
 
 fn format_playback_status(status: &PlaybackStatus) -> String {
     if status.state == PlaybackState::Stopped || status.current_track.is_none() {
-        return format!("State: {} [mode: {}]", status.state, status.mode);
+        return format!(
+            "State: {} [mode: {} | vol: {}%]",
+            status.state, status.mode, status.volume
+        );
     }
 
     let track = status.current_track.as_ref().expect("checked above");
@@ -500,7 +570,7 @@ fn format_playback_status(status: &PlaybackStatus) -> String {
         .unwrap_or_else(|| "--:--".to_string());
 
     format!(
-        "[{}] {}{} ({}/{}) {} / {} [mode: {}{}{}]",
+        "[{}] {}{} ({}/{}) {} / {} [mode: {}{}{} | vol: {}%]",
         status.state,
         track.title,
         artist,
@@ -511,6 +581,7 @@ fn format_playback_status(status: &PlaybackStatus) -> String {
         status.mode,
         playlist,
         loop_label,
+        status.volume,
     )
 }
 
@@ -850,6 +921,7 @@ Playlists (0):
             mode: PlayMode::Next,
             playlist_name: None,
             loop_playback: false,
+            volume: 50,
             current_track: Some(track.clone()),
             queue_index: 0,
             queue_len: 2,
@@ -860,7 +932,7 @@ Playlists (0):
 
         assert_eq!(
             format_playback_status(&base),
-            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next]"
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | vol: 50%]"
         );
 
         let loop_no_playlist = PlaybackStatus {
@@ -869,7 +941,7 @@ Playlists (0):
         };
         assert_eq!(
             format_playback_status(&loop_no_playlist),
-            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | loop: on]"
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | loop: on | vol: 50%]"
         );
 
         let no_loop_with_playlist = PlaybackStatus {
@@ -879,28 +951,180 @@ Playlists (0):
         };
         assert_eq!(
             format_playback_status(&no_loop_with_playlist),
-            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix]"
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix | vol: 50%]"
         );
 
         let loop_with_playlist = PlaybackStatus {
             playlist_name: Some("Mix".to_string()),
             loop_playback: true,
+            volume: 80,
             ..base.clone()
         };
         assert_eq!(
             format_playback_status(&loop_with_playlist),
-            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix | loop: on]"
+            "[playing] First Track - Artist One (1/2) 00:15 / 02:05 [mode: next | playlist: Mix | loop: on | vol: 80%]"
         );
 
         let stopped = PlaybackStatus {
             state: PlaybackState::Stopped,
             loop_playback: true,
+            volume: 35,
             current_track: None,
             ..base
         };
         assert_eq!(
             format_playback_status(&stopped),
-            "State: stopped [mode: next]"
+            "State: stopped [mode: next | vol: 35%]"
         );
+    }
+
+    struct TempWorkspaceGuard {
+        root: PathBuf,
+    }
+
+    impl TempWorkspaceGuard {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "tunr-main-test-{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+    }
+
+    impl Drop for TempWorkspaceGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_test_wav(path: &std::path::Path, sample_rate: u32, duration_secs: f64) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let channels: u16 = 1;
+        let bits_per_sample: u16 = 16;
+        let num_frames = (sample_rate as f64 * duration_secs).round() as u32;
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_size = num_frames * u32::from(block_align);
+        let riff_chunk_size = 36 + data_size;
+
+        let mut buf = Vec::with_capacity((44 + data_size) as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&riff_chunk_size.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&channels.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&block_align.to_le_bytes());
+        buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_size.to_le_bytes());
+        for i in 0..num_frames {
+            let t = i as f32 / sample_rate as f32;
+            let sample = ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25 * i16::MAX as f32)
+                as i16;
+            buf.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn format_update_summary_distinguishes_up_to_date_and_changed_runs() {
+        let up_to_date = UpdateSummary {
+            added_count: 0,
+            relinked_count: 0,
+            removed_count: 0,
+            unchanged_count: 4,
+            skipped_files: Vec::new(),
+        };
+        assert_eq!(
+            format_update_summary(&up_to_date),
+            "Library is up to date (4 song(s))."
+        );
+
+        let changed = UpdateSummary {
+            added_count: 2,
+            relinked_count: 1,
+            removed_count: 3,
+            unchanged_count: 5,
+            skipped_files: vec!["bad.wav: invalid".to_string()],
+        };
+        assert_eq!(
+            format_update_summary(&changed),
+            "Updated library: 2 added, 1 relinked, 3 removed (5 unchanged)."
+        );
+    }
+
+    #[test]
+    fn execute_workspace_update_reconciles_initialized_workspace() {
+        let guard = TempWorkspaceGuard::new("update");
+        let xdg_dir = guard.root.join("xdg");
+        let ws_dir = guard.root.join("ws");
+        let runtime_dir = guard.root.join("run");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let cfg = paths::initialize_workspace_with_env(
+            &ws_dir,
+            &guard.root,
+            Some(xdg_dir.into_os_string()),
+            None,
+        )
+        .unwrap();
+        let paths = AppPaths::from_roots(&cfg.working_dir, &runtime_dir);
+        Library::update(&paths.library_path, |_| Ok(())).unwrap();
+
+        let track_a = cfg.music_dir.join("TrackA.wav");
+        let track_b = cfg.music_dir.join("TrackB.wav");
+        write_test_wav(&track_a, 22_050, 0.25);
+        write_test_wav(&track_b, 22_050, 0.30);
+
+        let first = execute_workspace_update(&paths).unwrap();
+        assert_eq!(first.added_count, 2);
+        assert_eq!(first.relinked_count, 0);
+        assert_eq!(first.removed_count, 0);
+        assert_eq!(first.unchanged_count, 0);
+        assert_eq!(
+            format_update_summary(&first),
+            "Updated library: 2 added, 0 relinked, 0 removed (0 unchanged)."
+        );
+
+        // Second run with no filesystem changes reports up-to-date.
+        let second = execute_workspace_update(&paths).unwrap();
+        assert_eq!(second.added_count, 0);
+        assert_eq!(second.relinked_count, 0);
+        assert_eq!(second.removed_count, 0);
+        assert_eq!(second.unchanged_count, 2);
+        assert_eq!(
+            format_update_summary(&second),
+            "Library is up to date (2 song(s))."
+        );
+
+        // Move TrackA into a subdirectory and delete TrackB.
+        let moved_a = cfg.music_dir.join("Archive").join("TrackA.wav");
+        std::fs::create_dir_all(moved_a.parent().unwrap()).unwrap();
+        std::fs::rename(&track_a, &moved_a).unwrap();
+        std::fs::remove_file(&track_b).unwrap();
+
+        let third = execute_workspace_update(&paths).unwrap();
+        assert_eq!(third.added_count, 0);
+        assert_eq!(third.relinked_count, 1);
+        assert_eq!(third.removed_count, 1);
+        assert_eq!(third.unchanged_count, 0);
+        assert_eq!(
+            format_update_summary(&third),
+            "Updated library: 0 added, 1 relinked, 1 removed (0 unchanged)."
+        );
+
+        let lib = Library::load(&paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 1);
+        assert_eq!(lib.songs[0].path, std::fs::canonicalize(&moved_a).unwrap());
     }
 }

@@ -59,6 +59,72 @@ pub trait AudioSink: Send {
     fn close(&mut self);
 }
 
+const MAX_VOLUME: u8 = 100;
+
+/// Map a `[0, 100]` volume percentage to a perceptual cubic linear amplitude gain in `[0.0, 1.0]`.
+pub fn volume_to_gain(volume: u8) -> f32 {
+    if volume == 0 {
+        0.0
+    } else if volume >= MAX_VOLUME {
+        1.0
+    } else {
+        (f32::from(volume) / f32::from(MAX_VOLUME)).powi(3)
+    }
+}
+
+/// Scale interleaved `f32` PCM samples from `src` into `dst` with optional per-frame linear gain
+/// ramping from `start_gain` toward `target_gain` over `ramp_frames` frames, returning the final
+/// gain reached at the end of the chunk.
+pub fn scale_pcm_f32_ramped(
+    src: &[f32],
+    dst: &mut Vec<f32>,
+    channels: usize,
+    start_gain: f32,
+    target_gain: f32,
+    ramp_frames: usize,
+) -> f32 {
+    dst.resize(src.len(), 0.0);
+    if src.is_empty() || channels == 0 {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = s * target_gain;
+        }
+        return target_gain;
+    }
+
+    let total_frames = src.len() / channels;
+    if total_frames == 0 || (start_gain - target_gain).abs() <= f32::EPSILON || ramp_frames == 0 {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = s * target_gain;
+        }
+        return target_gain;
+    }
+
+    let steps = total_frames.min(ramp_frames);
+    let delta = target_gain - start_gain;
+    let ramp_denom = ramp_frames as f32;
+
+    for frame_idx in 0..steps {
+        let t = (frame_idx + 1) as f32 / ramp_denom;
+        let gain = start_gain + delta * t;
+        let start = frame_idx * channels;
+        let end = start + channels;
+        for (d, &s) in dst[start..end].iter_mut().zip(&src[start..end]) {
+            *d = s * gain;
+        }
+    }
+
+    let rem_start = steps * channels;
+    for (d, &s) in dst[rem_start..].iter_mut().zip(&src[rem_start..]) {
+        *d = s * target_gain;
+    }
+
+    if total_frames < ramp_frames {
+        start_gain + delta * (steps as f32 / ramp_denom)
+    } else {
+        target_gain
+    }
+}
+
 /// Construct the platform default [`AudioSink`], honoring `TUNR_AUDIO_BACKEND`
 /// (`auto`, `null`, `pulse`; platform-specific backends such as `aaudio`, `wasapi`, and
 /// `audioqueue` are reported explicitly until implemented).
@@ -791,5 +857,90 @@ mod tests {
             with_performer.resolved_artist().as_deref(),
             Some("Session Performer")
         );
+    }
+
+    #[test]
+    fn volume_to_gain_maps_cubic_curve_and_clamps() {
+        assert_eq!(volume_to_gain(0), 0.0);
+        assert!((volume_to_gain(50) - 0.125).abs() < 1e-6);
+        assert_eq!(volume_to_gain(100), 1.0);
+        assert_eq!(volume_to_gain(101), 1.0);
+        assert_eq!(volume_to_gain(255), 1.0);
+
+        let mut prev = volume_to_gain(0);
+        for vol in 1..=100 {
+            let g = volume_to_gain(vol);
+            assert!(
+                g > prev,
+                "volume_to_gain must strictly increase on 0..=100 (vol={vol}: {g} <= {prev})"
+            );
+            prev = g;
+        }
+        for vol in 101..=255 {
+            assert_eq!(volume_to_gain(vol), 1.0);
+        }
+    }
+
+    #[test]
+    fn scale_pcm_f32_ramped_handles_empty_and_steady_state() {
+        let mut dst = vec![99.0; 8];
+        let gain = scale_pcm_f32_ramped(&[], &mut dst, 2, 0.25, 0.75, 16);
+        assert!(dst.is_empty());
+        assert_eq!(gain, 0.75);
+
+        // Steady-state when start == target.
+        let src = [1.0, -0.5, 0.25, -1.0];
+        let gain = scale_pcm_f32_ramped(&src, &mut dst, 2, 0.5, 0.5, 10);
+        assert_eq!(gain, 0.5);
+        assert_eq!(dst, vec![0.5, -0.25, 0.125, -0.5]);
+
+        // Steady-state when ramp_frames == 0.
+        let gain = scale_pcm_f32_ramped(&src, &mut dst, 2, 1.0, 0.25, 0);
+        assert_eq!(gain, 0.25);
+        assert_eq!(dst, vec![0.25, -0.125, 0.0625, -0.25]);
+
+        // Zero silence.
+        let gain = scale_pcm_f32_ramped(&src, &mut dst, 2, 0.0, 0.0, 4);
+        assert_eq!(gain, 0.0);
+        assert_eq!(dst, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn scale_pcm_f32_ramped_completes_ramp_within_chunk() {
+        // 6 stereo frames, ramp over 4 frames from 0.0 to 1.0.
+        let src = [1.0; 12];
+        let mut dst = Vec::new();
+        let final_gain = scale_pcm_f32_ramped(&src, &mut dst, 2, 0.0, 1.0, 4);
+        assert_eq!(final_gain, 1.0);
+
+        let expected = [
+            0.25, 0.25, // frame 0
+            0.50, 0.50, // frame 1
+            0.75, 0.75, // frame 2
+            1.00, 1.00, // frame 3
+            1.00, 1.00, // frame 4 (tail)
+            1.00, 1.00, // frame 5 (tail)
+        ];
+        assert_eq!(dst.len(), expected.len());
+        for (a, b) in dst.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {a}, expected {b}");
+        }
+    }
+
+    #[test]
+    fn scale_pcm_f32_ramped_continues_across_short_chunks() {
+        // Total ramp = 4 frames from 0.0 to 1.0, split across two 2-frame stereo chunks.
+        let src1 = [1.0, -1.0, 1.0, -1.0];
+        let mut dst1 = Vec::new();
+        let gain_after_1 = scale_pcm_f32_ramped(&src1, &mut dst1, 2, 0.0, 1.0, 4);
+        assert!((gain_after_1 - 0.5).abs() < 1e-6, "got {gain_after_1}");
+        assert_eq!(dst1, vec![0.25, -0.25, 0.5, -0.5]);
+
+        // Second chunk finishes the remaining 2 frames of the 4-frame ramp.
+        let src2 = [1.0, -1.0, 1.0, -1.0];
+        let mut dst2 = Vec::new();
+        let gain_after_2 = scale_pcm_f32_ramped(&src2, &mut dst2, 2, gain_after_1, 1.0, 2);
+        assert_eq!(gain_after_2, 1.0);
+        assert_eq!(dst2, vec![0.75, -0.75, 1.0, -1.0]);
     }
 }

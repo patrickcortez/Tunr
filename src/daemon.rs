@@ -74,7 +74,7 @@ where
     };
 
     let startup_paths = paths.clone();
-    let (_daemon_lock, sink): (paths::FileLock, Box<dyn AudioSink>) =
+    let (_daemon_lock, sink, initial_volume): (paths::FileLock, Box<dyn AudioSink>, u8) =
         tokio::task::spawn_blocking(move || {
         startup_paths.ensure_dirs()?;
 
@@ -87,12 +87,16 @@ where
         };
 
         prepare_daemon_files(&startup_paths)?;
+        let initial_volume = crate::paths::load_workspace_config(&startup_paths)
+            .ok()
+            .map(|cfg| crate::paths::effective_volume(&cfg))
+            .unwrap_or(crate::paths::DEFAULT_VOLUME);
         let sink = make_sink()?;
         fs::write(
             &startup_paths.pid_path,
             format!("{}\n", std::process::id()),
         )?;
-        Ok((daemon_lock, sink))
+        Ok((daemon_lock, sink, initial_volume))
     })
     .await
     .map_err(|err| TunrError::Async(format!("daemon startup task failed: {err}")))??;
@@ -109,7 +113,7 @@ where
         pid_path: paths.pid_path.clone(),
     };
 
-    let (engine, engine_thread) = player::spawn_engine(sink)?;
+    let (engine, engine_thread) = player::spawn_engine_with_volume(sink, initial_volume)?;
 
     if let Some(tx) = ready_tx {
         let _ = tx.send(());
@@ -373,6 +377,7 @@ fn map_ipc_to_engine_command(req: IpcRequest) -> EngineCommand {
         IpcRequest::SeekAbsolute(target) => EngineCommand::SeekAbsolute(target),
         IpcRequest::TogglePause => EngineCommand::TogglePause,
         IpcRequest::SetPaused(paused) => EngineCommand::SetPaused(paused),
+        IpcRequest::SetVolume(vol) => EngineCommand::SetVolume(vol),
         IpcRequest::Stop => EngineCommand::Stop,
         IpcRequest::GetStatus => EngineCommand::GetStatus,
         IpcRequest::Shutdown => EngineCommand::Shutdown,
@@ -900,6 +905,110 @@ mod tests {
         let stopped = ipc::send_request(&paths, &IpcRequest::Stop).await.unwrap();
         assert_eq!(stopped.state, PlaybackState::Stopped);
         assert!(!stopped.loop_playback);
+
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_defaults_volume_without_config_and_updates_via_ipc() {
+        let dir = temp_workspace("volume-default");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+        assert!(!paths.config_path.exists());
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let daemon_paths = paths.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&daemon_paths, Box::new(NullSink::new()), Some(ready_tx), None)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("daemon should signal readiness")
+            .unwrap();
+
+        let initial = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(initial.volume, crate::paths::DEFAULT_VOLUME);
+        assert_eq!(initial.volume, 50);
+
+        let updated = ipc::send_request(&paths, &IpcRequest::SetVolume(25))
+            .await
+            .unwrap();
+        assert_eq!(updated.volume, 25);
+
+        let polled = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(polled.volume, 25);
+
+        let err = ipc::send_request(&paths, &IpcRequest::SetVolume(101))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TunrError::Daemon(_)));
+
+        let still_25 = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(still_25.volume, 25);
+
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_loads_volume_from_workspace_config() {
+        let dir = temp_workspace("volume-config");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+        let cfg = crate::paths::WorkspaceConfig {
+            version: crate::paths::WORKSPACE_CONFIG_VERSION,
+            working_dir: paths.working_dir.clone(),
+            config_dir: paths.working_dir.join("config"),
+            playlists_dir: paths.playlists_dir.clone(),
+            music_dir: paths.music_dir.clone(),
+            download_dest: None,
+            search_limit: None,
+            search_provider: None,
+            search_format: None,
+            volume: Some(75),
+        };
+        fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        fs::write(&paths.config_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let daemon_paths = paths.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&daemon_paths, Box::new(NullSink::new()), Some(ready_tx), None)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("daemon should signal readiness")
+            .unwrap();
+
+        let initial = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(initial.volume, 75);
+
+        let updated = ipc::send_request(&paths, &IpcRequest::SetVolume(25))
+            .await
+            .unwrap();
+        assert_eq!(updated.volume, 25);
+
+        let polled = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(polled.volume, 25);
 
         ipc::send_request(&paths, &IpcRequest::Shutdown)
             .await

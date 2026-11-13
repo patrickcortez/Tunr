@@ -27,6 +27,7 @@ pub enum EngineCommand {
     SeekAbsolute(f64),
     TogglePause,
     SetPaused(bool),
+    SetVolume(u8),
     Stop,
     GetStatus,
     Shutdown,
@@ -96,11 +97,28 @@ pub struct PlaybackEngine {
     duration_secs: Option<f64>,
     pending_pcm: Vec<f32>,
     pending_pos: f64,
+    volume: u8,
+    applied_gain: f32,
+    scaled_pcm: Vec<f32>,
+}
+
+fn normalize_initial_volume(initial_volume: u8) -> u8 {
+    if initial_volume <= crate::paths::MAX_VOLUME {
+        initial_volume
+    } else {
+        crate::paths::DEFAULT_VOLUME
+    }
 }
 
 impl PlaybackEngine {
-    /// Create a new idle engine wrapping `sink`.
+    /// Create a new idle engine wrapping `sink` with the default volume.
     pub fn new(sink: Box<dyn AudioSink>) -> Self {
+        Self::with_volume(sink, crate::paths::DEFAULT_VOLUME)
+    }
+
+    /// Create a new idle engine wrapping `sink` initialized to `initial_volume`.
+    pub fn with_volume(sink: Box<dyn AudioSink>, initial_volume: u8) -> Self {
+        let volume = normalize_initial_volume(initial_volume);
         Self {
             sink,
             open_spec: None,
@@ -119,6 +137,9 @@ impl PlaybackEngine {
             duration_secs: None,
             pending_pcm: Vec::new(),
             pending_pos: 0.0,
+            volume,
+            applied_gain: crate::audio::volume_to_gain(volume),
+            scaled_pcm: Vec::new(),
         }
     }
 
@@ -136,6 +157,7 @@ impl PlaybackEngine {
                 position_secs: 0.0,
                 duration_secs: None,
                 queue: Vec::new(),
+                volume: self.volume,
             };
         }
 
@@ -152,6 +174,7 @@ impl PlaybackEngine {
             position_secs: self.position_secs,
             duration_secs: self.duration_secs,
             queue: self.cached_ordered_queue.clone(),
+            volume: self.volume,
         }
     }
 
@@ -193,6 +216,7 @@ impl PlaybackEngine {
             EngineCommand::SeekAbsolute(target) => self.seek_absolute(target),
             EngineCommand::TogglePause => self.toggle_pause(),
             EngineCommand::SetPaused(paused) => self.set_paused(paused),
+            EngineCommand::SetVolume(vol) => self.set_volume(vol),
             EngineCommand::Stop => self.stop(),
             EngineCommand::GetStatus => Ok(()),
             EngineCommand::Shutdown => {
@@ -203,6 +227,15 @@ impl PlaybackEngine {
 
         let result = outcome.map(|()| self.status());
         (result, keep_running)
+    }
+
+    fn set_volume(&mut self, volume: u8) -> Result<()> {
+        let valid = crate::paths::validate_volume(volume)?;
+        self.volume = valid;
+        if self.state != PlaybackState::Playing {
+            self.applied_gain = crate::audio::volume_to_gain(valid);
+        }
+        Ok(())
     }
 
     fn load_queue(
@@ -232,6 +265,7 @@ impl PlaybackEngine {
             self.stop_clean_on_sink_error();
             return Err(err);
         }
+        self.applied_gain = crate::audio::volume_to_gain(self.volume);
 
         self.duration_secs = track.duration_secs().or(first_song.duration_secs);
         self.cached_ordered_queue = active_order
@@ -304,6 +338,7 @@ impl PlaybackEngine {
             (track, duration_secs)
         };
         let next_spec = (track.sample_rate(), track.channels());
+        let prev_spec = self.open_spec;
 
         self.pending_pcm.clear();
         self.pending_pos = 0.0;
@@ -316,6 +351,9 @@ impl PlaybackEngine {
         if let Err(err) = self.ensure_sink_spec(next_spec.0, next_spec.1) {
             self.stop_clean_on_sink_error();
             return Err(err);
+        }
+        if flush_before_switch || prev_spec != Some(next_spec) {
+            self.applied_gain = crate::audio::volume_to_gain(self.volume);
         }
 
         if let Some(orig_idx) = push_history {
@@ -351,6 +389,7 @@ impl PlaybackEngine {
                     if self.open_spec.is_some() {
                         self.sink.flush()?;
                     }
+                    self.applied_gain = crate::audio::volume_to_gain(self.volume);
                     return self.advance_or_stop_on_end(false);
                 }
             } else {
@@ -359,6 +398,7 @@ impl PlaybackEngine {
                 if self.open_spec.is_some() {
                     self.sink.flush()?;
                 }
+                self.applied_gain = crate::audio::volume_to_gain(self.volume);
 
                 let seek_res = self
                     .track
@@ -422,6 +462,7 @@ impl PlaybackEngine {
         if self.open_spec.is_some() {
             self.sink.flush()?;
         }
+        self.applied_gain = crate::audio::volume_to_gain(self.volume);
 
         let actual = self
             .track
@@ -455,6 +496,7 @@ impl PlaybackEngine {
                 if self.open_spec.is_some() {
                     self.sink.flush()?;
                 }
+                self.applied_gain = crate::audio::volume_to_gain(self.volume);
                 self.pending_pcm.clear();
                 self.pending_pos = 0.0;
                 self.paused_position = self.position_secs;
@@ -556,6 +598,7 @@ impl PlaybackEngine {
         self.position_secs = 0.0;
         self.paused_position = 0.0;
         self.state = PlaybackState::Stopped;
+        self.applied_gain = crate::audio::volume_to_gain(self.volume);
     }
 }
 
@@ -619,15 +662,28 @@ fn drain_pending_commands(
     }
 }
 
-/// Spawn the audio playback engine on a dedicated OS thread (`tunr-engine`), returning an
-/// async [`EngineHandle`] and thread [`std::thread::JoinHandle`].
+/// Spawn the audio playback engine on a dedicated OS thread (`tunr-engine`) with the default
+/// volume, returning an async [`EngineHandle`] and thread [`std::thread::JoinHandle`].
 pub fn spawn_engine(sink: Box<dyn AudioSink>) -> Result<(EngineHandle, std::thread::JoinHandle<()>)> {
+    spawn_engine_with_volume(sink, crate::paths::DEFAULT_VOLUME)
+}
+
+/// Spawn the audio playback engine on a dedicated OS thread (`tunr-engine`) initialized to
+/// `initial_volume`, returning an async [`EngineHandle`] and thread [`std::thread::JoinHandle`].
+pub fn spawn_engine_with_volume(
+    sink: Box<dyn AudioSink>,
+    initial_volume: u8,
+) -> Result<(EngineHandle, std::thread::JoinHandle<()>)> {
+    let initial_volume = normalize_initial_volume(initial_volume);
     let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
-    let (status_tx, status_rx) = watch::channel(Arc::new(PlaybackStatus::default()));
+    let (status_tx, status_rx) = watch::channel(Arc::new(PlaybackStatus {
+        volume: initial_volume,
+        ..PlaybackStatus::default()
+    }));
 
     let handle = std::thread::Builder::new()
         .name("tunr-engine".to_string())
-        .spawn(move || run_engine(sink, cmd_rx, status_tx))
+        .spawn(move || run_engine_with_volume(sink, cmd_rx, status_tx, initial_volume))
         .map_err(|err| {
             TunrError::Daemon(format!("failed to spawn audio engine thread: {err}"))
         })?;
@@ -635,8 +691,8 @@ pub fn spawn_engine(sink: Box<dyn AudioSink>) -> Result<(EngineHandle, std::thre
     Ok((EngineHandle::new(cmd_tx, status_rx), handle))
 }
 
-/// Run the audio engine loop on the current dedicated OS thread until [`EngineCommand::Shutdown`]
-/// or command channel disconnect.
+/// Run the audio engine loop on the current dedicated OS thread with the default volume until
+/// [`EngineCommand::Shutdown`] or command channel disconnect.
 ///
 /// Must run outside a Tokio runtime thread because it invokes `cmd_rx.blocking_recv()`,
 /// synchronous Symphonia I/O/decoding, and blocking [`AudioSink`] writes.
@@ -646,10 +702,19 @@ pub fn spawn_engine(sink: Box<dyn AudioSink>) -> Result<(EngineHandle, std::thre
 /// `cmd_rx.blocking_recv()` with zero busy-spinning.
 pub fn run_engine(
     sink: Box<dyn AudioSink>,
-    mut cmd_rx: mpsc::Receiver<EngineRequest>,
+    cmd_rx: mpsc::Receiver<EngineRequest>,
     status_tx: watch::Sender<Arc<PlaybackStatus>>,
 ) {
-    let mut engine = PlaybackEngine::new(sink);
+    run_engine_with_volume(sink, cmd_rx, status_tx, crate::paths::DEFAULT_VOLUME);
+}
+
+fn run_engine_with_volume(
+    sink: Box<dyn AudioSink>,
+    mut cmd_rx: mpsc::Receiver<EngineRequest>,
+    status_tx: watch::Sender<Arc<PlaybackStatus>>,
+    initial_volume: u8,
+) {
+    let mut engine = PlaybackEngine::with_volume(sink, initial_volume);
     publish_status(&status_tx, engine.status());
 
     loop {
@@ -736,7 +801,29 @@ pub fn run_engine(
             continue;
         }
 
-        if let Err(err) = engine.sink.write_f32(&engine.pending_pcm) {
+        let target_gain = crate::audio::volume_to_gain(engine.volume);
+        let write_result = if engine.volume == crate::paths::MAX_VOLUME
+            && (engine.applied_gain - 1.0).abs() <= f32::EPSILON
+        {
+            engine.sink.write_f32(&engine.pending_pcm)
+        } else {
+            let ramp_frames = (sample_rate / 100).max(1) as usize;
+            let next_gain = crate::audio::scale_pcm_f32_ramped(
+                &engine.pending_pcm,
+                &mut engine.scaled_pcm,
+                usize::from(channels.max(1)),
+                engine.applied_gain,
+                target_gain,
+                ramp_frames,
+            );
+            let res = engine.sink.write_f32(&engine.scaled_pcm);
+            if res.is_ok() {
+                engine.applied_gain = next_gain;
+            }
+            res
+        };
+
+        if let Err(err) = write_result {
             eprintln!("audio sink write error: {err}");
             engine.stop_clean_on_sink_error();
             publish_status(&status_tx, engine.status());
@@ -1630,6 +1717,275 @@ mod tests {
 
         handle.send(EngineCommand::Shutdown).await.unwrap();
         join_engine(join_handle).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct RecordingSink {
+        samples: Arc<std::sync::Mutex<Vec<f32>>>,
+        open: bool,
+    }
+
+    impl RecordingSink {
+        fn new() -> (Self, Arc<std::sync::Mutex<Vec<f32>>>) {
+            let samples = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    samples: Arc::clone(&samples),
+                    open: false,
+                },
+                samples,
+            )
+        }
+    }
+
+    impl AudioSink for RecordingSink {
+        fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
+            if sample_rate == 0 || channels == 0 {
+                return Err(TunrError::Audio("invalid audio spec".to_string()));
+            }
+            self.open = true;
+            Ok(())
+        }
+
+        fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
+            if !self.open {
+                return Err(TunrError::Audio("sink is not open".to_string()));
+            }
+            self.samples.lock().unwrap().extend_from_slice(samples);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn close(&mut self) {
+            self.open = false;
+        }
+    }
+
+    #[test]
+    fn volume_defaults_to_fifty_and_set_volume_validates_and_persists_across_states() {
+        let dir = temp_workspace("volume-states");
+        let songs = vec![
+            make_song(&dir, "VolA", 44_100, 1, 0.5),
+            make_song(&dir, "VolB", 44_100, 1, 0.5),
+        ];
+
+        // Default engine volume is 50 (DEFAULT_VOLUME).
+        let mut engine = PlaybackEngine::new(Box::new(NullSink::new()));
+        assert_eq!(engine.status().volume, crate::paths::DEFAULT_VOLUME);
+        assert_eq!(engine.status().volume, 50);
+        assert!((engine.applied_gain - crate::audio::volume_to_gain(50)).abs() <= f32::EPSILON);
+
+        // Out-of-range initial_volume falls back to DEFAULT_VOLUME.
+        let clamped_engine =
+            PlaybackEngine::with_volume(Box::new(NullSink::new()), crate::paths::MAX_VOLUME + 1);
+        assert_eq!(clamped_engine.status().volume, crate::paths::DEFAULT_VOLUME);
+
+        // Invalid SetVolume(101) fails and leaves volume unchanged.
+        let err = engine.execute(EngineCommand::SetVolume(101)).0.unwrap_err();
+        assert!(matches!(err, TunrError::InvalidArg(_)));
+        assert_eq!(engine.status().volume, 50);
+
+        // SetVolume while Stopped updates volume and snaps applied_gain.
+        let stopped_vol = engine.execute(EngineCommand::SetVolume(30)).0.unwrap();
+        assert_eq!(stopped_vol.state, PlaybackState::Stopped);
+        assert_eq!(stopped_vol.volume, 30);
+        assert!((engine.applied_gain - crate::audio::volume_to_gain(30)).abs() <= f32::EPSILON);
+
+        // LoadQueue preserves volume.
+        let playing = engine
+            .execute(EngineCommand::LoadQueue {
+                queue: songs,
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .0
+            .unwrap();
+        assert_eq!(playing.state, PlaybackState::Playing);
+        assert_eq!(playing.volume, 30);
+
+        // SetVolume while Playing updates status volume without snapping applied_gain.
+        let pre_playing_gain = engine.applied_gain;
+        let playing_vol = engine.execute(EngineCommand::SetVolume(80)).0.unwrap();
+        assert_eq!(playing_vol.state, PlaybackState::Playing);
+        assert_eq!(playing_vol.volume, 80);
+        assert!((engine.applied_gain - pre_playing_gain).abs() <= f32::EPSILON);
+
+        // SetVolume while Paused updates volume and snaps applied_gain.
+        let paused = engine.execute(EngineCommand::SetPaused(true)).0.unwrap();
+        assert_eq!(paused.state, PlaybackState::Paused);
+        let paused_vol = engine.execute(EngineCommand::SetVolume(40)).0.unwrap();
+        assert_eq!(paused_vol.state, PlaybackState::Paused);
+        assert_eq!(paused_vol.volume, 40);
+        assert!((engine.applied_gain - crate::audio::volume_to_gain(40)).abs() <= f32::EPSILON);
+
+        // Track switch (Next) and Stop preserve volume.
+        let switched = engine.execute(EngineCommand::Next).0.unwrap();
+        assert_eq!(switched.state, PlaybackState::Playing);
+        assert_eq!(switched.queue_index, 1);
+        assert_eq!(switched.volume, 40);
+
+        let stopped = engine.execute(EngineCommand::Stop).0.unwrap();
+        assert_eq!(stopped.state, PlaybackState::Stopped);
+        assert_eq!(stopped.volume, 40);
+        assert!((engine.applied_gain - crate::audio::volume_to_gain(40)).abs() <= f32::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_engine_with_volume_initializes_status_and_updates_while_playing() {
+        let dir = temp_workspace("spawn-volume");
+        let song = make_song(&dir, "PlayVol", 44_100, 1, 1.5);
+
+        let sink = NullSink::with_pacing(Duration::from_millis(8));
+        let (handle, join_handle) = spawn_engine_with_volume(Box::new(sink), 65).unwrap();
+        assert_eq!(handle.status().volume, 65);
+
+        let loaded = handle
+            .send(EngineCommand::LoadQueue {
+                queue: vec![song],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(loaded.state, PlaybackState::Playing);
+        assert_eq!(loaded.volume, 65);
+
+        let updated = handle.send(EngineCommand::SetVolume(25)).await.unwrap();
+        assert_eq!(updated.state, PlaybackState::Playing);
+        assert_eq!(updated.volume, 25);
+        assert_eq!(handle.status().volume, 25);
+
+        let err = handle.send(EngineCommand::SetVolume(101)).await.unwrap_err();
+        assert!(matches!(err, TunrError::InvalidArg(_)));
+        assert_eq!(handle.status().volume, 25);
+
+        let stopped = handle.send(EngineCommand::Stop).await.unwrap();
+        assert_eq!(stopped.state, PlaybackState::Stopped);
+        assert_eq!(stopped.volume, 25);
+
+        handle.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(join_handle).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn volume_scaling_outputs_zero_eighth_and_passthrough_with_unchanged_sample_count() {
+        let dir = temp_workspace("volume-scaling");
+        let song = make_song(&dir, "ScaleTone", 44_100, 1, 0.1);
+        let expected_samples = 4_410usize;
+
+        // Volume 100: passthrough reference samples.
+        let (sink_100, recorded_100) = RecordingSink::new();
+        let (h100, j100) = spawn_engine_with_volume(Box::new(sink_100), 100).unwrap();
+        h100.send(EngineCommand::LoadQueue {
+            queue: vec![song.clone()],
+            start_index: Some(0),
+            mode: PlayMode::Next,
+            playlist_name: None,
+            loop_playback: false,
+        })
+        .await
+        .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            h100.status().state == PlaybackState::Stopped
+        })
+        .await;
+        h100.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(j100).await;
+
+        let baseline = recorded_100.lock().unwrap().clone();
+        assert_eq!(baseline.len(), expected_samples);
+        assert!(baseline.iter().any(|&s| s.abs() > 0.01));
+
+        // Volume 50: 0.5^3 = 0.125x amplitude scaling.
+        let (sink_50, recorded_50) = RecordingSink::new();
+        let (h50, j50) = spawn_engine_with_volume(Box::new(sink_50), 50).unwrap();
+        h50.send(EngineCommand::LoadQueue {
+            queue: vec![song.clone()],
+            start_index: Some(0),
+            mode: PlayMode::Next,
+            playlist_name: None,
+            loop_playback: false,
+        })
+        .await
+        .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            h50.status().state == PlaybackState::Stopped
+        })
+        .await;
+        h50.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(j50).await;
+
+        let half = recorded_50.lock().unwrap().clone();
+        assert_eq!(half.len(), baseline.len());
+        for (actual, orig) in half.iter().zip(&baseline) {
+            assert!(
+                (actual - orig * 0.125).abs() <= 1e-6,
+                "expected {} (0.125 * {}), got {}",
+                orig * 0.125,
+                orig,
+                actual
+            );
+        }
+
+        // Volume 0: 0.0 samples and unchanged NullSink sample count so pacing/position stay accurate.
+        let (sink_0, recorded_0) = RecordingSink::new();
+        let (h0, j0) = spawn_engine_with_volume(Box::new(sink_0), 0).unwrap();
+        h0.send(EngineCommand::LoadQueue {
+            queue: vec![song.clone()],
+            start_index: Some(0),
+            mode: PlayMode::Next,
+            playlist_name: None,
+            loop_playback: false,
+        })
+        .await
+        .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            h0.status().state == PlaybackState::Stopped
+        })
+        .await;
+        h0.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(j0).await;
+
+        let muted = recorded_0.lock().unwrap().clone();
+        assert_eq!(muted.len(), baseline.len());
+        assert!(muted.iter().all(|&s| s == 0.0));
+
+        let null_sink = NullSink::new();
+        let null_stats = null_sink.stats();
+        let (h_null, j_null) = spawn_engine_with_volume(Box::new(null_sink), 0).unwrap();
+        h_null
+            .send(EngineCommand::LoadQueue {
+                queue: vec![song],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            h_null.status().state == PlaybackState::Stopped
+        })
+        .await;
+        assert_eq!(null_stats.written_samples(), expected_samples as u64);
+        assert!(null_stats.write_calls() > 0);
+        h_null.send(EngineCommand::Shutdown).await.unwrap();
+        join_engine(j_null).await;
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

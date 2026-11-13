@@ -32,6 +32,8 @@ pub struct DaemonOverrides {
     #[arg(long, hide = true)]
     pub library_path: Option<PathBuf>,
     #[arg(long, hide = true)]
+    pub config_path: Option<PathBuf>,
+    #[arg(long, hide = true)]
     pub socket_path: Option<String>,
     #[arg(long, hide = true)]
     pub pid_path: Option<PathBuf>,
@@ -52,6 +54,9 @@ impl DaemonOverrides {
             let run_root = pid_path.parent().unwrap_or_else(|| Path::new("."));
             let mut paths = AppPaths::from_roots(data_root, run_root);
             paths.library_path = library_path.clone();
+            if let Some(p) = &self.config_path {
+                paths.config_path = p.clone();
+            }
             paths.ipc_endpoint = IpcEndpoint::from_override(socket_path)?;
             paths.pid_path = pid_path.clone();
             paths.log_path = log_path.clone();
@@ -61,6 +66,9 @@ impl DaemonOverrides {
         let mut paths = AppPaths::resolve()?;
         if let Some(p) = &self.library_path {
             paths.library_path = p.clone();
+        }
+        if let Some(p) = &self.config_path {
+            paths.config_path = p.clone();
         }
         if let Some(raw_ep) = &self.socket_path {
             paths.ipc_endpoint = IpcEndpoint::from_override(raw_ep)?;
@@ -174,6 +182,13 @@ pub enum RawCommand {
         seconds: f64,
     },
 
+    /// Get or set playback volume percentage (0-100)
+    Volume {
+        /// Volume percentage (0-100); omit to display current volume
+        #[arg(allow_negative_numbers = true, value_parser = parse_volume)]
+        level: Option<u8>,
+    },
+
     /// Remove a song, playlist, or indexed playlist entry (`-p <playlist>[<index>]`) from the library index (never deletes audio files on disk)
     Delete {
         /// Song title, playlist name, or `<playlist>[<index>]` (1-based playlist track)
@@ -220,6 +235,9 @@ pub enum RawCommand {
         #[arg(value_enum, ignore_case = true)]
         kind: Option<ListKind>,
     },
+
+    /// Recheck the music workspace for new, moved, or removed audio files
+    Update,
 
     /// Download audio via yt-dlp in best quality and auto-index into the library
     Download {
@@ -374,6 +392,9 @@ pub enum Command {
     Advance {
         seconds: f64,
     },
+    Volume {
+        level: Option<u8>,
+    },
     Delete {
         target: String,
         kind: TargetKind,
@@ -389,6 +410,7 @@ pub enum Command {
     List {
         kind: Option<ListKind>,
     },
+    Update,
     Download(DownloadOptions),
     Search(SearchOptions),
     DaemonStop,
@@ -415,6 +437,19 @@ fn parse_non_negative_secs(raw: &str) -> std::result::Result<f64, String> {
         return Err(format!("seconds must be a finite number >= 0.0, got {raw}"));
     }
     Ok(if val == 0.0 { 0.0 } else { val })
+}
+
+fn parse_volume(raw: &str) -> std::result::Result<u8, String> {
+    let val: u8 = raw
+        .parse()
+        .map_err(|_| format!("volume must be an integer between 0 and 100, got '{raw}'"))?;
+    if val > paths::MAX_VOLUME {
+        return Err(format!(
+            "volume must be an integer between 0 and {}, got '{raw}'",
+            paths::MAX_VOLUME
+        ));
+    }
+    Ok(val)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,6 +913,7 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         RawCommand::Prev => Ok(Command::Prev),
         RawCommand::Rewind { seconds } => Ok(Command::Rewind { seconds }),
         RawCommand::Advance { seconds } => Ok(Command::Advance { seconds }),
+        RawCommand::Volume { level } => Ok(Command::Volume { level }),
         RawCommand::Delete {
             target,
             song,
@@ -918,6 +954,7 @@ fn validate_cli(cli: Cli) -> Result<Command> {
         RawCommand::Stop => Ok(Command::Stop),
         RawCommand::Status => Ok(Command::Status),
         RawCommand::List { kind } => Ok(Command::List { kind }),
+        RawCommand::Update => Ok(Command::Update),
         RawCommand::Download {
             dest,
             set_dest,
@@ -2345,12 +2382,17 @@ mod tests {
 
         let overrides = DaemonOverrides {
             library_path: Some(PathBuf::from("/tmp/data/library.json")),
+            config_path: None,
             socket_path: Some("/tmp/run/custom.sock".to_string()),
             pid_path: Some(PathBuf::from("/tmp/run/custom.pid")),
             log_path: Some(PathBuf::from("/tmp/run/custom.log")),
         };
         let resolved = overrides.resolve_paths().unwrap();
         assert_eq!(resolved.library_path, PathBuf::from("/tmp/data/library.json"));
+        assert_eq!(
+            resolved.config_path,
+            PathBuf::from("/tmp/data/config/config.json")
+        );
         assert_eq!(resolved.pid_path, PathBuf::from("/tmp/run/custom.pid"));
         assert_eq!(resolved.log_path, PathBuf::from("/tmp/run/custom.log"));
         #[cfg(unix)]
@@ -2363,6 +2405,81 @@ mod tests {
             resolved.ipc_endpoint,
             IpcEndpoint::NamedPipe(ref name) if name.starts_with(r"\\.\pipe\tunr-")
         ));
+    }
+
+    #[test]
+    fn daemon_overrides_parses_and_resolves_config_path() {
+        assert_eq!(
+            parse_cli_from([
+                "tunr",
+                "__daemon",
+                "--config-path",
+                "/tmp/ws/config/config.json",
+            ])
+            .unwrap(),
+            Command::Daemon(DaemonOverrides {
+                config_path: Some(PathBuf::from("/tmp/ws/config/config.json")),
+                ..DaemonOverrides::default()
+            })
+        );
+
+        let cmd = parse_cli_from([
+            "tunr",
+            "__daemon",
+            "--library-path",
+            "/tmp/ws/playlists/library.json",
+            "--config-path",
+            "/tmp/ws/config/config.json",
+            "--socket-path",
+            "/tmp/run/custom.sock",
+            "--pid-path",
+            "/tmp/run/custom.pid",
+            "--log-path",
+            "/tmp/run/custom.log",
+        ])
+        .unwrap();
+
+        let Command::Daemon(overrides) = cmd else {
+            panic!("expected Command::Daemon");
+        };
+        let resolved = overrides.resolve_paths().unwrap();
+        assert_eq!(
+            resolved.library_path,
+            PathBuf::from("/tmp/ws/playlists/library.json")
+        );
+        assert_eq!(
+            resolved.config_path,
+            PathBuf::from("/tmp/ws/config/config.json")
+        );
+    }
+
+    #[test]
+    fn volume_parses_optional_level_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_cli_from(["tunr", "volume"]).unwrap(),
+            Command::Volume { level: None }
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "volume", "0"]).unwrap(),
+            Command::Volume { level: Some(0) }
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "volume", "50"]).unwrap(),
+            Command::Volume { level: Some(50) }
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "volume", "100"]).unwrap(),
+            Command::Volume { level: Some(100) }
+        );
+
+        for invalid in ["-1", "101", "50.5", "abc"] {
+            let err = parse_cli_from(["tunr", "volume", invalid]).unwrap_err();
+            let expected = format!("volume must be an integer between 0 and 100, got '{invalid}'");
+            assert!(
+                matches!(err, TunrError::InvalidArg(ref msg) if msg.contains(&expected)),
+                "unexpected error for `tunr volume {invalid}`: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -2993,6 +3110,18 @@ mod tests {
         ));
         assert!(matches!(
             parse_cli_from(["tunr", "search", "--set-limit", "101"]),
+            Err(TunrError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn update_command_parses_without_args_and_rejects_extra_args() {
+        assert_eq!(
+            parse_cli_from(["tunr", "update"]).unwrap(),
+            Command::Update
+        );
+        assert!(matches!(
+            parse_cli_from(["tunr", "update", "extra"]),
             Err(TunrError::InvalidArg(_))
         ));
     }

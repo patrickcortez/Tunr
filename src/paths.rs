@@ -14,6 +14,8 @@ use crate::search::SearchProvider;
 pub const WORKSPACE_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
+pub const DEFAULT_VOLUME: u8 = 50;
+pub const MAX_VOLUME: u8 = 100;
 
 const NOT_INITIALIZED_MSG: &str =
     "Tunr is not initialized. Run `tunr init <working-directory-location>` first.";
@@ -111,6 +113,8 @@ pub struct WorkspaceConfig {
     pub search_provider: Option<SearchProvider>,
     #[serde(default)]
     pub search_format: Option<DownloadFormat>,
+    #[serde(default)]
+    pub volume: Option<u8>,
 }
 
 /// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/tunr/workspace.json` (or OS config dir).
@@ -443,6 +447,7 @@ fn initialize_workspace_with_env_and_os(
         search_limit: None,
         search_provider: None,
         search_format: None,
+        volume: None,
     };
 
     let config_file = config_dir.join("config.json");
@@ -565,6 +570,32 @@ pub fn set_workspace_search_format(
     update_workspace_config(paths, |cfg| {
         cfg.search_format = Some(format);
         format
+    })
+}
+
+/// Validate that a volume percentage is within `0..=MAX_VOLUME`.
+pub fn validate_volume(volume: u8) -> Result<u8> {
+    if volume > MAX_VOLUME {
+        return Err(TunrError::InvalidArg(format!(
+            "volume must be between 0 and {MAX_VOLUME}, got {volume}"
+        )));
+    }
+    Ok(volume)
+}
+
+/// Resolve the effective volume percentage from `cfg`, falling back to `DEFAULT_VOLUME` when unset or out of range.
+pub fn effective_volume(cfg: &WorkspaceConfig) -> u8 {
+    cfg.volume
+        .filter(|&v| v <= MAX_VOLUME)
+        .unwrap_or(DEFAULT_VOLUME)
+}
+
+/// Persist `volume` inside `paths.config_path` atomically after validating `volume`.
+pub fn set_workspace_volume(paths: &AppPaths, volume: u8) -> Result<u8> {
+    let valid = validate_volume(volume)?;
+    update_workspace_config(paths, |cfg| {
+        cfg.volume = Some(valid);
+        valid
     })
 }
 
@@ -1675,8 +1706,12 @@ mod tests {
         assert_eq!(cfg2.search_limit, None);
         assert_eq!(cfg2.search_provider, None);
         assert_eq!(cfg2.search_format, None);
+        assert_eq!(cfg2.volume, None);
+        assert_eq!(effective_volume(&cfg2), DEFAULT_VOLUME);
         assert_eq!(cfg.search_provider, None);
         assert_eq!(cfg.search_format, None);
+        assert_eq!(cfg.volume, None);
+        assert_eq!(effective_volume(&cfg), DEFAULT_VOLUME);
     }
 
     #[test]
@@ -1853,6 +1888,92 @@ mod tests {
             leftover_tmps.is_empty(),
             "leftover tmp files: {leftover_tmps:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_volume_and_effective_volume_enforce_bounds_and_defaults() {
+        assert_eq!(validate_volume(0).unwrap(), 0);
+        assert_eq!(validate_volume(DEFAULT_VOLUME).unwrap(), DEFAULT_VOLUME);
+        assert_eq!(validate_volume(MAX_VOLUME).unwrap(), MAX_VOLUME);
+        assert!(matches!(
+            validate_volume(MAX_VOLUME + 1),
+            Err(TunrError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            validate_volume(u8::MAX),
+            Err(TunrError::InvalidArg(_))
+        ));
+
+        let mut cfg = WorkspaceConfig {
+            version: WORKSPACE_CONFIG_VERSION,
+            working_dir: PathBuf::from("/tmp/ws"),
+            config_dir: PathBuf::from("/tmp/ws/config"),
+            playlists_dir: PathBuf::from("/tmp/ws/playlists"),
+            music_dir: PathBuf::from("/tmp/ws/music"),
+            download_dest: None,
+            search_limit: None,
+            search_provider: None,
+            search_format: None,
+            volume: None,
+        };
+        assert_eq!(effective_volume(&cfg), DEFAULT_VOLUME);
+
+        cfg.volume = Some(0);
+        assert_eq!(effective_volume(&cfg), 0);
+
+        cfg.volume = Some(75);
+        assert_eq!(effective_volume(&cfg), 75);
+
+        cfg.volume = Some(MAX_VOLUME);
+        assert_eq!(effective_volume(&cfg), MAX_VOLUME);
+
+        cfg.volume = Some(MAX_VOLUME + 1);
+        assert_eq!(effective_volume(&cfg), DEFAULT_VOLUME);
+    }
+
+    #[test]
+    fn set_workspace_volume_persists_and_validates() {
+        let root = temp_dir("workspace-volume");
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        let init_cfg = initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        assert_eq!(init_cfg.volume, None);
+        assert_eq!(effective_volume(&init_cfg), DEFAULT_VOLUME);
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+        assert_eq!(load_workspace_config(&paths).unwrap().volume, None);
+
+        assert!(matches!(
+            set_workspace_volume(&paths, MAX_VOLUME + 1),
+            Err(TunrError::InvalidArg(_))
+        ));
+        assert_eq!(load_workspace_config(&paths).unwrap().volume, None);
+
+        assert_eq!(set_workspace_volume(&paths, 0).unwrap(), 0);
+        let reloaded = load_workspace_config(&paths).unwrap();
+        assert_eq!(reloaded.volume, Some(0));
+        assert_eq!(effective_volume(&reloaded), 0);
+
+        assert_eq!(set_workspace_volume(&paths, MAX_VOLUME).unwrap(), MAX_VOLUME);
+        let reloaded = load_workspace_config(&paths).unwrap();
+        assert_eq!(reloaded.volume, Some(MAX_VOLUME));
+        assert_eq!(effective_volume(&reloaded), MAX_VOLUME);
 
         let _ = fs::remove_dir_all(&root);
     }

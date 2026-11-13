@@ -19,12 +19,13 @@ use tokio::time::MissedTickBehavior;
 use crate::error::{Result, TunrError};
 use crate::ipc::{self, IpcRequest, PlayMode, PlaybackState, PlaybackStatus, TargetKind};
 use crate::library::{DeleteOutcome, Library, Song};
-use crate::paths::AppPaths;
+use crate::paths::{self, AppPaths, DEFAULT_VOLUME, MAX_VOLUME};
 use crate::platform::ShutdownSignals;
 use crate::tui_common::{TerminalSession, fit_to_width, use_ascii_glyphs};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const SEEK_STEP_SECS: f64 = 5.0;
+const VOLUME_STEP: u8 = 5;
 const STATUS_TTL: Duration = Duration::from_secs(5);
 const STOP_ON_QUIT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -64,6 +65,10 @@ pub enum TuiEffect {
         generation: u64,
         request: IpcRequest,
     },
+    SetVolume {
+        generation: u64,
+        volume: u8,
+    },
     StopOnQuit {
         generation: u64,
     },
@@ -89,6 +94,10 @@ pub enum TuiEvent {
         is_play: bool,
         result: Result<PlaybackStatus>,
     },
+    VolumeUpdated {
+        generation: u64,
+        result: Result<Option<PlaybackStatus>>,
+    },
     LibraryChecked {
         generation: u64,
         observed_stamp: Option<(SystemTime, u64)>,
@@ -109,10 +118,16 @@ impl Drop for AbortGuard {
     }
 }
 
-struct QueuedIpcAction {
-    generation: u64,
-    ensure_daemon: bool,
-    request: IpcRequest,
+enum QueuedIpcAction {
+    Ipc {
+        generation: u64,
+        ensure_daemon: bool,
+        request: IpcRequest,
+    },
+    SetVolume {
+        generation: u64,
+        volume: u8,
+    },
 }
 
 /// Synchronous state machine and renderer for the interactive Tunr terminal interface.
@@ -124,6 +139,8 @@ pub struct TuiApp {
     track_state: ListState,
     mode: PlayMode,
     mode_locked: bool,
+    volume: u8,
+    volume_gen: u64,
     status: PlaybackStatus,
     confirm_delete: Option<ConfirmDelete>,
     status_message: Option<StatusMessage>,
@@ -147,7 +164,8 @@ impl TuiApp {
     pub fn new(paths: AppPaths) -> Result<Self> {
         let library = Library::load(&paths.library_path)?;
         let library_stamp = file_stamp(&paths.library_path);
-        Ok(Self::from_loaded(library, library_stamp))
+        let initial_volume = load_initial_volume(&paths);
+        Ok(Self::from_loaded(library, library_stamp).with_volume(initial_volume))
     }
 
     /// Construct a [`TuiApp`] from pre-loaded library contents and file metadata stamp.
@@ -168,6 +186,8 @@ impl TuiApp {
             track_state,
             mode: PlayMode::Next,
             mode_locked: false,
+            volume: DEFAULT_VOLUME,
+            volume_gen: 0,
             status: PlaybackStatus::default(),
             confirm_delete: None,
             status_message: None,
@@ -182,6 +202,19 @@ impl TuiApp {
             delete_in_flight: false,
             effects: Vec::new(),
         }
+    }
+
+    /// Override the initial volume percentage shown by [`TuiApp`].
+    pub fn with_volume(mut self, volume: u8) -> Self {
+        let clamped = volume.min(MAX_VOLUME);
+        self.volume = clamped;
+        self.status.volume = clamped;
+        self
+    }
+
+    /// Return the active local volume percentage (`0..=100`).
+    pub fn volume(&self) -> u8 {
+        self.volume
     }
 
     /// Return the currently focused pane.
@@ -281,7 +314,7 @@ impl TuiApp {
                 }
                 self.applied_status_gen = generation;
                 match result {
-                    Ok(status) => self.apply_live_status(status, false),
+                    Ok(status) => self.apply_live_status(status, generation, false),
                     Err(err) if is_daemon_offline_error(&err) => {
                         self.reset_status_stopped();
                     }
@@ -302,7 +335,7 @@ impl TuiApp {
                 }
                 self.applied_status_gen = generation;
                 match result {
-                    Ok(status) => self.apply_live_status(status, true),
+                    Ok(status) => self.apply_live_status(status, generation, true),
                     Err(err) if !is_play && is_daemon_offline_error(&err) => {
                         self.reset_status_stopped();
                         self.set_message("Playback daemon is not running.", false);
@@ -310,6 +343,23 @@ impl TuiApp {
                     Err(err) => {
                         let prefix = if is_play { "Play failed: " } else { "" };
                         self.set_message(format!("{prefix}{err}"), true);
+                    }
+                }
+            }
+            TuiEvent::VolumeUpdated { generation, result } => {
+                self.action_in_flight = self.action_in_flight.saturating_sub(1);
+                if generation <= self.applied_status_gen {
+                    return;
+                }
+                self.applied_status_gen = generation;
+                match result {
+                    Ok(Some(status)) => self.apply_live_status(status, generation, true),
+                    Ok(None) => {
+                        self.reset_status_stopped();
+                        self.status_message = None;
+                    }
+                    Err(err) => {
+                        self.set_message(format!("Volume update failed: {err}"), true);
                     }
                 }
             }
@@ -403,7 +453,7 @@ impl TuiApp {
 
     /// Handle a single terminal key event.
     ///
-    /// Navigation and seek keys respond to both `Press` and `Repeat` events, while
+    /// Navigation, seek, and volume keys respond to both `Press` and `Repeat` events, while
     /// state-toggling shortcuts, modal confirmations, and quit keys act only on `Press`.
     /// Release events are ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -469,6 +519,8 @@ impl TuiApp {
             KeyCode::Char('b') if is_press => self.send_control(IpcRequest::Prev),
             KeyCode::Char('[') => self.send_control(IpcRequest::SeekRelative(-SEEK_STEP_SECS)),
             KeyCode::Char(']') => self.send_control(IpcRequest::SeekRelative(SEEK_STEP_SECS)),
+            KeyCode::Char('-') => self.adjust_volume(-(VOLUME_STEP as i16)),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_volume(VOLUME_STEP as i16),
             KeyCode::Char('s') if is_press => self.toggle_mode(),
             KeyCode::Char('d') if is_press => self.open_delete_modal(),
             KeyCode::Char('q') | KeyCode::Esc if is_press => {
@@ -639,6 +691,20 @@ impl TuiApp {
         });
     }
 
+    fn adjust_volume(&mut self, delta: i16) {
+        let next_volume = (self.volume as i16 + delta).clamp(0, MAX_VOLUME as i16) as u8;
+        self.volume = next_volume;
+        self.status.volume = next_volume;
+        let generation = self.next_status_gen();
+        self.min_status_gen = generation;
+        self.volume_gen = generation;
+        self.action_in_flight = self.action_in_flight.saturating_add(1);
+        self.effects.push(TuiEffect::SetVolume {
+            generation,
+            volume: next_volume,
+        });
+    }
+
     fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             PlayMode::Next => PlayMode::Shuffle,
@@ -706,10 +772,16 @@ impl TuiApp {
         self.status_gen
     }
 
-    fn apply_live_status(&mut self, status: PlaybackStatus, clear_message: bool) {
+    fn apply_live_status(&mut self, mut status: PlaybackStatus, generation: u64, clear_message: bool) {
         if !self.mode_locked && status.state != PlaybackState::Stopped {
             self.mode = status.mode;
             self.mode_locked = true;
+        }
+        if generation >= self.volume_gen {
+            self.volume = status.volume.min(MAX_VOLUME);
+            status.volume = self.volume;
+        } else {
+            status.volume = self.volume;
         }
         self.status = status;
         if clear_message {
@@ -720,6 +792,7 @@ impl TuiApp {
     fn reset_status_stopped(&mut self) {
         self.status = PlaybackStatus {
             mode: self.mode,
+            volume: self.volume,
             ..PlaybackStatus::default()
         };
     }
@@ -865,6 +938,11 @@ impl TuiApp {
         }
         spans.push(Span::styled("   |   ", Style::new().fg(Color::DarkGray)));
         spans.push(Span::styled(state_text, state_style));
+        spans.push(Span::styled("   |   ", Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("Vol: {}%", self.volume),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
         let title_line = Line::from(spans);
 
         let block = Block::bordered()
@@ -1166,16 +1244,16 @@ impl TuiApp {
             .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray));
         frame.render_widget(gauge, gauge_area);
 
-        let help_text = if inner.width < 110 {
+        let help_text = if inner.width < 128 {
             if ascii {
-                "<-/->/Tab:Pane  h/j/k/l:Nav  Enter:Play  Space:Pause  n/b:Next  d:Del  q:Quit"
+                "<-/->/Tab:Pane  h/j/k/l:Nav  Enter:Play  Space:Pause  n/b:Next  -/+:Vol  d:Del  q:Quit"
             } else {
-                "←/→/Tab:Pane  ↑/↓:Nav  Enter:Play  Space:Pause  n/b:Next  d:Del  q:Quit"
+                "←/→/Tab:Pane  ↑/↓:Nav  Enter:Play  Space:Pause  n/b:Next  -/+:Vol  d:Del  q:Quit"
             }
         } else if ascii {
-            "<-/->/Tab:Pane  Up/Down/j/k:Nav  Enter:Play  p:PlayList  Space:Pause  n/b:Next/Prev  [/]:+/-5s  s:Mode  d:Del  q:Quit  Q:Stop+Quit"
+            "<-/->/Tab:Pane Up/Down/j/k:Nav Enter:Play p:PlayList Space:Pause n/b:Next/Prev [/]:+/-5s -/+:Vol s:Mode d:Del q:Quit Q:Stop+Quit"
         } else {
-            "←/→/Tab:Pane  ↑/↓/j/k:Nav  Enter:Play  p:PlayList  Space:Pause  n/b:Next/Prev  [/]:±5s  s:Mode  d:Del  q:Quit  Q:Stop+Quit"
+            "←/→/Tab:Pane ↑/↓/j/k:Nav Enter:Play p:PlayList Space:Pause n/b:Next/Prev [/]:±5s -/+:Vol s:Mode d:Del q:Quit Q:Stop+Quit"
         };
         let help_line = Line::from(Span::styled(help_text, Style::new().fg(Color::Gray)));
         frame.render_widget(Paragraph::new(help_line), help_area);
@@ -1225,16 +1303,17 @@ impl TuiApp {
 
 /// Launch the interactive ratatui TUI on the current terminal.
 pub async fn run_tui(paths: &AppPaths) -> Result<()> {
-    let lib_path = paths.library_path.clone();
-    let (library, library_stamp) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let library = Library::load(&lib_path)?;
-        let stamp = file_stamp(&lib_path);
-        Ok((library, stamp))
+    let paths_for_load = paths.clone();
+    let (library, library_stamp, initial_volume) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let library = Library::load(&paths_for_load.library_path)?;
+        let stamp = file_stamp(&paths_for_load.library_path);
+        let initial_volume = load_initial_volume(&paths_for_load);
+        Ok((library, stamp, initial_volume))
     })
     .await
     .map_err(|err| TunrError::Async(format!("failed to load library: {err}")))??;
 
-    let mut app = TuiApp::from_loaded(library, library_stamp);
+    let mut app = TuiApp::from_loaded(library, library_stamp).with_volume(initial_volume);
     app.request_poll_status();
 
     let mut session = TerminalSession::enter()?;
@@ -1357,7 +1436,7 @@ fn dispatch_effects(
                 request,
             } => {
                 if action_tx
-                    .send(QueuedIpcAction {
+                    .send(QueuedIpcAction::Ipc {
                         generation,
                         ensure_daemon: true,
                         request,
@@ -1378,7 +1457,7 @@ fn dispatch_effects(
                 request,
             } => {
                 if action_tx
-                    .send(QueuedIpcAction {
+                    .send(QueuedIpcAction::Ipc {
                         generation,
                         ensure_daemon: false,
                         request,
@@ -1388,6 +1467,19 @@ fn dispatch_effects(
                     let _ = worker_tx.send(TuiEvent::ActionCompleted {
                         generation,
                         is_play: false,
+                        result: Err(TunrError::Async(
+                            "playback action worker unavailable".to_string(),
+                        )),
+                    });
+                }
+            }
+            TuiEffect::SetVolume { generation, volume } => {
+                if action_tx
+                    .send(QueuedIpcAction::SetVolume { generation, volume })
+                    .is_err()
+                {
+                    let _ = worker_tx.send(TuiEvent::VolumeUpdated {
+                        generation,
                         result: Err(TunrError::Async(
                             "playback action worker unavailable".to_string(),
                         )),
@@ -1453,22 +1545,52 @@ async fn run_ipc_action_worker(
     worker_tx: mpsc::UnboundedSender<TuiEvent>,
 ) {
     while let Some(action) = rx.recv().await {
-        let result = if action.ensure_daemon {
-            ipc::ensure_daemon_and_send(&paths, &action.request).await
-        } else {
-            ipc::send_request(&paths, &action.request).await
+        let event = match action {
+            QueuedIpcAction::Ipc {
+                generation,
+                ensure_daemon,
+                request,
+            } => {
+                let result = if ensure_daemon {
+                    ipc::ensure_daemon_and_send(&paths, &request).await
+                } else {
+                    ipc::send_request(&paths, &request).await
+                };
+                TuiEvent::ActionCompleted {
+                    generation,
+                    is_play: ensure_daemon,
+                    result,
+                }
+            }
+            QueuedIpcAction::SetVolume { generation, volume } => {
+                let result = execute_set_volume(&paths, volume).await;
+                TuiEvent::VolumeUpdated { generation, result }
+            }
         };
-        if worker_tx
-            .send(TuiEvent::ActionCompleted {
-                generation: action.generation,
-                is_play: action.ensure_daemon,
-                result,
-            })
-            .is_err()
-        {
+        if worker_tx.send(event).is_err() {
             break;
         }
     }
+}
+
+async fn execute_set_volume(paths: &AppPaths, volume: u8) -> Result<Option<PlaybackStatus>> {
+    let paths_for_save = paths.clone();
+    tokio::task::spawn_blocking(move || paths::set_workspace_volume(&paths_for_save, volume))
+        .await
+        .map_err(|err| TunrError::Async(format!("volume save task failed: {err}")))??;
+
+    match ipc::send_request(paths, &IpcRequest::SetVolume(volume)).await {
+        Ok(status) => Ok(Some(status)),
+        Err(err) if is_daemon_offline_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_initial_volume(paths: &AppPaths) -> u8 {
+    paths::load_workspace_config(paths)
+        .ok()
+        .map(|c| paths::effective_volume(&c))
+        .unwrap_or(DEFAULT_VOLUME)
 }
 
 async fn stop_daemon_on_quit(
@@ -1608,6 +1730,12 @@ mod tests {
             if self.offline {
                 return Err(TunrError::Ipc("daemon not running".to_string()));
             }
+            if let IpcRequest::SetVolume(vol) = req {
+                let mut status = self.next_status.clone().unwrap_or_default();
+                status.volume = *vol;
+                self.next_status = Some(status.clone());
+                return Ok(status);
+            }
             Ok(self.next_status.clone().unwrap_or_default())
         }
 
@@ -1634,6 +1762,7 @@ mod tests {
                     position_secs: 0.0,
                     duration_secs: queue.get(idx).and_then(|s| s.duration_secs),
                     queue: queue.clone(),
+                    volume: self.next_status.as_ref().map_or(DEFAULT_VOLUME, |s| s.volume),
                 };
                 self.next_status = Some(status.clone());
                 return Ok(status);
@@ -1670,6 +1799,14 @@ mod tests {
                         is_play: false,
                         result,
                     });
+                }
+                TuiEffect::SetVolume { generation, volume } => {
+                    let result = match mock.handle_send(&IpcRequest::SetVolume(volume)) {
+                        Ok(status) => Ok(Some(status)),
+                        Err(err) if is_daemon_offline_error(&err) => Ok(None),
+                        Err(err) => Err(err),
+                    };
+                    app.apply_event(TuiEvent::VolumeUpdated { generation, result });
                 }
                 TuiEffect::StopOnQuit { .. } => {
                     let _ = mock.handle_send(&IpcRequest::Stop);
@@ -1964,6 +2101,7 @@ mod tests {
                 position_secs: 65.0,
                 duration_secs: Some(200.0),
                 queue: vec![active_song, lib.songs[2].clone()],
+                ..PlaybackStatus::default()
             }),
             ..MockState::default()
         };
@@ -2079,6 +2217,7 @@ mod tests {
             position_secs: 1.0,
             duration_secs: track.duration_secs,
             queue: vec![track],
+            ..PlaybackStatus::default()
         };
         app.apply_event(TuiEvent::ActionCompleted {
             generation: 2,
@@ -2324,5 +2463,278 @@ mod tests {
         let with_loop = terminal.backend().to_string();
         assert!(with_loop.contains("[Mode: Next]"), "missing mode:\n{with_loop}");
         assert!(with_loop.contains("[Loop]"), "missing [Loop] when enabled:\n{with_loop}");
+    }
+
+    #[test]
+    fn volume_keybindings_support_press_repeat_and_clamp_bounds() {
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+        assert_eq!(app.volume(), DEFAULT_VOLUME);
+        assert_eq!(app.status.volume, DEFAULT_VOLUME);
+
+        // '-' Press decrements by 5.
+        app.handle_key(press(KeyCode::Char('-')));
+        assert_eq!(app.volume(), 45);
+        assert_eq!(app.status.volume, 45);
+        assert_eq!(
+            app.take_effects(),
+            vec![TuiEffect::SetVolume {
+                generation: 1,
+                volume: 45,
+            }]
+        );
+
+        // '+' Repeat increments by 5.
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('+'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.volume(), 50);
+        assert_eq!(
+            app.take_effects(),
+            vec![TuiEffect::SetVolume {
+                generation: 2,
+                volume: 50,
+            }]
+        );
+
+        // '=' Press and Repeat increment by 5 each.
+        app.handle_key(press(KeyCode::Char('=')));
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('='),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.volume(), 60);
+        assert_eq!(
+            app.take_effects(),
+            vec![
+                TuiEffect::SetVolume {
+                    generation: 3,
+                    volume: 55,
+                },
+                TuiEffect::SetVolume {
+                    generation: 4,
+                    volume: 60,
+                },
+            ]
+        );
+
+        // Clamps cleanly at 0.
+        let mut low = TuiApp::from_loaded(sample_library(), None).with_volume(3);
+        low.handle_key(press(KeyCode::Char('-')));
+        assert_eq!(low.volume(), 0);
+        assert_eq!(low.status.volume, 0);
+        low.handle_key(press(KeyCode::Char('-')));
+        assert_eq!(low.volume(), 0);
+
+        // Clamps cleanly at MAX_VOLUME (100).
+        let mut high = TuiApp::from_loaded(sample_library(), None).with_volume(97);
+        high.handle_key(press(KeyCode::Char('+')));
+        assert_eq!(high.volume(), MAX_VOLUME);
+        assert_eq!(high.status.volume, MAX_VOLUME);
+        high.handle_key(press(KeyCode::Char('=')));
+        assert_eq!(high.volume(), MAX_VOLUME);
+    }
+
+    #[test]
+    fn volume_generation_protects_against_stale_status_and_offline_preserves_state() {
+        let (root, paths) = temp_paths("vol-gen");
+        let lib = sample_library();
+        let mut app = TuiApp::from_loaded(lib, None);
+
+        // Toggle local mode to Shuffle and start a non-volume control at gen 1.
+        app.handle_key(press(KeyCode::Char('s')));
+        assert_eq!(app.mode(), PlayMode::Shuffle);
+        app.handle_key(press(KeyCode::Char(' '))); // gen 1
+        // Rapidly press '+' twice (gen 2 -> 55, gen 3 -> 60).
+        app.handle_key(press(KeyCode::Char('+')));
+        app.handle_key(press(KeyCode::Char('+')));
+        let effects = app.take_effects();
+        assert_eq!(effects.len(), 3);
+        assert_eq!(app.volume(), 60);
+        assert_eq!(app.volume_gen, 3);
+
+        // Earlier TogglePause (gen 1) completes with old volume 50 -> must NOT overwrite 60.
+        app.apply_event(TuiEvent::ActionCompleted {
+            generation: 1,
+            is_play: false,
+            result: Ok(PlaybackStatus {
+                state: PlaybackState::Paused,
+                mode: PlayMode::Shuffle,
+                volume: 50,
+                ..PlaybackStatus::default()
+            }),
+        });
+        assert_eq!(app.status.state, PlaybackState::Paused);
+        assert_eq!(app.volume(), 60);
+        assert_eq!(app.status.volume, 60);
+
+        // Earlier SetVolume (gen 2) completes with 55 -> must NOT overwrite 60.
+        app.apply_event(TuiEvent::VolumeUpdated {
+            generation: 2,
+            result: Ok(Some(PlaybackStatus {
+                state: PlaybackState::Paused,
+                mode: PlayMode::Shuffle,
+                volume: 55,
+                ..PlaybackStatus::default()
+            })),
+        });
+        assert_eq!(app.volume(), 60);
+        assert_eq!(app.status.volume, 60);
+
+        // Latest SetVolume (gen 3) completes with 60.
+        app.apply_event(TuiEvent::VolumeUpdated {
+            generation: 3,
+            result: Ok(Some(PlaybackStatus {
+                state: PlaybackState::Paused,
+                mode: PlayMode::Shuffle,
+                volume: 60,
+                ..PlaybackStatus::default()
+            })),
+        });
+        assert_eq!(app.volume(), 60);
+        assert_eq!(app.status.volume, 60);
+
+        // Offline poll calls reset_status_stopped and must preserve volume and mode.
+        app.request_poll_status(); // gen 4
+        let mut offline_mock = MockState {
+            offline: true,
+            ..MockState::default()
+        };
+        drive_effects(&mut app, &paths, &mut offline_mock);
+        assert_eq!(app.status.state, PlaybackState::Stopped);
+        assert_eq!(app.mode(), PlayMode::Shuffle);
+        assert_eq!(app.volume(), 60);
+        assert_eq!(app.status.volume, 60);
+
+        // Offline SetVolume is benign: no error message, preserves mode and updated volume.
+        app.handle_key(press(KeyCode::Char('-'))); // 55
+        drive_effects(&mut app, &paths, &mut offline_mock);
+        assert_eq!(app.volume(), 55);
+        assert_eq!(app.status.volume, 55);
+        assert_eq!(app.mode(), PlayMode::Shuffle);
+        assert_eq!(app.status.state, PlaybackState::Stopped);
+        assert!(app.status_message.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tui_app_new_loads_persisted_workspace_volume_and_with_volume_clamps() {
+        let root = std::env::temp_dir().join(format!("tunr-tui-init-vol-{}", Uuid::new_v4()));
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        paths::initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+        sample_library().save(&paths.library_path).unwrap();
+
+        // Unset workspace volume defaults to DEFAULT_VOLUME (50).
+        let default_app = TuiApp::new(paths.clone()).unwrap();
+        assert_eq!(default_app.volume(), DEFAULT_VOLUME);
+        assert_eq!(default_app.status.volume, DEFAULT_VOLUME);
+
+        // Persisted workspace volume is loaded on startup.
+        paths::set_workspace_volume(&paths, 80).unwrap();
+        let loaded_app = TuiApp::new(paths).unwrap();
+        assert_eq!(loaded_app.volume(), 80);
+        assert_eq!(loaded_app.status.volume, 80);
+
+        // with_volume clamps out-of-range inputs cleanly.
+        let clamped = TuiApp::from_loaded(sample_library(), None).with_volume(150);
+        assert_eq!(clamped.volume(), MAX_VOLUME);
+        assert_eq!(clamped.status.volume, MAX_VOLUME);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn execute_set_volume_persists_to_config_when_daemon_offline() {
+        let root = std::env::temp_dir().join(format!("tunr-tui-exec-vol-{}", Uuid::new_v4()));
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        paths::initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+
+        let outcome = execute_set_volume(&paths, 35).await.unwrap();
+        assert!(outcome.is_none());
+        let cfg = paths::load_workspace_config(&paths).unwrap();
+        assert_eq!(paths::effective_volume(&cfg), 35);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renders_volume_in_header_and_help_in_unicode_and_ascii() {
+        let mut app = TuiApp::from_loaded(sample_library(), None).with_volume(75);
+        app.status.state = PlaybackState::Playing;
+
+        // Wide threshold (130 outer -> 128 inner) renders full wide help without clipping in ASCII & Unicode.
+        for ascii in [false, true] {
+            let backend = TestBackend::new(130, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| app.render_with_ascii(frame, ascii))
+                .unwrap();
+            let screen = terminal.backend().to_string();
+            assert!(
+                screen.contains("Vol: 75%"),
+                "missing header volume (ascii={ascii}):\n{screen}"
+            );
+            assert!(
+                screen.contains("-/+:Vol"),
+                "missing footer volume shortcut (ascii={ascii}):\n{screen}"
+            );
+            assert!(
+                screen.contains("Q:Stop+Quit"),
+                "wide footer help clipped at 128 inner width (ascii={ascii}):\n{screen}"
+            );
+        }
+
+        // Compact width (100 outer) also shows both header volume and compact -/+:Vol shortcut.
+        for ascii in [false, true] {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| app.render_with_ascii(frame, ascii))
+                .unwrap();
+            let screen = terminal.backend().to_string();
+            assert!(
+                screen.contains("Vol: 75%"),
+                "missing compact header volume (ascii={ascii}):\n{screen}"
+            );
+            assert!(
+                screen.contains("-/+:Vol"),
+                "missing compact footer volume shortcut (ascii={ascii}):\n{screen}"
+            );
+        }
     }
 }

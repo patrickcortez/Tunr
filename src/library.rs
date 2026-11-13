@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,16 @@ pub struct AddSummary {
     pub added_titles: Vec<String>,
     pub playlist_name: Option<String>,
     pub playlist_added_count: usize,
+    pub skipped_files: Vec<String>,
+}
+
+/// Summary returned by `Library::update_workspace`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateSummary {
+    pub added_count: usize,
+    pub relinked_count: usize,
+    pub removed_count: usize,
+    pub unchanged_count: usize,
     pub skipped_files: Vec<String>,
 }
 
@@ -149,14 +160,18 @@ enum SongLookupMode {
 }
 
 impl Library {
-    fn load_unlocked(path: &Path) -> Result<Self> {
+    fn load_unlocked_with_status(path: &Path) -> Result<(Self, bool, bool)> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), false, false));
         }
         let raw = fs::read_to_string(path)?;
         let mut lib: Library = serde_json::from_str(&raw)?;
-        lib.normalize_existing_songs();
-        Ok(lib)
+        let normalized = lib.normalize_existing_songs();
+        Ok((lib, true, normalized))
+    }
+
+    fn load_unlocked(path: &Path) -> Result<Self> {
+        Self::load_unlocked_with_status(path).map(|(lib, _, _)| lib)
     }
 
     /// Normalize legacy `"Artist - Title"` entries in place; returns `true` if any song changed.
@@ -194,6 +209,200 @@ impl Library {
             let out = mutator(&mut lib)?;
             write_json_atomic(path, &lib)?;
             Ok(out)
+        })
+    }
+
+    /// Atomically update `path` under an exclusive advisory lock, skipping the disk write
+    /// when `path` already existed and neither normalization nor `mutator` changed the library.
+    pub fn update_if_changed<T>(
+        path: &Path,
+        mutator: impl FnOnce(&mut Library) -> Result<T>,
+    ) -> Result<T> {
+        with_file_lock(&lock_path_for(path), true, || {
+            let (mut lib, existed, normalized) = Self::load_unlocked_with_status(path)?;
+            let before = if existed && !normalized {
+                Some(lib.clone())
+            } else {
+                None
+            };
+            let out = mutator(&mut lib)?;
+            if !existed || normalized || before.as_ref() != Some(&lib) {
+                write_json_atomic(path, &lib)?;
+            }
+            Ok(out)
+        })
+    }
+
+    /// Remove all songs whose IDs appear in `ids` and strip those IDs from every playlist.
+    fn remove_songs_by_ids(&mut self, ids: &HashSet<String>) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let before = self.songs.len();
+        self.songs.retain(|song| !ids.contains(&song.id));
+        let removed = before.saturating_sub(self.songs.len());
+        for pl in &mut self.playlists {
+            pl.song_ids.retain(|id| !ids.contains(id));
+        }
+        removed
+    }
+
+    /// Reconcile the workspace (and optional separate `download_dest`) against `library_path`:
+    /// adds newly discovered audio files, relinks uniquely matched moved/renamed workspace files
+    /// while preserving `Song::id` and playlist membership, and prunes deleted workspace files.
+    pub fn update_workspace(
+        library_path: &Path,
+        working_dir: &Path,
+        config_dir: &Path,
+        playlists_dir: &Path,
+        download_dest: Option<&Path>,
+    ) -> Result<UpdateSummary> {
+        let working_dir = canonicalize_clean(working_dir)?;
+        let config_dir =
+            canonicalize_clean(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+        let playlists_dir =
+            canonicalize_clean(playlists_dir).unwrap_or_else(|_| playlists_dir.to_path_buf());
+
+        let mut scan_roots = vec![working_dir];
+        let mut skipped_files = Vec::new();
+
+        if let Some(dest) = download_dest {
+            if dest.is_dir() {
+                match canonicalize_clean(dest) {
+                    Ok(dest_canon) => {
+                        if !scan_roots.iter().any(|r| dest_canon.starts_with(r)) {
+                            scan_roots.push(dest_canon);
+                        }
+                    }
+                    Err(err) => skipped_files.push(format!(
+                        "download destination {}: {err}",
+                        dest.display()
+                    )),
+                }
+            } else if dest.exists() {
+                skipped_files.push(format!(
+                    "download destination {} is not a directory; skipping scan",
+                    dest.display()
+                ));
+            } else {
+                skipped_files.push(format!(
+                    "download destination {} does not exist (unmounted?); skipping scan",
+                    dest.display()
+                ));
+            }
+        }
+
+        // Phase 1: scan and probe outside the exclusive library lock.
+        let snapshot = Self::load(library_path)?;
+        let snapshot_paths: HashSet<PathBuf> =
+            snapshot.songs.iter().map(|s| s.path.clone()).collect();
+
+        let skip_dirs = [config_dir, playlists_dir];
+        let mut discovered_paths = Vec::new();
+        let mut discovered_set = HashSet::new();
+
+        for root in &scan_roots {
+            let (files, walk_skipped) = walk_audio_files(root, &skip_dirs, &[".tunr-dl-tmp"])?;
+            skipped_files.extend(walk_skipped);
+            for path in files {
+                if discovered_set.insert(path.clone()) {
+                    discovered_paths.push(path);
+                }
+            }
+        }
+        discovered_paths.sort();
+
+        let mut probed_candidates = Vec::new();
+        for path in discovered_paths {
+            if snapshot_paths.contains(&path) {
+                continue;
+            }
+            match probe_song(path.clone()) {
+                Ok(song) => probed_candidates.push(song),
+                Err(err) => skipped_files.push(format!("{}: {err}", path.display())),
+            }
+        }
+
+        // Phase 2: reconcile atomically under exclusive lock, writing only if changed.
+        Self::update_if_changed(library_path, |lib| {
+            let existing_paths: HashSet<PathBuf> =
+                lib.songs.iter().map(|s| s.path.clone()).collect();
+            let mut candidates: Vec<Song> = probed_candidates
+                .into_iter()
+                .filter(|c| !existing_paths.contains(&c.path))
+                .collect();
+
+            let mut missing_indices: Vec<usize> = lib
+                .songs
+                .iter()
+                .enumerate()
+                .filter(|(_, song)| {
+                    scan_roots.iter().any(|root| song.path.starts_with(root))
+                        && !discovered_set.contains(&song.path)
+                        && !song.path.exists()
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+
+            let mut relinked_count = 0usize;
+
+            // Pass 1: unique match by (title, artist, album, duration_bucket) with valid duration.
+            let (pass1_matches, remaining_missing, remaining_cand_indices) =
+                match_unique_moves(lib, &missing_indices, &candidates, |song| {
+                    let bucket = duration_bucket(song.duration_secs)?;
+                    Some((
+                        song.title.clone(),
+                        song.artist.clone(),
+                        song.album.clone(),
+                        bucket,
+                    ))
+                });
+            for (song_idx, cand_idx) in pass1_matches {
+                apply_relink(&mut lib.songs[song_idx], &candidates[cand_idx]);
+                relinked_count += 1;
+            }
+            missing_indices = remaining_missing;
+            candidates = remaining_cand_indices
+                .into_iter()
+                .map(|idx| candidates[idx].clone())
+                .collect();
+
+            // Pass 2: unique match by (file_name, duration_bucket).
+            let (pass2_matches, remaining_missing, remaining_cand_indices) =
+                match_unique_moves(lib, &missing_indices, &candidates, |song| {
+                    let file_name = song.path.file_name().map(|n| n.to_os_string());
+                    Some((file_name, duration_bucket(song.duration_secs)))
+                });
+            for (song_idx, cand_idx) in pass2_matches {
+                apply_relink(&mut lib.songs[song_idx], &candidates[cand_idx]);
+                relinked_count += 1;
+            }
+
+            let unmatched_candidates: Vec<Song> = remaining_cand_indices
+                .into_iter()
+                .map(|idx| candidates[idx].clone())
+                .collect();
+            let added_count = unmatched_candidates.len();
+            lib.songs.extend(unmatched_candidates);
+
+            let remove_ids: HashSet<String> = remaining_missing
+                .into_iter()
+                .map(|idx| lib.songs[idx].id.clone())
+                .collect();
+            let removed_count = lib.remove_songs_by_ids(&remove_ids);
+
+            let unchanged_count = lib
+                .songs
+                .len()
+                .saturating_sub(added_count + relinked_count);
+
+            Ok(UpdateSummary {
+                added_count,
+                relinked_count,
+                removed_count,
+                unchanged_count,
+                skipped_files,
+            })
         })
     }
 
@@ -343,24 +552,10 @@ impl Library {
                 continue;
             }
 
-            match probe_track(&canonical) {
-                Ok(probe) => {
-                    let (title, artist) = normalize_track_metadata(
-                        probe.title.as_deref(),
-                        probe.artist.as_deref(),
-                        &canonical,
-                    );
-                    let album = clean_opt(probe.album);
-                    let song = Song {
-                        id: Uuid::new_v4().to_string(),
-                        title: title.clone(),
-                        artist,
-                        album,
-                        path: canonical,
-                        duration_secs: probe.duration_secs,
-                    };
+            match probe_song(canonical.clone()) {
+                Ok(song) => {
                     resolved_ids.push(song.id.clone());
-                    summary.added_titles.push(title);
+                    summary.added_titles.push(song.title.clone());
                     summary.added_count += 1;
                     self.songs.push(song);
                 }
@@ -1345,34 +1540,131 @@ impl Library {
     }
 }
 
-fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, Vec<String>)> {
-    if !folder {
-        let canonical = canonicalize_clean(path)?;
-        if !is_supported_extension(&canonical) {
-            return Err(TunrError::InvalidArg(format!(
-                "unsupported audio file extension: {}",
-                canonical.display()
-            )));
+fn probe_song(canonical: PathBuf) -> Result<Song> {
+    let probe = probe_track(&canonical)?;
+    let (title, artist) =
+        normalize_track_metadata(probe.title.as_deref(), probe.artist.as_deref(), &canonical);
+    let album = clean_opt(probe.album);
+    Ok(Song {
+        id: Uuid::new_v4().to_string(),
+        title,
+        artist,
+        album,
+        path: canonical,
+        duration_secs: probe.duration_secs,
+    })
+}
+
+fn duration_bucket(duration_secs: Option<f64>) -> Option<i64> {
+    duration_secs
+        .filter(|d| d.is_finite())
+        .map(|d| (d * 10.0).round() as i64)
+}
+
+fn apply_relink(target: &mut Song, candidate: &Song) {
+    target.path = candidate.path.clone();
+    target.title = candidate.title.clone();
+    target.artist = candidate.artist.clone();
+    target.album = candidate.album.clone();
+    target.duration_secs = candidate.duration_secs;
+}
+
+fn match_unique_moves<K>(
+    lib: &Library,
+    missing_indices: &[usize],
+    candidates: &[Song],
+    key_fn: impl Fn(&Song) -> Option<K>,
+) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut missing_by_key: HashMap<K, Vec<usize>> = HashMap::new();
+    for &song_idx in missing_indices {
+        if let Some(key) = key_fn(&lib.songs[song_idx]) {
+            missing_by_key.entry(key).or_default().push(song_idx);
         }
-        return Ok((vec![canonical], Vec::new()));
     }
+
+    let mut cands_by_key: HashMap<K, Vec<usize>> = HashMap::new();
+    for (cand_idx, cand) in candidates.iter().enumerate() {
+        if let Some(key) = key_fn(cand) {
+            cands_by_key.entry(key).or_default().push(cand_idx);
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut matched_songs = HashSet::new();
+    let mut matched_cands = HashSet::new();
+
+    for (key, m_list) in missing_by_key {
+        if m_list.len() == 1
+            && let Some(c_list) = cands_by_key.get(&key)
+            && c_list.len() == 1
+        {
+            let song_idx = m_list[0];
+            let cand_idx = c_list[0];
+            matches.push((song_idx, cand_idx));
+            matched_songs.insert(song_idx);
+            matched_cands.insert(cand_idx);
+        }
+    }
+
+    let remaining_missing = missing_indices
+        .iter()
+        .copied()
+        .filter(|idx| !matched_songs.contains(idx))
+        .collect();
+    let remaining_candidates = (0..candidates.len())
+        .filter(|idx| !matched_cands.contains(idx))
+        .collect();
+
+    (matches, remaining_missing, remaining_candidates)
+}
+
+fn walk_audio_files(
+    root: &Path,
+    skip_dirs: &[PathBuf],
+    skip_dir_names: &[&str],
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let canon_skip_dirs: Vec<PathBuf> = skip_dirs
+        .iter()
+        .map(|d| canonicalize_clean(d).unwrap_or_else(|_| d.to_path_buf()))
+        .collect();
 
     let mut files = Vec::new();
     let mut skipped = Vec::new();
-    for entry in WalkDir::new(path).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() > 0 && entry.file_type().is_dir() {
+                if skip_dir_names.iter().any(|name| entry.file_name() == *name) {
+                    return false;
+                }
+                if !canon_skip_dirs.is_empty()
+                    && (canon_skip_dirs.iter().any(|skip| skip == entry.path())
+                        || canonicalize_clean(entry.path())
+                            .is_ok_and(|canon| canon_skip_dirs.iter().any(|skip| skip == &canon)))
+                {
+                    return false;
+                }
+            }
+            true
+        })
+    {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
                 if err.depth() == 0 {
                     return Err(TunrError::Io(std::io::Error::other(format!(
                         "failed walking {}: {err}",
-                        path.display()
+                        root.display()
                     ))));
                 }
                 let entry_path = err
                     .path()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
+                    .unwrap_or_else(|| root.display().to_string());
                 skipped.push(format!("{entry_path}: {err}"));
                 continue;
             }
@@ -1392,7 +1684,22 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, V
     }
     files.sort();
     files.dedup();
+    Ok((files, skipped))
+}
 
+fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    if !folder {
+        let canonical = canonicalize_clean(path)?;
+        if !is_supported_extension(&canonical) {
+            return Err(TunrError::InvalidArg(format!(
+                "unsupported audio file extension: {}",
+                canonical.display()
+            )));
+        }
+        return Ok((vec![canonical], Vec::new()));
+    }
+
+    let (files, skipped) = walk_audio_files(path, &[], &[])?;
     if files.is_empty() {
         return Err(TunrError::NotFound(format!(
             "no supported audio files found in {}",
@@ -3264,5 +3571,375 @@ mod tests {
             lib.add_existing_song("Alpha", "   "),
             Err(TunrError::InvalidArg(_))
         ));
+    }
+
+    struct WorkspaceFixture {
+        root: PathBuf,
+        working_dir: PathBuf,
+        config_dir: PathBuf,
+        playlists_dir: PathBuf,
+        music_dir: PathBuf,
+        library_path: PathBuf,
+    }
+
+    impl WorkspaceFixture {
+        fn new(label: &str) -> Self {
+            let root = temp_workspace(label);
+            let working_dir = root.join("workspace");
+            let config_dir = working_dir.join("config");
+            let playlists_dir = working_dir.join("playlists");
+            let music_dir = working_dir.join("music");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::create_dir_all(&playlists_dir).unwrap();
+            fs::create_dir_all(&music_dir).unwrap();
+            let library_path = playlists_dir.join("library.json");
+            Self {
+                root,
+                working_dir,
+                config_dir,
+                playlists_dir,
+                music_dir,
+                library_path,
+            }
+        }
+    }
+
+    impl Drop for WorkspaceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn update_if_changed_skips_rewrite_when_unmodified_and_writes_on_change() {
+        let ws = WorkspaceFixture::new("if-changed");
+        let lib_path = &ws.library_path;
+
+        // Missing file is created on initial update_if_changed.
+        Library::update_if_changed(lib_path, |_| Ok(())).unwrap();
+        assert!(lib_path.exists());
+
+        let track = ws.music_dir.join("Tone.wav");
+        write_synthetic_wav(&track, 22_050, 0.2);
+
+        // Mutating writes the updated library.
+        Library::update_if_changed(lib_path, |lib| {
+            lib.add_files(&track, false, None).map(|_| ())
+        })
+        .unwrap();
+
+        let meta_before = fs::metadata(lib_path).unwrap();
+        let bytes_before = fs::read(lib_path).unwrap();
+
+        // No-op mutator must not rewrite library.json (mtime, inode, content stay identical).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Library::update_if_changed(lib_path, |_| Ok(())).unwrap();
+
+        let meta_after = fs::metadata(lib_path).unwrap();
+        let bytes_after = fs::read(lib_path).unwrap();
+        assert_eq!(meta_after.modified().unwrap(), meta_before.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(meta_after.ino(), meta_before.ino());
+        }
+        assert_eq!(bytes_after, bytes_before);
+
+        // Legacy un-normalized song triggers a write on next update_if_changed.
+        Library::update(lib_path, |lib| {
+            lib.songs[0].title = "Artist One - Tone".to_string();
+            lib.songs[0].artist = None;
+            Ok(())
+        })
+        .unwrap();
+        let normalized_again = Library::update_if_changed(lib_path, |_| Ok(())).map(|_| {
+            Library::load(lib_path).unwrap()
+        }).unwrap();
+        assert_eq!(normalized_again.songs[0].title, "Tone");
+        assert_eq!(normalized_again.songs[0].artist.as_deref(), Some("Artist One"));
+    }
+
+    #[test]
+    fn update_workspace_scans_roots_skips_internal_dirs_and_is_idempotent() {
+        let ws = WorkspaceFixture::new("scan-roots");
+        let separate_dl = ws.root.join("downloads");
+        fs::create_dir_all(&separate_dl).unwrap();
+
+        // Valid tracks across working_dir root, music/, subdirs, and separate download_dest.
+        write_synthetic_wav(&ws.working_dir.join("RootTrack.wav"), 22_050, 0.2);
+        write_synthetic_wav(&ws.music_dir.join("Album").join("MusicTrack.wav"), 22_050, 0.25);
+        write_synthetic_wav(&separate_dl.join("sub").join("Downloaded.wav"), 22_050, 0.3);
+
+        // Internal/staging directories must be ignored.
+        write_synthetic_wav(&ws.config_dir.join("ShouldIgnoreConfig.wav"), 22_050, 0.2);
+        write_synthetic_wav(
+            &ws.playlists_dir.join("ShouldIgnorePlaylists.wav"),
+            22_050,
+            0.2,
+        );
+        write_synthetic_wav(
+            &ws.working_dir.join(".tunr-dl-tmp").join("Partial.wav"),
+            22_050,
+            0.2,
+        );
+        write_synthetic_wav(
+            &separate_dl.join(".tunr-dl-tmp").join("PartialDl.wav"),
+            22_050,
+            0.2,
+        );
+
+        let first = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            Some(&separate_dl),
+        )
+        .unwrap();
+        assert_eq!(first.added_count, 3);
+        assert_eq!(first.relinked_count, 0);
+        assert_eq!(first.removed_count, 0);
+        assert_eq!(first.unchanged_count, 0);
+        assert!(first.skipped_files.is_empty(), "{:?}", first.skipped_files);
+
+        let lib = Library::load(&ws.library_path).unwrap();
+        let titles: Vec<&str> = lib.songs.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Downloaded", "RootTrack", "MusicTrack"]);
+
+        // Re-running update_workspace with no changes is idempotent and does not rewrite library.json.
+        let meta_before = fs::metadata(&ws.library_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            Some(&separate_dl),
+        )
+        .unwrap();
+        assert_eq!(second.added_count, 0);
+        assert_eq!(second.relinked_count, 0);
+        assert_eq!(second.removed_count, 0);
+        assert_eq!(second.unchanged_count, 3);
+        assert!(second.skipped_files.is_empty());
+
+        let meta_after = fs::metadata(&ws.library_path).unwrap();
+        assert_eq!(meta_after.modified().unwrap(), meta_before.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(meta_after.ino(), meta_before.ino());
+        }
+    }
+
+    #[test]
+    fn update_workspace_relinks_moved_files_prunes_deleted_and_keeps_external_songs() {
+        let ws = WorkspaceFixture::new("relink-prune");
+        let external_dir = ws.root.join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let move_src = ws.music_dir.join("KeepAndMove.wav");
+        let pass2_src = ws.music_dir.join("SameFilePass2.wav");
+        let delete_src = ws.music_dir.join("DeleteMe.wav");
+        let keep_src = ws.music_dir.join("StayPut.wav");
+        let external_src = external_dir.join("ExternalTrack.wav");
+        let external_missing = external_dir.join("ExternalMissing.wav");
+
+        write_synthetic_wav(&move_src, 22_050, 0.25);
+        write_synthetic_wav(&pass2_src, 22_050, 0.40);
+        write_synthetic_wav(&delete_src, 22_050, 0.15);
+        write_synthetic_wav(&keep_src, 22_050, 0.55);
+        write_synthetic_wav(&external_src, 22_050, 0.30);
+        write_synthetic_wav(&external_missing, 22_050, 0.35);
+
+        // Index workspace files and external files, and build a playlist referencing them.
+        Library::update(&ws.library_path, |lib| {
+            lib.add_files(&ws.music_dir, true, Some("Favorites"))?;
+            lib.add_files(&external_src, false, Some("Favorites"))?;
+            lib.add_files(&external_missing, false, Some("Favorites"))?;
+            // Adjust Pass 2 song's title in library so Pass 1 key differs while Pass 2 (file_name, duration_bucket) matches.
+            let pass2_song = lib
+                .songs
+                .iter_mut()
+                .find(|s| s.title == "SameFilePass2")
+                .unwrap();
+            pass2_song.title = "Custom Library Title".to_string();
+            Ok(())
+        })
+        .unwrap();
+
+        let before = Library::load(&ws.library_path).unwrap();
+        let moved_id = before
+            .songs
+            .iter()
+            .find(|s| s.title == "KeepAndMove")
+            .unwrap()
+            .id
+            .clone();
+        let pass2_id = before
+            .songs
+            .iter()
+            .find(|s| s.title == "Custom Library Title")
+            .unwrap()
+            .id
+            .clone();
+        let deleted_id = before
+            .songs
+            .iter()
+            .find(|s| s.title == "DeleteMe")
+            .unwrap()
+            .id
+            .clone();
+        let external_missing_id = before
+            .songs
+            .iter()
+            .find(|s| s.title == "ExternalMissing")
+            .unwrap()
+            .id
+            .clone();
+
+        // Move two workspace tracks, delete one workspace track, and delete an external track.
+        let move_dst = ws.working_dir.join("sorted").join("KeepAndMove.wav");
+        fs::create_dir_all(move_dst.parent().unwrap()).unwrap();
+        fs::rename(&move_src, &move_dst).unwrap();
+
+        let pass2_dst = ws.working_dir.join("archived").join("SameFilePass2.wav");
+        fs::create_dir_all(pass2_dst.parent().unwrap()).unwrap();
+        fs::rename(&pass2_src, &pass2_dst).unwrap();
+
+        fs::remove_file(&delete_src).unwrap();
+        fs::remove_file(&external_missing).unwrap();
+
+        let summary = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.added_count, 0);
+        assert_eq!(summary.relinked_count, 2);
+        assert_eq!(summary.removed_count, 1);
+        assert_eq!(summary.unchanged_count, 3); // StayPut + ExternalTrack + ExternalMissing
+
+        let after = Library::load(&ws.library_path).unwrap();
+        assert_eq!(after.songs.len(), 5);
+        assert!(after.find_song_by_id(&deleted_id).is_none());
+
+        let relinked_1 = after.find_song_by_id(&moved_id).unwrap();
+        assert_eq!(relinked_1.path, canonicalize_clean(&move_dst).unwrap());
+
+        let relinked_2 = after.find_song_by_id(&pass2_id).unwrap();
+        assert_eq!(relinked_2.path, canonicalize_clean(&pass2_dst).unwrap());
+
+        // External missing song outside scan_roots must remain untouched.
+        assert!(after.find_song_by_id(&external_missing_id).is_some());
+
+        // Playlist preserved relinked IDs and external IDs, while pruning deleted workspace ID.
+        let fav = &after.playlists[0];
+        assert_eq!(fav.name, "Favorites");
+        assert!(fav.song_ids.contains(&moved_id));
+        assert!(fav.song_ids.contains(&pass2_id));
+        assert!(fav.song_ids.contains(&external_missing_id));
+        assert!(!fav.song_ids.contains(&deleted_id));
+    }
+
+    #[test]
+    fn update_workspace_does_not_relink_ambiguous_moves() {
+        let ws = WorkspaceFixture::new("ambiguous-move");
+        let a = ws.music_dir.join("dir_a").join("Dup.wav");
+        let b = ws.music_dir.join("dir_b").join("Dup.wav");
+        write_synthetic_wav(&a, 22_050, 0.25);
+        write_synthetic_wav(&b, 22_050, 0.25);
+
+        Library::update(&ws.library_path, |lib| {
+            lib.add_files(&ws.music_dir, true, None).map(|_| ())
+        })
+        .unwrap();
+
+        // Remove both originals and place one copy in a new folder -> ambiguous (2 missing, 1 candidate).
+        fs::remove_file(&a).unwrap();
+        fs::remove_file(&b).unwrap();
+        let moved = ws.music_dir.join("dir_c").join("Dup.wav");
+        write_synthetic_wav(&moved, 22_050, 0.25);
+
+        let summary = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.relinked_count, 0);
+        assert_eq!(summary.added_count, 1);
+        assert_eq!(summary.removed_count, 2);
+        assert_eq!(summary.unchanged_count, 0);
+    }
+
+    #[test]
+    fn update_workspace_handles_empty_workspace_corrupt_files_and_missing_download_dest() {
+        let ws = WorkspaceFixture::new("edge-cases");
+
+        // Empty workspace succeeds with zero counts.
+        let empty_summary = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty_summary, UpdateSummary::default());
+
+        // Add a valid track and a track under a download_dest that later disappears (e.g. unmounted drive).
+        let dl_dest = ws.root.join("external_dl");
+        fs::create_dir_all(&dl_dest).unwrap();
+        let dl_track = dl_dest.join("MountedTrack.wav");
+        write_synthetic_wav(&dl_track, 22_050, 0.2);
+
+        let valid_track = ws.music_dir.join("Healthy.wav");
+        write_synthetic_wav(&valid_track, 22_050, 0.2);
+        let corrupt_track = ws.music_dir.join("Corrupt.wav");
+        fs::write(&corrupt_track, b"not a valid audio file").unwrap();
+
+        let first = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            Some(&dl_dest),
+        )
+        .unwrap();
+        assert_eq!(first.added_count, 2);
+        assert_eq!(first.skipped_files.len(), 1);
+        assert!(first.skipped_files[0].contains("Corrupt.wav"));
+
+        // Simulate unmounted download_dest: directory no longer exists.
+        fs::remove_dir_all(&dl_dest).unwrap();
+
+        let after_unmount = Library::update_workspace(
+            &ws.library_path,
+            &ws.working_dir,
+            &ws.config_dir,
+            &ws.playlists_dir,
+            Some(&dl_dest),
+        )
+        .unwrap();
+        assert_eq!(after_unmount.removed_count, 0);
+        assert_eq!(after_unmount.unchanged_count, 2);
+        assert!(
+            after_unmount
+                .skipped_files
+                .iter()
+                .any(|w| w.contains("does not exist") || w.contains("skipping scan")),
+            "expected missing download_dest warning, got {:?}",
+            after_unmount.skipped_files
+        );
+
+        let lib = Library::load(&ws.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 2);
+        assert!(lib.songs.iter().any(|s| s.title == "MountedTrack"));
     }
 }

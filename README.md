@@ -110,11 +110,13 @@ tunr search "lofi"    # Search YouTube interactively
 | `tunr search [OPTIONS] [QUERY...]` | Search supported providers via `yt-dlp`, copy URLs, or download tracks/videos |
 | `tunr download [OPTIONS] <URL\|LINK_FILE...>` | Download media via `yt-dlp` from URLs or `.link` batch files and auto-index audio tracks into the library |
 | `tunr add [-p <PLAYLIST>] [-f \| -e] [<PATH> \| -s <SONG>]` | Add an audio file, folder (`-f`), or existing library song (`-e` / `-s` with `-p`) to the library and/or a playlist |
+| `tunr update` | Rescan workspace (and configured download directory) for new, moved, or removed audio files |
 | `tunr list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
 | `tunr play [OPTIONS] [TARGET] [MODE]` | Play a song, playlist, `<playlist>[<index>]` (1-based start track), or 1-based `list` index, or resume paused playback when omitted |
 | `tunr pause` / `resume` / `stop` | Control daemon playback |
 | `tunr next` / `prev` | Skip to next or previous track |
 | `tunr rewind [secs]` / `advance <secs>` | Seek backward (omitting `<secs>` rewinds to the beginning of the song) or forward |
+| `tunr volume [n]` | Get or set playback volume percentage (`0`–`100`, default `50`; persisted in workspace config) |
 | `tunr create <name> [songs=<s1,s2,...>]... [-s <song>]...` | Create a playlist from existing library songs |
 | `tunr delete [-s \| -p] <target>` | Remove a song or playlist from the library index (`-p MyList[<index>]` removes only that track from `MyList`; leaves files on disk untouched) |
 | `tunr status` | Show current daemon playback status |
@@ -165,6 +167,22 @@ tunr add -e "Mundo - IV Of Spades" -p Favorites
 tunr add -s "Mundo" -p Favorites
 tunr add -p Favorites -s 5
 ```
+
+## `tunr update`
+
+Recheck your Tunr workspace against the filesystem to index newly added tracks, relink moved or renamed tracks, and prune deleted workspace files:
+
+```bash
+tunr update
+```
+
+### Behavior
+
+- **Zero-argument command**: `tunr update` takes no positional arguments or flags.
+- **Scanned roots**: Recursively scans your workspace `working_dir` (automatically skipping the internal `config` and `playlists` directories and `.tunr-dl-tmp` staging folders), plus your configured `download_dest` directory if it lives outside `working_dir`.
+- **Move & rename relinking**: Uniquely matched moved or renamed audio files within the scanned roots are relinked in place, preserving their song IDs and existing playlist memberships.
+- **Scoped missing-file pruning**: Missing audio files whose paths are inside the scanned roots are removed from the library index and playlists, while songs imported from external paths outside the scanned roots are left untouched.
+- **Automatic TUI reload**: If the interactive `tunr` TUI is open, it detects changes to `library.json` and reloads the updated library automatically.
 
 ## `tunr play`
 
@@ -325,21 +343,24 @@ tunr delete 'MyList[2]'
 
 ## Playback & Seeking Controls
 
-Control an active daemon playback session from the CLI:
+Control an active daemon playback session from the CLI (and query or persist volume even when the daemon is stopped):
 
 ```bash
 tunr rewind          # Rewind to 00:00 (the beginning of the current song)
 tunr rewind 15       # Rewind backward by 15 seconds
 tunr advance 15      # Seek forward by 15 seconds
+tunr volume          # Show current playback volume percentage (0-100)
+tunr volume 75       # Set playback volume to 75% (persisted across restarts)
 tunr pause           # Pause playback
 tunr resume          # Resume paused playback
 tunr next            # Skip to next track
 tunr prev            # Return to previous track
 tunr stop            # Stop playback and clear the active queue
-tunr status          # Print current track, state, mode, and loop status
+tunr status          # Print current track, state, mode, loop, and volume status
 ```
 
 - Calling `tunr rewind` without `<seconds>` seeks in place to `00:00`: if playback is `playing`, it restarts from the beginning; if `paused`, it resets to `00:00` while staying paused; if `stopped`, it returns an error.
+- `tunr volume [n]` accepts an integer percentage from `0` to `100` (default `50`), persists it to workspace `config.json`, and updates the running daemon immediately when active (or takes effect on the next playback session when the daemon is stopped).
 
 ### Interactive Player TUI Controls
 
@@ -351,6 +372,7 @@ Launch the full-screen player UI with `tunr` (or `tunr tui`):
 - `Space`: pause or resume playback
 - `n` / `b`: next or previous track
 - `[` / `]`: rewind or advance by `5` seconds
+- `-` / `+` (`=`): decrease or increase volume by `5%` (persisted to workspace config)
 - `s`: toggle playback mode (`Next` / `Shuffle`)
 - `d`: delete selected song or playlist from the library index (with confirmation)
 - `q` / `Esc`: quit the TUI (keeps background daemon playing)

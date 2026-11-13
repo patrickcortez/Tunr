@@ -98,13 +98,18 @@ pub enum IpcRequest {
     SeekAbsolute(f64),
     TogglePause,
     SetPaused(bool),
+    SetVolume(u8),
     Stop,
     GetStatus,
     Shutdown,
 }
 
+fn default_volume() -> u8 {
+    crate::paths::DEFAULT_VOLUME
+}
+
 /// Snapshot of current daemon playback state returned in `IpcResponse::Ok`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaybackStatus {
     pub state: PlaybackState,
     pub mode: PlayMode,
@@ -117,6 +122,26 @@ pub struct PlaybackStatus {
     pub queue: Vec<Song>,
     #[serde(default)]
     pub loop_playback: bool,
+    #[serde(default = "default_volume")]
+    pub volume: u8,
+}
+
+impl Default for PlaybackStatus {
+    fn default() -> Self {
+        Self {
+            state: PlaybackState::default(),
+            mode: PlayMode::default(),
+            playlist_name: None,
+            current_track: None,
+            queue_index: 0,
+            queue_len: 0,
+            position_secs: 0.0,
+            duration_secs: None,
+            queue: Vec::new(),
+            loop_playback: false,
+            volume: crate::paths::DEFAULT_VOLUME,
+        }
+    }
 }
 
 /// Response returned by the Tunr playback daemon for an `IpcRequest`.
@@ -678,6 +703,8 @@ async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
     cmd.arg("__daemon")
         .arg("--library-path")
         .arg(&paths.library_path)
+        .arg("--config-path")
+        .arg(&paths.config_path)
         .arg("--socket-path")
         .arg(paths.ipc_endpoint.to_arg_string())
         .arg("--pid-path")
@@ -878,11 +905,54 @@ mod tests {
             duration_secs: Some(123.5),
             queue: vec![song],
             loop_playback: false,
+            volume: 75,
         };
         let resp = IpcResponse::Ok(status);
         let resp_json = serde_json::to_string(&resp).unwrap();
         let resp_decoded: IpcResponse = serde_json::from_str(&resp_json).unwrap();
         assert_eq!(resp, resp_decoded);
+    }
+
+    #[test]
+    fn playback_status_default_sets_default_volume() {
+        let status = PlaybackStatus::default();
+        assert_eq!(status.state, PlaybackState::Stopped);
+        assert_eq!(status.mode, PlayMode::Next);
+        assert_eq!(status.playlist_name, None);
+        assert_eq!(status.current_track, None);
+        assert_eq!(status.queue_index, 0);
+        assert_eq!(status.queue_len, 0);
+        assert_eq!(status.position_secs, 0.0);
+        assert_eq!(status.duration_secs, None);
+        assert!(status.queue.is_empty());
+        assert!(!status.loop_playback);
+        assert_eq!(status.volume, crate::paths::DEFAULT_VOLUME);
+    }
+
+    #[test]
+    fn set_volume_ipc_request_round_trips() {
+        for volume in [0_u8, crate::paths::DEFAULT_VOLUME, crate::paths::MAX_VOLUME] {
+            let req = IpcRequest::SetVolume(volume);
+            let json = serde_json::to_string(&req).unwrap();
+            let decoded: IpcRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(req, decoded);
+        }
+    }
+
+    #[test]
+    fn playback_status_missing_volume_json_defaults_to_fifty() {
+        let legacy_status_json = r#"{"state":"playing","mode":"next","playlist_name":null,"current_track":null,"queue_index":0,"queue_len":0,"position_secs":0.0,"duration_secs":null,"queue":[],"loop_playback":false}"#;
+        let decoded_status: PlaybackStatus = serde_json::from_str(legacy_status_json).unwrap();
+        assert_eq!(decoded_status.volume, 50);
+        assert_eq!(decoded_status.volume, crate::paths::DEFAULT_VOLUME);
+
+        let explicit_status = PlaybackStatus {
+            volume: 85,
+            ..PlaybackStatus::default()
+        };
+        let explicit_json = serde_json::to_string(&explicit_status).unwrap();
+        let round_tripped: PlaybackStatus = serde_json::from_str(&explicit_json).unwrap();
+        assert_eq!(explicit_status, round_tripped);
     }
 
     #[test]
