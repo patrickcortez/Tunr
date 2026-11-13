@@ -8,7 +8,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::audio::{self, AudioSink};
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::ipc::{self, IpcListener, IpcRequest, IpcResponse, IpcStream};
 use crate::paths::{self, AppPaths, IpcEndpoint};
 use crate::platform::ShutdownSignals;
@@ -83,7 +83,7 @@ where
         let Some(daemon_lock) =
             paths::acquire_file_lock(&startup_paths.daemon_lock_path(), true, false)?
         else {
-            return Err(TermusicError::Daemon("daemon already running".to_string()));
+            return Err(TunrError::Daemon("daemon already running".to_string()));
         };
 
         prepare_daemon_files(&startup_paths)?;
@@ -95,7 +95,7 @@ where
         Ok((daemon_lock, sink))
     })
     .await
-    .map_err(|err| TermusicError::Async(format!("daemon startup task failed: {err}")))??;
+    .map_err(|err| TunrError::Async(format!("daemon startup task failed: {err}")))??;
 
     let listener = match IpcListener::bind(&paths.ipc_endpoint) {
         Ok(listener) => listener,
@@ -142,9 +142,9 @@ where
 
     let join_res = tokio::task::spawn_blocking(move || engine_thread.join())
         .await
-        .map_err(|err| TermusicError::Async(format!("engine join task failed: {err}")))
+        .map_err(|err| TunrError::Async(format!("engine join task failed: {err}")))
         .and_then(|res| {
-            res.map_err(|_| TermusicError::Async("audio engine thread panicked".to_string()))
+            res.map_err(|_| TunrError::Async("audio engine thread panicked".to_string()))
         });
 
     // Drop socket/PID cleanup guard BEFORE releasing `_daemon_lock` so no racing startup removes
@@ -296,7 +296,7 @@ async fn handle_client(
                 return Ok(());
             }
             Err(_) => {
-                return Err(TermusicError::Ipc(
+                return Err(TunrError::Ipc(
                     "timed out reading IPC request from client".to_string(),
                 ));
             }
@@ -346,7 +346,7 @@ async fn handle_client(
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) if is_client_disconnect(&err) => Ok(()),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(TermusicError::Ipc(
+        Err(_) => Err(TunrError::Ipc(
             "timed out writing IPC response to client".to_string(),
         )),
     }
@@ -379,9 +379,9 @@ fn map_ipc_to_engine_command(req: IpcRequest) -> EngineCommand {
     }
 }
 
-fn is_client_disconnect(err: &TermusicError) -> bool {
+fn is_client_disconnect(err: &TunrError) -> bool {
     match err {
-        TermusicError::Io(io_err) => {
+        TunrError::Io(io_err) => {
             if matches!(
                 io_err.kind(),
                 io::ErrorKind::BrokenPipe
@@ -532,7 +532,7 @@ mod tests {
         let err = ipc::send_request(&paths, &IpcRequest::Next)
             .await
             .unwrap_err();
-        assert!(matches!(err, TermusicError::Daemon(_)));
+        assert!(matches!(err, TunrError::Daemon(_)));
 
         // Play starts queue at Alpha.
         let playing = ipc::send_request(
@@ -644,7 +644,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(dup_err, TermusicError::Daemon(ref msg) if msg.contains("already running")),
+            matches!(dup_err, TunrError::Daemon(ref msg) if msg.contains("already running")),
             "unexpected duplicate daemon error: {dup_err:?}"
         );
 

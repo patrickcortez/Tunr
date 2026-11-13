@@ -7,13 +7,13 @@ use walkdir::WalkDir;
 
 use crate::audio::{is_supported_extension, probe_track};
 use crate::cli::validate_add_path;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::ipc::TargetKind;
 use crate::paths::{lock_path_for, with_file_lock, write_json_atomic};
 use crate::platform::canonicalize_clean;
 
 pub const LIBRARY_VERSION: u32 = 1;
-const INVALID_ONE_BASED_INDEX_MSG: &str = "index must be >= 1 (1-based from `termusic list`)";
+const INVALID_ONE_BASED_INDEX_MSG: &str = "index must be >= 1 (1-based from `tunr list`)";
 
 /// Metadata record for a single audio track indexed in `library.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,14 +251,14 @@ impl Library {
                     match self.lookup_playlist(playlist_name) {
                         LookupMatch::One(idx) => return Ok(idx),
                         LookupMatch::Multiple(names) => {
-                            return Err(TermusicError::Ambiguous(format!(
+                            return Err(TunrError::Ambiguous(format!(
                                 "playlist '{playlist_name}' matched multiple entries: {}",
                                 names.join(", ")
                             )));
                         }
                         LookupMatch::None => {
                             return if matches!(parsed, Ok(0)) {
-                                Err(TermusicError::InvalidArg(
+                                Err(TunrError::InvalidArg(
                                     INVALID_ONE_BASED_INDEX_MSG.to_string(),
                                 ))
                             } else {
@@ -276,7 +276,7 @@ impl Library {
 
         match self.lookup_playlist(playlist_name) {
             LookupMatch::One(idx) => Ok(idx),
-            LookupMatch::Multiple(names) => Err(TermusicError::Ambiguous(format!(
+            LookupMatch::Multiple(names) => Err(TunrError::Ambiguous(format!(
                 "playlist '{playlist_name}' matched multiple entries: {}",
                 names.join(", ")
             ))),
@@ -305,10 +305,10 @@ impl Library {
     fn resolve_existing_song_index(&self, trimmed: &str) -> Result<usize> {
         match self.resolve_create_song_match(trimmed)? {
             LookupMatch::One(idx) => Ok(idx),
-            LookupMatch::None => Err(TermusicError::NotFound(format!(
+            LookupMatch::None => Err(TunrError::NotFound(format!(
                 "no song found matching '{trimmed}'"
             ))),
-            LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
+            LookupMatch::Multiple(matches) => Err(TunrError::Ambiguous(format!(
                 "ambiguous song '{trimmed}': {} (use \"Title - Artist\" or list index)",
                 matches.join(", ")
             ))),
@@ -334,7 +334,7 @@ impl Library {
             ..AddSummary::default()
         };
         let mut resolved_ids = Vec::with_capacity(candidates.len());
-        let mut last_probe_err: Option<TermusicError> = None;
+        let mut last_probe_err: Option<TunrError> = None;
 
         for canonical in candidates {
             if let Some(existing) = self.songs.iter().find(|s| s.path == canonical) {
@@ -396,7 +396,7 @@ impl Library {
     pub fn add_song(&mut self, query: &str, playlist_name: Option<&str>) -> Result<AddSummary> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "song cannot be empty".to_string(),
             ));
         }
@@ -409,8 +409,8 @@ impl Library {
 
         if let Some(pl_name) = clean_playlist {
             let idx = self.resolve_existing_song_index(trimmed).map_err(|err| match err {
-                TermusicError::NotFound(_) => {
-                    TermusicError::NotFound(format!("song or audio file '{trimmed}' not found"))
+                TunrError::NotFound(_) => {
+                    TunrError::NotFound(format!("song or audio file '{trimmed}' not found"))
                 }
                 other => other,
             })?;
@@ -438,7 +438,7 @@ impl Library {
     ) -> Result<AddSummary> {
         let trimmed_song = query.trim();
         if trimmed_song.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "song cannot be empty".to_string(),
             ));
         }
@@ -466,25 +466,25 @@ impl Library {
     pub fn create_playlist(&mut self, name: &str, song_titles: &[String]) -> Result<Playlist> {
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "playlist name cannot be empty".to_string(),
             ));
         }
         if song_titles.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "playlist must contain at least one song".to_string(),
             ));
         }
 
         match self.lookup_playlist(trimmed_name) {
             LookupMatch::One(idx) => {
-                return Err(TermusicError::AlreadyExists(format!(
+                return Err(TunrError::AlreadyExists(format!(
                     "playlist '{}' already exists",
                     self.playlists[idx].name
                 )));
             }
             LookupMatch::Multiple(_) => {
-                return Err(TermusicError::AlreadyExists(format!(
+                return Err(TunrError::AlreadyExists(format!(
                     "playlist '{trimmed_name}' already exists"
                 )));
             }
@@ -524,13 +524,13 @@ impl Library {
             }
             let msg = parts.join("; ");
             if missing.is_empty() {
-                return Err(TermusicError::Ambiguous(msg));
+                return Err(TunrError::Ambiguous(msg));
             }
-            return Err(TermusicError::NotFound(msg));
+            return Err(TunrError::NotFound(msg));
         }
 
         if resolved_ids.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "playlist must contain at least one non-empty song title".to_string(),
             ));
         }
@@ -550,7 +550,7 @@ impl Library {
     pub fn delete_target(&mut self, query: &str, kind: TargetKind) -> Result<DeleteOutcome> {
         let q = query.trim();
         if q.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "delete target cannot be empty".to_string(),
             ));
         }
@@ -577,7 +577,7 @@ impl Library {
                 let has_playlist = !matches!(playlist_match, LookupMatch::None);
 
                 if has_song && has_playlist {
-                    return Err(TermusicError::Ambiguous(format!(
+                    return Err(TunrError::Ambiguous(format!(
                         "'{q}' matches both a song and a playlist; specify `--song` or `--playlist`"
                     )));
                 }
@@ -592,7 +592,7 @@ impl Library {
                         playlist_name,
                         one_based_index,
                     } => self.delete_playlist_song_by_index(playlist_name, one_based_index),
-                    BracketIndexLookup::None => Err(TermusicError::NotFound(format!(
+                    BracketIndexLookup::None => Err(TunrError::NotFound(format!(
                         "no song or playlist found matching '{q}'"
                     ))),
                 }
@@ -611,7 +611,7 @@ impl Library {
                     .iter()
                     .map(format_ambiguous_candidate)
                     .collect();
-                Err(TermusicError::Ambiguous(format!(
+                Err(TunrError::Ambiguous(format!(
                     "multiple songs match '{query}': {}",
                     labels.join(", ")
                 )))
@@ -630,7 +630,7 @@ impl Library {
     ) -> Result<PlayResolution> {
         let q = query.trim();
         if q.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "play target cannot be empty".to_string(),
             ));
         }
@@ -638,7 +638,7 @@ impl Library {
             Some(raw) => {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
-                    return Err(TermusicError::InvalidArg(
+                    return Err(TunrError::InvalidArg(
                         "artist filter cannot be empty".to_string(),
                     ));
                 }
@@ -655,7 +655,7 @@ impl Library {
             TargetKind::Song => self.resolve_song_play_candidates(q, clean_artist),
             TargetKind::Playlist => {
                 if clean_artist.is_some() {
-                    return Err(TermusicError::InvalidArg(
+                    return Err(TunrError::InvalidArg(
                         "--artist cannot be used with --playlist".to_string(),
                     ));
                 }
@@ -704,7 +704,7 @@ impl Library {
                 let has_song = !song_indices.is_empty();
 
                 if has_song && has_playlist && song_is_exact_title {
-                    return Err(TermusicError::Ambiguous(format!(
+                    return Err(TunrError::Ambiguous(format!(
                         "'{q}' matches both a song and a playlist; specify `--song` or `--playlist`"
                     )));
                 }
@@ -719,7 +719,7 @@ impl Library {
                     self.resolve_playlist_play_target(q)
                         .map(PlayResolution::Ready)
                 } else {
-                    Err(TermusicError::NotFound(format!(
+                    Err(TunrError::NotFound(format!(
                         "no song or playlist found matching '{q}'"
                     )))
                 }
@@ -727,7 +727,7 @@ impl Library {
         }
     }
 
-    /// Strictly resolve a 1-based list index (`termusic list`) into a playable song or playlist.
+    /// Strictly resolve a 1-based list index (`tunr list`) into a playable song or playlist.
     pub fn resolve_play_index(
         &self,
         one_based_index: usize,
@@ -735,12 +735,12 @@ impl Library {
         artist: Option<&str>,
     ) -> Result<PlayResolution> {
         if one_based_index == 0 {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 INVALID_ONE_BASED_INDEX_MSG.to_string(),
             ));
         }
         if artist.is_some() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "--artist cannot be used with --index".to_string(),
             ));
         }
@@ -770,7 +770,7 @@ impl Library {
             .songs
             .get(index)
             .cloned()
-            .ok_or_else(|| TermusicError::NotFound(format!("song index {index} out of bounds")))?;
+            .ok_or_else(|| TunrError::NotFound(format!("song index {index} out of bounds")))?;
         let mut queue = Vec::with_capacity(self.songs.len());
         queue.extend_from_slice(&self.songs[index..]);
         queue.extend_from_slice(&self.songs[..index]);
@@ -810,7 +810,7 @@ impl Library {
         one_based_index: usize,
     ) -> Result<DeleteOutcome> {
         if one_based_index == 0 {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 INVALID_ONE_BASED_INDEX_MSG.to_string(),
             ));
         }
@@ -818,12 +818,12 @@ impl Library {
         let playable = self.resolve_playable_playlist_entries(pl_idx);
         let pl_name = &self.playlists[pl_idx].name;
         if playable.is_empty() {
-            return Err(TermusicError::NotFound(format!(
+            return Err(TunrError::NotFound(format!(
                 "playlist '{pl_name}' contains no songs"
             )));
         }
         if one_based_index > playable.len() {
-            return Err(TermusicError::NotFound(format!(
+            return Err(TunrError::NotFound(format!(
                 "playlist '{pl_name}' track index {one_based_index} out of bounds (playlist has {} track(s))",
                 playable.len()
             )));
@@ -862,7 +862,7 @@ impl Library {
                     Some(artist) => format!("no song found matching '{query}' by artist '{artist}'"),
                     None => format!("no song found matching '{query}'"),
                 };
-                Err(TermusicError::NotFound(msg))
+                Err(TunrError::NotFound(msg))
             }
             1 => Ok(PlayResolution::Ready(
                 self.play_target_for_song_index(indices[0])?,
@@ -886,7 +886,7 @@ impl Library {
                         .lookup_song_indices_with_tier(query, None, SongLookupMode::Strict)
                         .0;
                     if exact.is_empty() {
-                        Err(TermusicError::InvalidArg(
+                        Err(TunrError::InvalidArg(
                             INVALID_ONE_BASED_INDEX_MSG.to_string(),
                         ))
                     } else {
@@ -1086,7 +1086,7 @@ impl Library {
             Ok(_) => self.resolve_exact_numeric_fallback(
                 q,
                 kind,
-                TermusicError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string()),
+                TunrError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string()),
             ),
             Err(_) => {
                 let err = match kind {
@@ -1108,7 +1108,7 @@ impl Library {
         &self,
         q: &str,
         kind: TargetKind,
-        on_none: TermusicError,
+        on_none: TunrError,
     ) -> Result<PlayResolution> {
         match kind {
             TargetKind::Playlist => match self.lookup_playlist(q) {
@@ -1136,7 +1136,7 @@ impl Library {
                 let has_playlist = !matches!(playlist_match, LookupMatch::None);
 
                 if has_song && has_playlist {
-                    Err(TermusicError::Ambiguous(format!(
+                    Err(TunrError::Ambiguous(format!(
                         "'{q}' matches both a song and a playlist; specify `--song` or `--playlist`"
                     )))
                 } else if has_playlist {
@@ -1176,7 +1176,7 @@ impl Library {
             .map(|(_, song)| song)
             .collect();
         if songs.is_empty() {
-            return Err(TermusicError::NotFound(format!(
+            return Err(TunrError::NotFound(format!(
                 "playlist '{}' contains no playable songs",
                 playlist.name
             )));
@@ -1184,12 +1184,12 @@ impl Library {
         let start_index = match one_based_index {
             Some(idx) => {
                 if idx == 0 {
-                    return Err(TermusicError::InvalidArg(
+                    return Err(TunrError::InvalidArg(
                         INVALID_ONE_BASED_INDEX_MSG.to_string(),
                     ));
                 }
                 if idx > songs.len() {
-                    return Err(TermusicError::NotFound(format!(
+                    return Err(TunrError::NotFound(format!(
                         "playlist '{}' track index {idx} out of bounds (playlist has {} track(s))",
                         playlist.name,
                         songs.len()
@@ -1209,10 +1209,10 @@ impl Library {
     fn resolve_unique_song_index(&self, query: &str) -> Result<usize> {
         match self.lookup_song(query) {
             LookupMatch::One(idx) => Ok(idx),
-            LookupMatch::None => Err(TermusicError::NotFound(format!(
+            LookupMatch::None => Err(TunrError::NotFound(format!(
                 "no song found matching '{query}'"
             ))),
-            LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
+            LookupMatch::Multiple(matches) => Err(TunrError::Ambiguous(format!(
                 "multiple songs match '{query}': {}",
                 matches.join(", ")
             ))),
@@ -1222,10 +1222,10 @@ impl Library {
     fn resolve_unique_playlist_index(&self, query: &str) -> Result<usize> {
         match self.lookup_playlist(query) {
             LookupMatch::One(idx) => Ok(idx),
-            LookupMatch::None => Err(TermusicError::NotFound(format!(
+            LookupMatch::None => Err(TunrError::NotFound(format!(
                 "no playlist found matching '{query}'"
             ))),
-            LookupMatch::Multiple(matches) => Err(TermusicError::Ambiguous(format!(
+            LookupMatch::Multiple(matches) => Err(TunrError::Ambiguous(format!(
                 "multiple playlists match '{query}': {}",
                 matches.join(", ")
             ))),
@@ -1349,7 +1349,7 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, V
     if !folder {
         let canonical = canonicalize_clean(path)?;
         if !is_supported_extension(&canonical) {
-            return Err(TermusicError::InvalidArg(format!(
+            return Err(TunrError::InvalidArg(format!(
                 "unsupported audio file extension: {}",
                 canonical.display()
             )));
@@ -1364,7 +1364,7 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, V
             Ok(entry) => entry,
             Err(err) => {
                 if err.depth() == 0 {
-                    return Err(TermusicError::Io(std::io::Error::other(format!(
+                    return Err(TunrError::Io(std::io::Error::other(format!(
                         "failed walking {}: {err}",
                         path.display()
                     ))));
@@ -1394,7 +1394,7 @@ fn collect_candidate_files(path: &Path, folder: bool) -> Result<(Vec<PathBuf>, V
     files.dedup();
 
     if files.is_empty() {
-        return Err(TermusicError::NotFound(format!(
+        return Err(TunrError::NotFound(format!(
             "no supported audio files found in {}",
             path.display()
         )));
@@ -1454,8 +1454,8 @@ fn index_out_of_bounds_error(
     target_label: &str,
     count: usize,
     index_display: &str,
-) -> TermusicError {
-    TermusicError::NotFound(format!(
+) -> TunrError {
+    TunrError::NotFound(format!(
         "{target_label} index {index_display} out of bounds (library has {count} {target_label}(s))"
     ))
 }
@@ -1485,7 +1485,7 @@ fn song_display_text(song: &Song, reversed: bool) -> String {
     }
 }
 
-/// Produce ordered fallback queries for lines copied from `termusic list` (`N. Title - Artist [MM:SS]`).
+/// Produce ordered fallback queries for lines copied from `tunr list` (`N. Title - Artist [MM:SS]`).
 fn list_line_fallback_variants(query: &str) -> Vec<String> {
     let mut variants = Vec::new();
     let mut push_unique = |candidate: &str| {
@@ -1588,7 +1588,7 @@ fn normalize_playlist_name(playlist_name: Option<&str>) -> Result<Option<String>
         Some(name) => {
             let trimmed = name.trim();
             if trimmed.is_empty() {
-                return Err(TermusicError::InvalidArg(
+                return Err(TunrError::InvalidArg(
                     "playlist name cannot be empty".to_string(),
                 ));
             }
@@ -1640,11 +1640,11 @@ fn parse_playlist_bracket_index(raw: &str) -> Option<PlaylistBracketIndex<'_>> {
     }
 }
 
-fn invalid_bracket_index_error(name: &str) -> TermusicError {
+fn invalid_bracket_index_error(name: &str) -> TunrError {
     if name.trim().is_empty() {
-        TermusicError::InvalidArg("playlist name cannot be empty".to_string())
+        TunrError::InvalidArg("playlist name cannot be empty".to_string())
     } else {
-        TermusicError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string())
+        TunrError::InvalidArg(INVALID_ONE_BASED_INDEX_MSG.to_string())
     }
 }
 
@@ -1659,7 +1659,7 @@ fn parse_validated_bracket_index(raw: &str) -> Result<BracketIndexLookup<'_>> {
             one_based_index,
         }) => {
             if name.trim().is_empty() {
-                return Err(TermusicError::InvalidArg(
+                return Err(TunrError::InvalidArg(
                     "playlist name cannot be empty".to_string(),
                 ));
             }
@@ -1679,7 +1679,7 @@ mod tests {
 
     fn temp_workspace(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "termusic-lib-test-{label}-{}",
+            "tunr-lib-test-{label}-{}",
             Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -1801,7 +1801,7 @@ mod tests {
                 &["First Song".to_string(), "NoSuchSong".to_string()],
             )
             .unwrap_err();
-        assert!(matches!(missing_err, TermusicError::NotFound(msg) if msg.contains("NoSuchSong")));
+        assert!(matches!(missing_err, TunrError::NotFound(msg) if msg.contains("NoSuchSong")));
         assert!(lib.playlists.is_empty());
 
         // Case-insensitive match succeeds.
@@ -1818,7 +1818,7 @@ mod tests {
         let dup_err = lib
             .create_playlist("favorites", &["First Song".to_string()])
             .unwrap_err();
-        assert!(matches!(dup_err, TermusicError::AlreadyExists(_)));
+        assert!(matches!(dup_err, TunrError::AlreadyExists(_)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1869,11 +1869,11 @@ mod tests {
 
         assert!(matches!(
             lib.resolve_play_target("Aurora", TargetKind::Auto),
-            Err(TermusicError::Ambiguous(_))
+            Err(TunrError::Ambiguous(_))
         ));
         assert!(matches!(
             lib.delete_target("Aurora", TargetKind::Auto),
-            Err(TermusicError::Ambiguous(_))
+            Err(TunrError::Ambiguous(_))
         ));
 
         let song_play = lib
@@ -2005,10 +2005,10 @@ mod tests {
         // Mutator errors must not persist partial changes or leave temp files.
         let err = Library::update(&lib_path, |lib| {
             lib.songs.clear();
-            Err::<(), _>(TermusicError::InvalidArg("abort update".to_string()))
+            Err::<(), _>(TunrError::InvalidArg("abort update".to_string()))
         })
         .unwrap_err();
-        assert!(matches!(err, TermusicError::InvalidArg(_)));
+        assert!(matches!(err, TunrError::InvalidArg(_)));
         let after_err = Library::load(&lib_path).unwrap();
         assert_eq!(after_err.songs.len(), track_count);
 
@@ -2059,9 +2059,9 @@ mod tests {
 
     #[test]
     fn collect_candidate_files_errors_when_folder_missing() {
-        let missing = std::env::temp_dir().join(format!("termusic-missing-{}", Uuid::new_v4()));
+        let missing = std::env::temp_dir().join(format!("tunr-missing-{}", Uuid::new_v4()));
         let err = collect_candidate_files(&missing, true).unwrap_err();
-        assert!(matches!(err, TermusicError::Io(_)));
+        assert!(matches!(err, TunrError::Io(_)));
     }
 
     #[test]
@@ -2212,7 +2212,7 @@ mod tests {
 
         // Legacy resolve_play_target surfaces artist labels in Ambiguous error.
         let amb_err = lib.resolve_play_target("Echoes", TargetKind::Song).unwrap_err();
-        assert!(matches!(amb_err, TermusicError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")));
+        assert!(matches!(amb_err, TunrError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")));
 
         // --artist filter narrows to unique candidate.
         let filtered = lib
@@ -2230,7 +2230,7 @@ mod tests {
         let not_found = lib
             .resolve_play_target_with_artist("echoes", TargetKind::Song, Some("Artist Three"))
             .unwrap_err();
-        assert!(matches!(not_found, TermusicError::NotFound(_)));
+        assert!(matches!(not_found, TunrError::NotFound(_)));
 
         // Substring match works when exact tiers have no match.
         let sub = lib
@@ -2255,7 +2255,7 @@ mod tests {
         assert!(matches!(by_idx, PlayTarget::Song { ref selected, .. } if selected.id == "2"));
         assert!(matches!(
             lib.play_target_for_song_index(99),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
     }
 
@@ -2387,7 +2387,7 @@ mod tests {
         // Out-of-bounds "1984" in Auto mode reports Ambiguous when both exact song and playlist exist.
         assert!(matches!(
             lib.resolve_play_target_with_artist("1984", TargetKind::Auto, None),
-            Err(TermusicError::Ambiguous(_))
+            Err(TunrError::Ambiguous(_))
         ));
 
         // Out-of-bounds "1999" in Auto mode falls back to exact playlist "1999".
@@ -2405,7 +2405,7 @@ mod tests {
                 .resolve_play_target_with_artist("2024", kind, None)
                 .unwrap_err();
             assert!(
-                matches!(err, TermusicError::NotFound(ref msg) if msg.contains("song index 2024 out of bounds")),
+                matches!(err, TunrError::NotFound(ref msg) if msg.contains("song index 2024 out of bounds")),
                 "expected song out-of-bounds NotFound for {kind}, got {err:?}"
             );
         }
@@ -2415,7 +2415,7 @@ mod tests {
             .resolve_play_target_with_artist("99", TargetKind::Playlist, None)
             .unwrap_err();
         assert!(
-            matches!(pl_oob, TermusicError::NotFound(ref msg) if msg.contains("playlist index 99 out of bounds"))
+            matches!(pl_oob, TunrError::NotFound(ref msg) if msg.contains("playlist index 99 out of bounds"))
         );
 
         // Selecting an empty playlist by 1-based index fails with empty-playlist NotFound.
@@ -2423,14 +2423,14 @@ mod tests {
             .resolve_play_target_with_artist("3", TargetKind::Playlist, None)
             .unwrap_err();
         assert!(
-            matches!(pl_empty, TermusicError::NotFound(ref msg) if msg.contains("contains no playable songs"))
+            matches!(pl_empty, TunrError::NotFound(ref msg) if msg.contains("contains no playable songs"))
         );
 
         // Overflowing numeric string returns NotFound out-of-bounds when no exact match exists.
         let overflow_err = lib
             .resolve_play_target_with_artist("999999999999999999999999999999", TargetKind::Auto, None)
             .unwrap_err();
-        assert!(matches!(overflow_err, TermusicError::NotFound(_)));
+        assert!(matches!(overflow_err, TunrError::NotFound(_)));
     }
 
     #[test]
@@ -2451,7 +2451,7 @@ mod tests {
                 .resolve_play_target_with_artist("0", kind, None)
                 .unwrap_err();
             assert!(
-                matches!(err, TermusicError::InvalidArg(_)),
+                matches!(err, TunrError::InvalidArg(_)),
                 "expected InvalidArg for '0' in {kind}, got {err:?}"
             );
         }
@@ -2526,29 +2526,29 @@ mod tests {
         // Empty playlist by index returns NotFound.
         assert!(matches!(
             lib.resolve_play_index(2, TargetKind::Playlist, None),
-            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no playable songs")
+            Err(TunrError::NotFound(ref msg)) if msg.contains("contains no playable songs")
         ));
 
         // Strict index-only: out-of-bounds 1984 does NOT fall back to song/playlist named "1984".
         assert!(matches!(
             lib.resolve_play_index(1984, TargetKind::Auto, None),
-            Err(TermusicError::NotFound(ref msg)) if msg.contains("song index 1984 out of bounds")
+            Err(TunrError::NotFound(ref msg)) if msg.contains("song index 1984 out of bounds")
         ));
         assert!(matches!(
             lib.resolve_play_index(1984, TargetKind::Playlist, None),
-            Err(TermusicError::NotFound(ref msg)) if msg.contains("playlist index 1984 out of bounds")
+            Err(TunrError::NotFound(ref msg)) if msg.contains("playlist index 1984 out of bounds")
         ));
 
         // Index 0 is rejected with InvalidArg even if a song/playlist named "0" existed.
         assert!(matches!(
             lib.resolve_play_index(0, TargetKind::Auto, None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         // artist.is_some() is rejected with InvalidArg.
         assert!(matches!(
             lib.resolve_play_index(1, TargetKind::Song, Some("Artist A")),
-            Err(TermusicError::InvalidArg(ref msg)) if msg.contains("--artist cannot be used with --index")
+            Err(TunrError::InvalidArg(ref msg)) if msg.contains("--artist cannot be used with --index")
         ));
     }
 
@@ -2604,7 +2604,7 @@ mod tests {
         let non_numeric_strip = lib
             .create_playlist("NoCoerce", &["5. 1".to_string()])
             .unwrap_err();
-        assert!(matches!(non_numeric_strip, TermusicError::NotFound(_)));
+        assert!(matches!(non_numeric_strip, TunrError::NotFound(_)));
     }
 
     #[test]
@@ -2655,7 +2655,7 @@ mod tests {
         let unstripped = lib
             .create_playlist("NoStripBracket", &["Missing [Remix]".to_string()])
             .unwrap_err();
-        assert!(matches!(unstripped, TermusicError::NotFound(_)));
+        assert!(matches!(unstripped, TunrError::NotFound(_)));
     }
 
     #[test]
@@ -2711,20 +2711,20 @@ mod tests {
         let bare_artist = lib
             .create_playlist("BareArtist", &["Joji".to_string()])
             .unwrap_err();
-        assert!(matches!(bare_artist, TermusicError::NotFound(_)));
+        assert!(matches!(bare_artist, TunrError::NotFound(_)));
 
         // Out-of-bounds "2024" must NOT fall back to substring "Summer 2024" or stem "2024.mp3".
         let oob_2024 = lib
             .create_playlist("OobNoFuzzy", &["2024".to_string()])
             .unwrap_err();
-        assert!(matches!(oob_2024, TermusicError::NotFound(_)));
+        assert!(matches!(oob_2024, TunrError::NotFound(_)));
 
         // Ambiguous song returns Ambiguous with artist hints and leaves playlists unchanged.
         let amb = lib
             .create_playlist("Amb", &["echoes".to_string()])
             .unwrap_err();
         assert!(
-            matches!(amb, TermusicError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")),
+            matches!(amb, TunrError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")),
             "expected Ambiguous with artists, got {amb:?}"
         );
         assert!(lib.playlists.iter().all(|p| p.name != "Amb"));
@@ -2736,7 +2736,7 @@ mod tests {
         ] {
             let err = lib.create_playlist("ZeroErr", &items).unwrap_err();
             assert!(
-                matches!(err, TermusicError::InvalidArg(_)),
+                matches!(err, TunrError::InvalidArg(_)),
                 "expected InvalidArg for {items:?}, got {err:?}"
             );
         }
@@ -2754,7 +2754,7 @@ mod tests {
         let amb_zero = lib
             .create_playlist("ExactZeroDup", &["0".to_string()])
             .unwrap_err();
-        assert!(matches!(amb_zero, TermusicError::Ambiguous(_)));
+        assert!(matches!(amb_zero, TunrError::Ambiguous(_)));
     }
 
     #[test]
@@ -2778,7 +2778,7 @@ mod tests {
         // Duplicate title reports Ambiguous with artist names.
         let amb = lib.delete_target("Echoes", TargetKind::Auto).unwrap_err();
         assert!(
-            matches!(amb, TermusicError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")),
+            matches!(amb, TunrError::Ambiguous(ref msg) if msg.contains("Artist One") && msg.contains("Artist Two")),
             "expected Ambiguous with artist hints, got {amb:?}"
         );
 
@@ -2793,17 +2793,17 @@ mod tests {
         // Substring and file_stem remain disallowed in delete.
         assert!(matches!(
             lib.delete_target("Remix", TargetKind::Song),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.delete_target("03_remix_file", TargetKind::Song),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
 
         // Numeric queries in delete never resolve by 1-based list index.
         assert!(matches!(
             lib.delete_target("2", TargetKind::Auto),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         let del_one = lib.delete_target("1", TargetKind::Song).unwrap();
         assert!(matches!(del_one, DeleteOutcome::Song(ref s) if s.id == "s4"));
@@ -2850,7 +2850,7 @@ mod tests {
         // Exact display match in Auto collides with a same-named playlist.
         assert!(matches!(
             lib.resolve_play_target_with_artist("Mundo - IV Of Spades", TargetKind::Auto, None),
-            Err(TermusicError::Ambiguous(_))
+            Err(TunrError::Ambiguous(_))
         ));
 
         // Tier 4b truncated display substring resolves "Sanctuary - Joji".
@@ -2876,7 +2876,7 @@ mod tests {
                 TargetKind::Song,
                 Some("Artist One")
             ),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
     }
 
@@ -2944,7 +2944,7 @@ mod tests {
                 assert!(
                     matches!(
                         lib.resolve_play_target_with_artist(bad, kind, None),
-                        Err(TermusicError::InvalidArg(_))
+                        Err(TunrError::InvalidArg(_))
                     ),
                     "expected InvalidArg for {bad} in {kind}"
                 );
@@ -2956,13 +2956,13 @@ mod tests {
             .resolve_play_target_with_artist("MyList[4]", TargetKind::Playlist, None)
             .unwrap_err();
         assert!(
-            matches!(oob, TermusicError::NotFound(ref msg) if msg.contains("MyList") && msg.contains("3 track(s)"))
+            matches!(oob, TunrError::NotFound(ref msg) if msg.contains("MyList") && msg.contains("3 track(s)"))
         );
         let empty = lib
             .resolve_play_target_with_artist("EmptyList[1]", TargetKind::Auto, None)
             .unwrap_err();
         assert!(
-            matches!(empty, TermusicError::NotFound(ref msg) if msg.contains("contains no playable songs"))
+            matches!(empty, TunrError::NotFound(ref msg) if msg.contains("contains no playable songs"))
         );
 
         // Literal song titles with brackets and literal playlists with numeric brackets are preserved.
@@ -2995,11 +2995,11 @@ mod tests {
         // --song and --artist never treat bracket syntax as playlist traversal.
         assert!(matches!(
             lib.resolve_play_target_with_artist("MyList[1]", TargetKind::Song, None),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.resolve_play_target_with_artist("MyList[1]", TargetKind::Auto, Some("Artist A")),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
     }
 
@@ -3066,16 +3066,16 @@ mod tests {
         for bad in ["MyList[0]", "MyList[-1]", "MyList[]", "[1]"] {
             assert!(matches!(
                 lib.delete_target(bad, TargetKind::Playlist),
-                Err(TermusicError::InvalidArg(_))
+                Err(TunrError::InvalidArg(_))
             ));
         }
         assert!(matches!(
             lib.delete_target("MyList[1]", TargetKind::Playlist),
-            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no songs")
+            Err(TunrError::NotFound(ref msg)) if msg.contains("contains no songs")
         ));
         assert!(matches!(
             lib.delete_target("EmptyList[1]", TargetKind::Auto),
-            Err(TermusicError::NotFound(ref msg)) if msg.contains("contains no songs")
+            Err(TunrError::NotFound(ref msg)) if msg.contains("contains no songs")
         ));
 
         // Literal playlist "Mix [2]" deletes the whole playlist; literal song "Title[1]" deletes the song.
@@ -3085,7 +3085,7 @@ mod tests {
         assert!(matches!(del_song, DeleteOutcome::Song(ref s) if s.id == "s-bracket"));
         assert!(matches!(
             lib.delete_target("MyList[1]", TargetKind::Song),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
 
         let _ = fs::remove_dir_all(&dir);
@@ -3143,7 +3143,7 @@ mod tests {
             "/music/echoes_2.mp3",
         ));
         let amb = lib.add_song("Echoes", Some("Chill")).unwrap_err();
-        assert!(matches!(amb, TermusicError::Ambiguous(_)));
+        assert!(matches!(amb, TunrError::Ambiguous(_)));
         assert_eq!(lib.playlists.len(), 1);
 
         let disamb = lib.add_song("Echoes - Artist Two", Some("Chill")).unwrap();
@@ -3154,27 +3154,27 @@ mod tests {
         // Error cases: empty query, empty playlist, directory path, missing file, missing song, index 0.
         assert!(matches!(
             lib.add_song("   ", None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_song("Alpha", Some("   ")),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_song(dir.to_str().unwrap(), None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_song("/nonexistent/track.wav", None),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.add_song("NoSuchSong", Some("Chill")),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.add_song("0", Some("Chill")),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         let _ = fs::remove_dir_all(&dir);
@@ -3238,31 +3238,31 @@ mod tests {
         // Error cases: index 0, out-of-bounds playlist index, missing song, ambiguous song, empty args.
         assert!(matches!(
             lib.add_existing_song("1", "0"),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_existing_song("0", "1"),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_existing_song("1", "9"),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.add_existing_song("MissingSong", "1"),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
         assert!(matches!(
             lib.add_existing_song("Echoes", "1"),
-            Err(TermusicError::Ambiguous(_))
+            Err(TunrError::Ambiguous(_))
         ));
         assert!(matches!(
             lib.add_existing_song("   ", "1"),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             lib.add_existing_song("Alpha", "   "),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
     }
 }

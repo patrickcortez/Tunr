@@ -15,7 +15,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::download::{DownloadFormat, DownloadOptions, DownloadOutcome};
 use crate::download_tui::{self, DownloadTuiOutcome};
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::paths::AppPaths;
 use crate::platform::{ClipboardMethod, ShutdownSignals, copy_to_clipboard};
 use crate::search::{self, SearchProvider, SearchResult};
@@ -425,7 +425,7 @@ impl SearchAppState {
             format!(" Search (top {}){sep}{provider_label}{dl_badge}{sep}", self.limit)
         } else {
             format!(
-                " Termusic Search (top {}){sep}{provider_label}{dl_badge}{sep}",
+                " Tunr Search (top {}){sep}{provider_label}{dl_badge}{sep}",
                 self.limit
             )
         };
@@ -896,7 +896,7 @@ pub async fn run_search_tui(initial_query: Option<String>, cfg: SearchRunConfig)
                     }
                     Ok(_) => {}
                     Err(err) if !err.is_cancelled() => {
-                        state.apply_search_result(Err(TermusicError::Search(
+                        state.apply_search_result(Err(TunrError::Search(
                             format!("search task panicked: {err}"),
                         )));
                     }
@@ -988,7 +988,7 @@ pub async fn run_search_tui(initial_query: Option<String>, cfg: SearchRunConfig)
                                         Err(err) => {
                                             if matches!(
                                                 &err,
-                                                TermusicError::Download(msg) if msg.starts_with("download interrupted")
+                                                TunrError::Download(msg) if msg.starts_with("download interrupted")
                                             ) {
                                                 break Err(err);
                                             }
@@ -1062,7 +1062,7 @@ pub async fn run_search_plain(query: &str, cfg: SearchRunConfig) -> Result<()> {
             Some(p) => p,
             None => tokio::task::spawn_blocking(AppPaths::resolve)
                 .await
-                .map_err(|err| TermusicError::Async(err.to_string()))??,
+                .map_err(|err| TunrError::Async(err.to_string()))??,
         };
         let dl_opts = build_search_download_options(top.url.clone(), &cfg, true);
         let outcome = download_tui::run_download_with_line_progress(&paths, &dl_opts).await?;
@@ -1073,7 +1073,7 @@ pub async fn run_search_plain(query: &str, cfg: SearchRunConfig) -> Result<()> {
             eprintln!("Download failed ({}): {}", failure.url, failure.error);
         }
         if !outcome.failed.is_empty() && outcome.downloaded_files.is_empty() {
-            return Err(TermusicError::Download(outcome.failed[0].error.clone()));
+            return Err(TunrError::Download(outcome.failed[0].error.clone()));
         }
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::error::TermusicError;
+    use crate::error::TunrError;
 
     use super::*;
 
@@ -1132,7 +1132,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         terminal.draw(|f| state.render(f)).unwrap();
         let searching = buffer_text(&terminal);
-        assert!(searching.contains("Termusic Search (top 10)"));
+        assert!(searching.contains("Tunr Search (top 10)"));
         assert!(searching.contains("\"lofi beats\""));
         assert!(searching.contains("Searching YouTube"));
 
@@ -1178,7 +1178,7 @@ mod tests {
         }]));
         state.apply_copy_result(
             "https://www.youtube.com/watch?v=abc",
-            Err(TermusicError::NotFound("no clipboard tool".to_string())),
+            Err(TunrError::NotFound("no clipboard tool".to_string())),
         );
 
         let mut terminal = Terminal::new(TestBackend::new(46, 12)).unwrap();
@@ -1339,7 +1339,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
         terminal.draw(|f| state.render(f)).unwrap();
         let searching = buffer_text(&terminal);
-        assert!(searching.contains("Termusic Search (top 10)"));
+        assert!(searching.contains("Tunr Search (top 10)"));
         assert!(searching.contains("SoundCloud"));
         assert!(searching.contains("DL:mp4"));
         assert!(searching.contains("Searching SoundCloud"));

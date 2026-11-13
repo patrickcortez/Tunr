@@ -32,21 +32,21 @@ test-live *args:
 android-check:
     {{cargo}} {{ if os() == "android" { "check --all-targets --locked" } else { "ndk -t aarch64-linux-android --platform 24 check --all-targets --locked" } }}
 
-# Launch Termusic TUI via cargo run
+# Launch Tunr TUI via cargo run
 run *args:
     {{cargo}} run --locked {{args}}
 
-# Install termusic binary via cargo install
+# Install tunr binary via cargo install
 install:
     {{cargo}} install --path . --locked
 
-# Rebuild and reinstall termusic binary (--force)
+# Rebuild and reinstall tunr binary (--force)
 update:
     {{cargo}} install --path . --locked --force
 
-# Uninstall termusic binary
+# Uninstall tunr binary
 uninstall:
-    {{cargo}} uninstall termusic
+    {{cargo}} uninstall tunr
 
 # Remove Cargo build artifacts
 clean:

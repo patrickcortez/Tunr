@@ -18,7 +18,7 @@ use crate::download::{
     self, DownloadFormat, DownloadOptions, DownloadOutcome, DownloadPhase, DownloadProgressEvent,
     StepTransition,
 };
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::link::{DownloadTarget, LinkStatement};
 use crate::paths::AppPaths;
 use crate::platform::ShutdownSignals;
@@ -380,7 +380,7 @@ impl DownloadTuiState {
         let line = if area.width < 80 {
             Line::from(vec![
                 Span::styled(
-                    " Termusic Downloader",
+                    " Tunr Downloader",
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" | ", Style::new().fg(Color::DarkGray)),
@@ -391,7 +391,7 @@ impl DownloadTuiState {
         } else {
             Line::from(vec![
                 Span::styled(
-                    concat!(" Termusic Downloader v", env!("CARGO_PKG_VERSION")),
+                    concat!(" Tunr Downloader v", env!("CARGO_PKG_VERSION")),
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
@@ -666,7 +666,7 @@ async fn resolve_plan_blocking(opts: &DownloadOptions) -> Result<Vec<LinkStateme
     let opts_cloned = opts.clone();
     tokio::task::spawn_blocking(move || download::resolve_download_plan(&opts_cloned))
         .await
-        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+        .map_err(|err| TunrError::Async(format!("blocking task failed: {err}")))?
 }
 
 /// Run [`download::run_download_with_progress`] with an interactive ratatui loading TUI.
@@ -704,7 +704,7 @@ pub async fn run_download_tui_plan(
 
     match res? {
         DownloadTuiOutcome::Completed(outcome) => Ok(outcome),
-        DownloadTuiOutcome::Cancelled => Err(TermusicError::Download(
+        DownloadTuiOutcome::Cancelled => Err(TunrError::Download(
             "download cancelled by user".to_string(),
         )),
     }
@@ -756,7 +756,7 @@ pub async fn run_download_tui_plan_on_session(
                     state.apply_event(ev);
                 }
                 let outcome = res
-                    .map_err(|err| TermusicError::Async(format!("download task panicked: {err}")))??;
+                    .map_err(|err| TunrError::Async(format!("download task panicked: {err}")))??;
                 return Ok(DownloadTuiOutcome::Completed(outcome));
             }
             Some(ev) = rx.recv() => {
@@ -798,7 +798,7 @@ pub async fn run_download_tui_plan_on_session(
             sig = signals.recv() => {
                 download_task.abort();
                 let _ = download_task.await;
-                return Err(TermusicError::Download(format!(
+                return Err(TunrError::Download(format!(
                     "download interrupted ({sig})"
                 )));
             }
@@ -937,7 +937,7 @@ pub async fn run_download_plan_with_line_progress(
 
     download_task
         .await
-        .map_err(|err| TermusicError::Async(format!("download task panicked: {err}")))?
+        .map_err(|err| TunrError::Async(format!("download task panicked: {err}")))?
 }
 
 #[cfg(test)]
@@ -1005,7 +1005,7 @@ mod tests {
         terminal.draw(|frame| state.render(frame)).unwrap();
         let rendered = buffer_text(&terminal);
 
-        assert!(rendered.contains("Termusic Downloader"));
+        assert!(rendered.contains("Tunr Downloader"));
         assert!(rendered.contains("Downloading..."));
         assert!(rendered.contains("Elapsed 00:07"));
         assert!(rendered.contains("Alpha Song"));
@@ -1095,7 +1095,7 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(&terminal);
 
-        assert!(rendered.contains("Termusic Downloader"));
+        assert!(rendered.contains("Tunr Downloader"));
         assert!(rendered.contains("Progress (1/1 done"));
         assert!(rendered.contains("[##########]"));
         assert!(!rendered.contains('╭'), "unexpected rounded border:\n{rendered}");

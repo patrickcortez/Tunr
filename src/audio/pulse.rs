@@ -6,7 +6,7 @@ use std::ptr::{NonNull, null};
 use libloading::Library;
 
 use crate::audio::AudioSink;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 const PA_SAMPLE_FLOAT32LE: c_int = 5;
 const PA_STREAM_PLAYBACK: c_int = 1;
@@ -120,7 +120,7 @@ impl PulseApi {
             } else {
                 ""
             };
-            TermusicError::Audio(format!(
+            TunrError::Audio(format!(
                 "failed to load libpulse-simple.so.0 (or libpulse-simple.so): {err}{hint}"
             ))
         })?;
@@ -162,7 +162,7 @@ impl PulseApi {
 fn load_symbol<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
     let sym = unsafe { lib.get::<T>(name) }.map_err(|err| {
         let label = String::from_utf8_lossy(name).trim_end_matches('\0').to_string();
-        TermusicError::Audio(format!("failed to resolve PulseAudio symbol '{label}': {err}"))
+        TunrError::Audio(format!("failed to resolve PulseAudio symbol '{label}': {err}"))
     })?;
     Ok(*sym)
 }
@@ -189,7 +189,7 @@ fn buffer_attr_for_spec(sample_rate: u32, channels: u8) -> PaBufferAttr {
 ///
 /// # Concurrency & Ownership Contract
 /// - `PulseSimpleSink` is [`Send`] (so ownership can move into the dedicated
-///   `termusic-engine` OS thread) and intentionally `!Sync` (due to `NonNull<PaSimple>`).
+///   `tunr-engine` OS thread) and intentionally `!Sync` (due to `NonNull<PaSimple>`).
 /// - `libpulse-simple` owns an internal threaded mainloop whose `pa_simple*` operations are
 ///   NOT safe under concurrent shared access; all playback calls require exclusive `&mut self`
 ///   access from a single owner thread.
@@ -210,7 +210,7 @@ pub struct PulseSimpleSink {
     api: PulseApi,
 }
 
-// SAFETY: `PulseSimpleSink` is moved once to the `termusic-engine` OS thread and never shares
+// SAFETY: `PulseSimpleSink` is moved once to the `tunr-engine` OS thread and never shares
 // `&self` (`!Sync` is preserved via `NonNull<PaSimple>`). `libpulse-simple` manages its internal
 // threaded mainloop per `pa_simple*`, and `&mut self` guarantees serialized single-owner calls
 // with `PulseApi` libraries kept alive strictly longer than `stream`.
@@ -220,16 +220,16 @@ impl PulseSimpleSink {
     /// Load `libpulse-simple.so.0` (falling back to `libpulse-simple.so`) and prepare
     /// a PulseAudio sink without connecting a playback stream until [`AudioSink::open`] is called.
     pub fn new() -> Result<Self> {
-        Self::with_names("termusic", "playback")
+        Self::with_names("tunr", "playback")
     }
 
     /// Load `libpulse-simple` with custom PulseAudio application and stream names.
     pub fn with_names(app_name: &str, stream_name: &str) -> Result<Self> {
         let app_c = CString::new(app_name).map_err(|err| {
-            TermusicError::InvalidArg(format!("invalid PulseAudio app name: {err}"))
+            TunrError::InvalidArg(format!("invalid PulseAudio app name: {err}"))
         })?;
         let stream_c = CString::new(stream_name).map_err(|err| {
-            TermusicError::InvalidArg(format!("invalid PulseAudio stream name: {err}"))
+            TunrError::InvalidArg(format!("invalid PulseAudio stream name: {err}"))
         })?;
         let api = PulseApi::load()?;
 
@@ -267,7 +267,7 @@ impl PulseSimpleSink {
 impl AudioSink for PulseSimpleSink {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
         if sample_rate == 0 || channels == 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "invalid audio specification: {sample_rate} Hz, {channels} channels"
             )));
         }
@@ -301,7 +301,7 @@ impl AudioSink for PulseSimpleSink {
         };
 
         let Some(stream) = NonNull::new(ptr) else {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "pa_simple_new failed ({sample_rate} Hz, {channels} ch): {}",
                 self.format_pa_error(err)
             )));
@@ -314,7 +314,7 @@ impl AudioSink for PulseSimpleSink {
 
     fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
         let stream = self.stream.ok_or_else(|| {
-            TermusicError::Audio("PulseAudio stream is not open".to_string())
+            TunrError::Audio("PulseAudio stream is not open".to_string())
         })?;
         if samples.is_empty() {
             return Ok(());
@@ -331,7 +331,7 @@ impl AudioSink for PulseSimpleSink {
             )
         };
         if rc < 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "pa_simple_write failed: {}",
                 self.format_pa_error(err)
             )));
@@ -346,7 +346,7 @@ impl AudioSink for PulseSimpleSink {
         let mut err: c_int = 0;
         let rc = unsafe { (self.api.pa_simple_flush)(stream.as_ptr(), &mut err) };
         if rc < 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "pa_simple_flush failed: {}",
                 self.format_pa_error(err)
             )));
@@ -361,7 +361,7 @@ impl AudioSink for PulseSimpleSink {
         let mut err: c_int = 0;
         let rc = unsafe { (self.api.pa_simple_drain)(stream.as_ptr(), &mut err) };
         if rc < 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "pa_simple_drain failed: {}",
                 self.format_pa_error(err)
             )));

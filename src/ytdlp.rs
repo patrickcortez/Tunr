@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 /// Environment snapshot for discovering external tools (`yt-dlp`, `ffmpeg`, `deno`, `node`, etc.)
 /// without mutating process-wide environment variables in tests.
@@ -261,7 +261,7 @@ pub(crate) fn find_yt_dlp(env: &ToolEnv) -> Result<PathBuf> {
         #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
         let hint = "yt-dlp not found in ~/.local/bin or PATH";
 
-        TermusicError::NotFound(hint.into())
+        TunrError::NotFound(hint.into())
     })
 }
 
@@ -302,7 +302,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "termusic-ytdlp-test-{label}-{}",
+            "tunr-ytdlp-test-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -333,7 +333,7 @@ mod tests {
             pathext: None,
             extra_search_dirs: vec![extra_dir.clone()],
         };
-        assert!(matches!(find_yt_dlp(&empty_env), Err(TermusicError::NotFound(_))));
+        assert!(matches!(find_yt_dlp(&empty_env), Err(TunrError::NotFound(_))));
         assert_eq!(find_ffmpeg(&empty_env), None);
         assert_eq!(detect_js_runtime(&empty_env), None);
 

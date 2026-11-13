@@ -12,7 +12,7 @@ use libloading::Library;
 
 use crate::audio::AudioSink;
 use crate::audio::resample::PcmAdapter;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 const AAUDIO_OK: i32 = 0;
 const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
@@ -97,14 +97,14 @@ unsafe impl Send for AAudioApi {}
 
 unsafe fn load_sym<T: Copy>(lib: &Library, name: &[u8], label: &str) -> Result<T> {
     let sym = unsafe { lib.get::<T>(name) }
-        .map_err(|err| TermusicError::Audio(format!("missing symbol '{label}' in libaaudio.so: {err}")))?;
+        .map_err(|err| TunrError::Audio(format!("missing symbol '{label}' in libaaudio.so: {err}")))?;
     Ok(*sym)
 }
 
 impl AAudioApi {
     fn load() -> Result<Self> {
         let lib = unsafe { Library::new("libaaudio.so") }.map_err(|err| {
-            TermusicError::Audio(format!("failed to load libaaudio.so (requires Android 8.0+ / API 26+): {err}"))
+            TunrError::Audio(format!("failed to load libaaudio.so (requires Android 8.0+ / API 26+): {err}"))
         })?;
 
         let create_stream_builder =
@@ -213,8 +213,8 @@ impl AAudioApi {
         format!("code {code}")
     }
 
-    fn error_for(&self, context: &str, code: i32) -> TermusicError {
-        TermusicError::Audio(format!("{context}: {} ({code})", self.result_name(code)))
+    fn error_for(&self, context: &str, code: i32) -> TunrError {
+        TunrError::Audio(format!("{context}: {} ({code})", self.result_name(code)))
     }
 }
 
@@ -300,7 +300,7 @@ impl AAudioSink {
 
         if actual_rate <= 0 || actual_channels <= 0 {
             let _ = unsafe { (self.api.close_stream)(raw_stream) };
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "AAudio negotiated invalid stream format: rate={actual_rate}, channels={actual_channels}"
             )));
         }
@@ -310,7 +310,7 @@ impl AAudioSink {
             AAUDIO_FORMAT_PCM_I16 => DeviceSampleFormat::I16,
             other => {
                 let _ = unsafe { (self.api.close_stream)(raw_stream) };
-                return Err(TermusicError::Audio(format!(
+                return Err(TunrError::Audio(format!(
                     "AAudio negotiated unsupported PCM format {other}"
                 )));
             }
@@ -374,7 +374,7 @@ impl AAudioSink {
     fn ensure_started(&mut self) -> std::result::Result<(), AAudioWriteErr> {
         let stream = self
             .stream
-            .ok_or_else(|| AAudioWriteErr::Fatal(TermusicError::Audio("AAudioSink is not open".to_string())))?
+            .ok_or_else(|| AAudioWriteErr::Fatal(TunrError::Audio("AAudioSink is not open".to_string())))?
             .as_ptr();
         if self.started {
             return Ok(());
@@ -412,7 +412,7 @@ impl AAudioSink {
             return Ok(());
         }
 
-        Err(AAudioWriteErr::Fatal(TermusicError::Audio(format!(
+        Err(AAudioWriteErr::Fatal(TunrError::Audio(format!(
             "unexpected AAudio stream state {state} before start"
         ))))
     }
@@ -493,7 +493,7 @@ impl AAudioSink {
                 if start.elapsed() >= MAX_WRITE_STALL {
                     return Err(PartialDisconnect {
                         written_dst_frames: written_frames,
-                        fatal: Some(TermusicError::Audio(format!(
+                        fatal: Some(TunrError::Audio(format!(
                             "AAudioStream_write stalled without progress ({name})"
                         ))),
                     });
@@ -521,12 +521,12 @@ impl AAudioSink {
 
 enum AAudioWriteErr {
     Disconnected,
-    Fatal(TermusicError),
+    Fatal(TunrError),
 }
 
 struct PartialDisconnect {
     written_dst_frames: usize,
-    fatal: Option<TermusicError>,
+    fatal: Option<TunrError>,
 }
 
 fn convert_f32_to_i16(src: &[f32], dst: &mut Vec<i16>) {
@@ -557,10 +557,10 @@ fn consumed_source_frames(
 impl AudioSink for AAudioSink {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
         if sample_rate == 0 {
-            return Err(TermusicError::Audio("AAudio sample_rate must be > 0".to_string()));
+            return Err(TunrError::Audio("AAudio sample_rate must be > 0".to_string()));
         }
         if channels == 0 {
-            return Err(TermusicError::Audio("AAudio channels must be > 0".to_string()));
+            return Err(TunrError::Audio("AAudio channels must be > 0".to_string()));
         }
 
         if self.stream.is_some() && self.requested_spec == Some((sample_rate, channels)) {
@@ -574,10 +574,10 @@ impl AudioSink for AAudioSink {
     fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
         let (req_rate, req_channels) = self
             .requested_spec
-            .ok_or_else(|| TermusicError::Audio("AAudioSink::write_f32 called before open()".to_string()))?;
+            .ok_or_else(|| TunrError::Audio("AAudioSink::write_f32 called before open()".to_string()))?;
         let req_ch = usize::from(req_channels);
         if samples.len() % req_ch != 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "PCM sample slice length {} is not divisible by {req_ch} channels",
                 samples.len()
             )));
@@ -595,7 +595,7 @@ impl AudioSink for AAudioSink {
                 let adapter = self
                     .adapter
                     .as_mut()
-                    .ok_or_else(|| TermusicError::Audio("AAudioSink missing PCM adapter".to_string()))?;
+                    .ok_or_else(|| TunrError::Audio("AAudioSink missing PCM adapter".to_string()))?;
                 let pt = adapter.is_passthrough();
                 let dr = adapter.dst_rate();
                 if !pt {
@@ -622,7 +622,7 @@ impl AudioSink for AAudioSink {
                 }) => {
                     disconnect_retries += 1;
                     if disconnect_retries > MAX_DISCONNECT_RETRIES {
-                        return Err(TermusicError::Audio(
+                        return Err(TunrError::Audio(
                             "AAudio device stayed disconnected after reopen attempts".to_string(),
                         ));
                     }

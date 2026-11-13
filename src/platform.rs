@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 /// Cross-platform shutdown signal listener (`SIGINT` / `SIGTERM` on Unix; console control
 /// events on Windows).
@@ -585,7 +585,7 @@ pub async fn copy_to_clipboard(text: &str, allow_osc52: bool) -> Result<Clipboar
     }
 
     let detail = last_err.unwrap_or_else(|| "no supported clipboard utility found".to_string());
-    Err(TermusicError::NotFound(detail))
+    Err(TunrError::NotFound(detail))
 }
 
 /// Resolve the user's default music directory via `dirs::audio_dir()`, falling back to
@@ -633,7 +633,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "termusic-platform-test-{label}-{}",
+            "tunr-platform-test-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -730,7 +730,7 @@ mod tests {
         ensure_private_dir(&private).unwrap();
         assert!(private.is_dir());
 
-        let file_path = private.join("termusic.sock");
+        let file_path = private.join("tunr.sock");
         fs::write(&file_path, b"placeholder").unwrap();
         restrict_socket_permissions(&file_path).unwrap();
 

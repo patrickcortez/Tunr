@@ -16,14 +16,14 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::library::{AddSummary, Library};
 use crate::link::{self, DownloadTarget, LinkExpr, LinkStatement};
 use crate::paths::{AppPaths, load_workspace_config, set_workspace_download_dest};
 use crate::platform::canonicalize_clean;
 use crate::ytdlp::{self, ToolEnv};
 
-/// Output container/codec format supported by `termusic download` and `termusic search -d`.
+/// Output container/codec format supported by `tunr download` and `tunr search -d`.
 #[derive(
     Debug,
     Clone,
@@ -48,7 +48,7 @@ pub enum DownloadFormat {
 }
 
 impl DownloadFormat {
-    /// Canonical lowercase format name used by termusic.
+    /// Canonical lowercase format name used by tunr.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mp3 => "mp3",
@@ -87,7 +87,7 @@ pub fn parse_download_format_str(raw: &str) -> Result<DownloadFormat> {
         "ogg" => Ok(DownloadFormat::Ogg),
         "wav" => Ok(DownloadFormat::Wav),
         "aac" => Ok(DownloadFormat::Aac),
-        _ => Err(TermusicError::InvalidArg(format!(
+        _ => Err(TunrError::InvalidArg(format!(
             "unsupported format '{raw}' (expected one of: mp3, mp4, flac, m4a, ogg, wav, aac)"
         ))),
     }
@@ -99,7 +99,7 @@ impl fmt::Display for DownloadFormat {
     }
 }
 
-/// Parameters controlling `termusic download`.
+/// Parameters controlling `tunr download`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadOptions {
     pub urls: Vec<String>,
@@ -123,7 +123,7 @@ pub enum StepTransition {
     Then,
 }
 
-/// Lifecycle phase for an individual URL inside `termusic download`.
+/// Lifecycle phase for an individual URL inside `tunr download`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadPhase {
     Queued,
@@ -175,11 +175,11 @@ pub enum DownloadProgressEvent {
     BatchFinished,
 }
 
-const PROGRESS_TEMPLATE_DOWNLOAD: &str = "download:TERMUSIC_PROG\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress.speed)s\t%(progress.eta)s\t%(info.title)s";
-const PROGRESS_TEMPLATE_POSTPROCESS: &str = "postprocess:TERMUSIC_POST\t%(progress.status)s\t%(progress.postprocessor)s\t%(info.title)s";
+const PROGRESS_TEMPLATE_DOWNLOAD: &str = "download:TUNR_PROG\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress.speed)s\t%(progress.eta)s\t%(info.title)s";
+const PROGRESS_TEMPLATE_POSTPROCESS: &str = "postprocess:TUNR_POST\t%(progress.status)s\t%(progress.postprocessor)s\t%(info.title)s";
 const MAX_CAPTURE_BYTES: usize = 512 * 1024;
 
-/// Failure details captured for an individual URL during `termusic download`.
+/// Failure details captured for an individual URL during `tunr download`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadFailure {
     pub url: String,
@@ -202,7 +202,7 @@ pub struct DownloadOutcome {
 struct DownloadEnv {
     home_dir: Option<PathBuf>,
     path_var: Option<OsString>,
-    termusic_dest: Option<String>,
+    tunr_dest: Option<String>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pathext: Option<OsString>,
     extra_search_dirs: Vec<PathBuf>,
@@ -214,7 +214,7 @@ impl DownloadEnv {
         Self {
             home_dir: tool.home_dir,
             path_var: tool.path_var,
-            termusic_dest: std::env::var("TERMUSIC_DEST").ok(),
+            tunr_dest: std::env::var("TUNR_DEST").ok(),
             pathext: tool.pathext,
             extra_search_dirs: tool.extra_search_dirs,
         }
@@ -260,7 +260,7 @@ fn emit_progress(
     }
 }
 
-/// RAII staging directory guard that cleans up `<dest>/.termusic-dl-tmp/<uuid>` on drop or explicit cleanup.
+/// RAII staging directory guard that cleans up `<dest>/.tunr-dl-tmp/<uuid>` on drop or explicit cleanup.
 struct StageDirGuard {
     path: PathBuf,
     cleaned: bool,
@@ -302,7 +302,7 @@ pub fn normalize_urls(raw_urls: &[String]) -> Result<Vec<String>> {
 
     for raw in raw_urls {
         if raw.trim().is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "URL cannot be empty".to_string(),
             ));
         }
@@ -323,7 +323,7 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+        .map_err(|err| TunrError::Async(format!("blocking task failed: {err}")))?
 }
 
 /// Resolve [`DownloadOptions`] (`targets` or `urls`) into an ordered list of top-level
@@ -444,7 +444,7 @@ async fn run_download_plan_with_env_and_progress(
                 ..DownloadOutcome::default()
             });
         }
-        return Err(TermusicError::InvalidArg(
+        return Err(TunrError::InvalidArg(
             "at least one download URL is required".into(),
         ));
     }
@@ -469,7 +469,7 @@ async fn run_download_plan_with_env_and_progress(
 
     let ffmpeg_location = ffmpeg_bin.parent().map(Path::to_path_buf);
     let embed_thumbnail = should_embed_thumbnail_with_progress(opts, env, progress_tx.as_ref()).await;
-    let staging_root = dest_dir.join(".termusic-dl-tmp");
+    let staging_root = dest_dir.join(".tunr-dl-tmp");
     let effective_jobs = opts.jobs.max(1);
     let batch_labels: Vec<String> = plan.iter().map(|stmt| stmt.expr.to_string()).collect();
     emit_progress(
@@ -504,7 +504,7 @@ async fn run_download_plan_with_env_and_progress(
         let semaphore = Arc::clone(&semaphore);
         join_set.spawn(async move {
             let _permit = semaphore.acquire_owned().await.map_err(|_| {
-                TermusicError::Async("download concurrency semaphore closed".to_string())
+                TunrError::Async("download concurrency semaphore closed".to_string())
             })?;
             let mut tracker = StepTracker {
                 attempt: 0,
@@ -549,14 +549,14 @@ async fn run_download_plan_with_env_and_progress(
                 });
             }
 
-            Ok::<_, TermusicError>((stmt_idx, res))
+            Ok::<_, TunrError>((stmt_idx, res))
         });
     }
 
     let mut slots: Vec<Option<ExprEvalResult>> = (0..plan.len()).map(|_| None).collect();
     while let Some(joined) = join_set.join_next().await {
         let (idx, res) = joined.map_err(|err| {
-            TermusicError::Async(format!("download worker task failed: {err}"))
+            TunrError::Async(format!("download worker task failed: {err}"))
         })??;
         slots[idx] = Some(res);
     }
@@ -816,15 +816,15 @@ async fn download_into_stage_and_finalize(
 
 fn validate_non_empty_path(path: &Path, label: &str) -> Result<()> {
     if path.as_os_str().to_string_lossy().trim().is_empty() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             "{label} path cannot be empty"
         )));
     }
     Ok(())
 }
 
-/// Validate and prepare the effective download destination for `termusic search -d`
-/// (`dest` -> `TERMUSIC_DEST` -> `WorkspaceConfig.download_dest`).
+/// Validate and prepare the effective download destination for `tunr search -d`
+/// (`dest` -> `TUNR_DEST` -> `WorkspaceConfig.download_dest`).
 pub fn validate_search_download_destination(
     paths: &AppPaths,
     dest: Option<&Path>,
@@ -854,7 +854,7 @@ fn resolve_destination_with_env(
     } else if let Some(saved) = saved_dest {
         saved.to_path_buf()
     } else if let Some(env_dest) = env
-        .termusic_dest
+        .tunr_dest
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -868,8 +868,8 @@ fn resolve_destination_with_env(
                 dest
             }
             None => {
-                return Err(TermusicError::InvalidArg(
-                    "no download destination configured; pass --dest, --set-dest, or set TERMUSIC_DEST"
+                return Err(TunrError::InvalidArg(
+                    "no download destination configured; pass --dest, --set-dest, or set TUNR_DEST"
                         .into(),
                 ));
             }
@@ -881,7 +881,7 @@ fn resolve_destination_with_env(
 
 fn prepare_directory(dir: &Path) -> Result<PathBuf> {
     if dir.exists() && !dir.is_dir() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             "download destination '{}' exists and is not a directory",
             dir.display()
         )));
@@ -970,7 +970,7 @@ fn find_ffmpeg(env: &DownloadEnv) -> Result<PathBuf> {
         #[cfg(not(any(target_os = "android", target_os = "macos", windows)))]
         let hint = "neither ffmpeg nor avconv found in PATH";
 
-        TermusicError::NotFound(hint.into())
+        TunrError::NotFound(hint.into())
     })
 }
 
@@ -1187,7 +1187,7 @@ fn friendly_postprocessor_name(raw: &str) -> String {
 
 fn parse_yt_dlp_progress_line(line: &str, index: usize) -> Option<DownloadProgressEvent> {
     let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("TERMUSIC_PROG\t") {
+    if let Some(rest) = trimmed.strip_prefix("TUNR_PROG\t") {
         let mut parts = rest.splitn(7, '\t');
         let status = parts.next()?.trim();
         let downloaded_s = parts.next().unwrap_or("");
@@ -1217,7 +1217,7 @@ fn parse_yt_dlp_progress_line(line: &str, index: usize) -> Option<DownloadProgre
         });
     }
 
-    if let Some(rest) = trimmed.strip_prefix("TERMUSIC_POST\t") {
+    if let Some(rest) = trimmed.strip_prefix("TUNR_POST\t") {
         let mut parts = rest.splitn(3, '\t');
         let _status = parts.next()?;
         let postprocessor = parts.next().unwrap_or("");
@@ -1236,8 +1236,8 @@ fn parse_yt_dlp_progress_line(line: &str, index: usize) -> Option<DownloadProgre
 }
 
 fn is_yt_dlp_progress_or_status_line(trimmed: &str) -> bool {
-    trimmed.starts_with("TERMUSIC_PROG\t")
-        || trimmed.starts_with("TERMUSIC_POST\t")
+    trimmed.starts_with("TUNR_PROG\t")
+        || trimmed.starts_with("TUNR_POST\t")
         || trimmed.starts_with("[download]")
         || trimmed.starts_with("[ExtractAudio]")
         || trimmed.starts_with("[Metadata]")
@@ -1269,11 +1269,11 @@ async fn execute_yt_dlp(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| TermusicError::Download("yt-dlp stdout pipe missing".to_string()))?;
+        .ok_or_else(|| TunrError::Download("yt-dlp stdout pipe missing".to_string()))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| TermusicError::Download("yt-dlp stderr pipe missing".to_string()))?;
+        .ok_or_else(|| TunrError::Download("yt-dlp stderr pipe missing".to_string()))?;
 
     let tx_out = progress_tx.cloned();
     let tx_err = progress_tx.cloned();
@@ -1340,7 +1340,7 @@ async fn execute_yt_dlp(
             Some(line) => format!("yt-dlp failed ({code_info}): {line}"),
             None => format!("yt-dlp failed ({code_info})"),
         };
-        return Err(TermusicError::Download(detail));
+        return Err(TunrError::Download(detail));
     }
 
     Ok(resolve_printed_filepaths(&stdout_lines, stage_dir))
@@ -1457,7 +1457,7 @@ fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> io::Result<T>) -> io::R
 
 fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
     if !staged_file.exists() {
-        return Err(TermusicError::Download(format!(
+        return Err(TunrError::Download(format!(
             "downloaded file missing from staging directory: {}",
             staged_file.display()
         )));
@@ -1470,7 +1470,7 @@ fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
     }
 
     let file_name = staged_file.file_name().ok_or_else(|| {
-        TermusicError::Download(format!(
+        TunrError::Download(format!(
             "downloaded file has invalid filename: {}",
             staged_file.display()
         ))
@@ -1512,7 +1512,7 @@ fn move_staged_file(staged_file: &Path, dest_dir: &Path) -> Result<PathBuf> {
         }
     }
 
-    Err(TermusicError::Download(format!(
+    Err(TunrError::Download(format!(
         "exhausted disambiguation attempts for {}",
         staged_file.display()
     )))
@@ -1572,7 +1572,7 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "termusic-download-test-{}",
+                "tunr-download-test-{}",
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(&dir).expect("create temp dir");
@@ -1639,11 +1639,11 @@ mod tests {
             }
         }
 
-        fn env(&self, termusic_dest: Option<&str>) -> DownloadEnv {
+        fn env(&self, tunr_dest: Option<&str>) -> DownloadEnv {
             DownloadEnv {
                 home_dir: Some(self.home_dir.clone()),
                 path_var: Some(self.bin_dir.as_os_str().to_os_string()),
-                termusic_dest: termusic_dest.map(str::to_string),
+                tunr_dest: tunr_dest.map(str::to_string),
                 pathext: None,
                 extra_search_dirs: Vec::new(),
             }
@@ -1800,7 +1800,7 @@ mod tests {
         let err = run_download_with_env(&ws.paths, &opts, &env)
             .await
             .unwrap_err();
-        assert!(matches!(err, TermusicError::InvalidArg(_)));
+        assert!(matches!(err, TunrError::InvalidArg(_)));
     }
 
     #[tokio::test]
@@ -1814,7 +1814,7 @@ mod tests {
             run_download_with_env(&ws.paths, &opts, &env)
                 .await
                 .unwrap_err(),
-            TermusicError::InvalidArg(_)
+            TunrError::InvalidArg(_)
         ));
 
         let mut set_only = base_options(vec![]);
@@ -1823,7 +1823,7 @@ mod tests {
             run_download_with_env(&ws.paths, &set_only, &env)
                 .await
                 .unwrap_err(),
-            TermusicError::InvalidArg(_)
+            TunrError::InvalidArg(_)
         ));
     }
 
@@ -1868,13 +1868,13 @@ mod tests {
             canonicalize_clean(&config_dir).unwrap()
         );
 
-        // 3rd: TERMUSIC_DEST overrides configured download_dest
+        // 3rd: TUNR_DEST overrides configured download_dest
         assert_eq!(
             resolve_destination(&ws.paths, &opts, None, &env_with_var).unwrap(),
             canonicalize_clean(&env_dir).unwrap()
         );
 
-        // 2nd: saved_dest (--set-dest) overrides TERMUSIC_DEST
+        // 2nd: saved_dest (--set-dest) overrides TUNR_DEST
         fs::create_dir_all(&set_dir).unwrap();
         let canonical_set = canonicalize_clean(&set_dir).unwrap();
         assert_eq!(
@@ -1882,7 +1882,7 @@ mod tests {
             canonical_set
         );
 
-        // 1st: --dest overrides --set-dest and TERMUSIC_DEST
+        // 1st: --dest overrides --set-dest and TUNR_DEST
         let mut flag_opts = opts.clone();
         flag_opts.dest = Some(flag_dir.clone());
         assert_eq!(
@@ -1896,7 +1896,7 @@ mod tests {
         fs::write(&file_dest, b"data").unwrap();
         flag_opts.dest = Some(file_dest);
         let err = resolve_destination(&ws.paths, &flag_opts, None, &env_without_var).unwrap_err();
-        assert!(matches!(err, TermusicError::InvalidArg(_)));
+        assert!(matches!(err, TunrError::InvalidArg(_)));
     }
 
     #[test]
@@ -1904,8 +1904,8 @@ mod tests {
         let ws = TestWorkspace::new();
         let env = ws.env(None);
 
-        assert!(matches!(find_yt_dlp(&env), Err(TermusicError::NotFound(_))));
-        assert!(matches!(find_ffmpeg(&env), Err(TermusicError::NotFound(_))));
+        assert!(matches!(find_yt_dlp(&env), Err(TunrError::NotFound(_))));
+        assert!(matches!(find_ffmpeg(&env), Err(TunrError::NotFound(_))));
         assert_eq!(detect_js_runtime(&env), None);
 
         // PATH yt-dlp, overridden when ~/.local/bin/yt-dlp exists
@@ -2095,7 +2095,7 @@ mod tests {
         assert!(no_add_out.failed.is_empty(), "failures: {:?}", no_add_out.failed);
         assert_eq!(no_add_out.downloaded_files, vec![expected_dest_track.clone()]);
         assert!(expected_dest_track.exists());
-        assert!(!dest.join(".termusic-dl-tmp").exists());
+        assert!(!dest.join(".tunr-dl-tmp").exists());
         assert!(no_add_out.add_summary.is_none());
         let lib_before = Library::load(&ws.paths.library_path).expect("load empty lib");
         assert!(lib_before.songs.is_empty());
@@ -2155,7 +2155,7 @@ mod tests {
         assert_eq!(outcome.failed[0].url, "https://example.com/fail");
         assert!(outcome.failed[0].error.contains("exit code 2"));
         assert!(outcome.failed[0].error.contains("ERROR: video unavailable"));
-        assert!(!dest.join(".termusic-dl-tmp").exists());
+        assert!(!dest.join(".tunr-dl-tmp").exists());
     }
 
     #[tokio::test]
@@ -2429,7 +2429,7 @@ printf '%s\n' "$out""#,
         for path in &outcome.downloaded_files {
             assert!(path.exists(), "missing finalized track {}", path.display());
         }
-        assert!(!dest.join(".termusic-dl-tmp").exists());
+        assert!(!dest.join(".tunr-dl-tmp").exists());
 
         let lib = Library::load(&ws.paths.library_path).unwrap();
         assert_eq!(lib.songs.len(), 2);
@@ -2513,7 +2513,7 @@ printf '%s\n' "$out""#,
     #[test]
     fn parses_yt_dlp_progress_and_postprocess_templates() {
         let prog = parse_yt_dlp_progress_line(
-            "TERMUSIC_PROG\tdownloading\t524288\tNA\t1048576.0\t262144.4\t2.0\tMy Cool Track",
+            "TUNR_PROG\tdownloading\t524288\tNA\t1048576.0\t262144.4\t2.0\tMy Cool Track",
             1,
         )
         .expect("should parse progress");
@@ -2532,7 +2532,7 @@ printf '%s\n' "$out""#,
         );
 
         let post = parse_yt_dlp_progress_line(
-            "TERMUSIC_POST\tstarted\tExtractAudio\tMy Cool Track",
+            "TUNR_POST\tstarted\tExtractAudio\tMy Cool Track",
             1,
         )
         .expect("should parse postprocess");
@@ -2559,16 +2559,16 @@ printf '%s\n' "$out""#,
         write_mock_yt_dlp(
             &ws.bin_dir,
             &format!(
-                r#"printf 'TERMUSIC_PROG\tdownloading\t500\t1000\tNA\t250\t2\tStreamed Song\n'
-printf 'TERMUSIC_POST\tstarted\tExtractAudio\tStreamed Song\n'
+                r#"printf 'TUNR_PROG\tdownloading\t500\t1000\tNA\t250\t2\tStreamed Song\n'
+printf 'TUNR_POST\tstarted\tExtractAudio\tStreamed Song\n'
 out="$stage/Streamed Song.wav"
 cp "{template}" "$out"
 printf '%s\n' "$out""#,
                 template = template_wav.display(),
             ),
             &format!(
-                "WScript.StdOut.WriteLine(\"TERMUSIC_PROG\\tdownloading\\t500\\t1000\\tNA\\t250\\t2\\tStreamed Song\");\n\
-                 WScript.StdOut.WriteLine(\"TERMUSIC_POST\\tstarted\\tExtractAudio\\tStreamed Song\");\n\
+                "WScript.StdOut.WriteLine(\"TUNR_PROG\\tdownloading\\t500\\t1000\\tNA\\t250\\t2\\tStreamed Song\");\n\
+                 WScript.StdOut.WriteLine(\"TUNR_POST\\tstarted\\tExtractAudio\\tStreamed Song\");\n\
                  var out = stage + \"\\\\Streamed Song.wav\";\n\
                  fso.CopyFile(\"{template}\", out, true);\n\
                  WScript.StdOut.WriteLine(out);",
@@ -2729,7 +2729,7 @@ printf '%s\n' "$out""#,
 
         for bad in ["", "   ", ".", ".mkv", "avi"] {
             assert!(
-                matches!(parse_download_format_str(bad), Err(TermusicError::InvalidArg(_))),
+                matches!(parse_download_format_str(bad), Err(TunrError::InvalidArg(_))),
                 "expected InvalidArg for {bad:?}"
             );
         }
@@ -2944,7 +2944,7 @@ printf '%s\n' "$out""#,
         let err = run_download_with_env(&ws.paths, &missing_opts, &ws.env(None))
             .await
             .unwrap_err();
-        assert!(matches!(err, TermusicError::NotFound(_)));
+        assert!(matches!(err, TunrError::NotFound(_)));
         let cfg = load_workspace_config(&ws.paths).expect("load workspace config");
         assert!(cfg.download_dest.is_none());
     }

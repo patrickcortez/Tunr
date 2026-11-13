@@ -21,7 +21,7 @@ use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleO
 use windows::core::{GUID, HRESULT, Interface, PCWSTR};
 
 use crate::audio::AudioSink;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 /// 100 ms in 100-nanosecond REFTIME units for shared-mode WASAPI buffering.
 const BUFFER_DURATION_HNS: i64 = 1_000_000;
@@ -44,7 +44,7 @@ impl ComGuard {
             // Thread already initialized COM (e.g., STA); COM remains valid, do not uninitialize.
             Ok(Self { should_uninit: false })
         } else {
-            Err(TermusicError::Audio(format!(
+            Err(TunrError::Audio(format!(
                 "CoInitializeEx(COINIT_MULTITHREADED) failed: {}",
                 windows::core::Error::from_hresult(hr)
             )))
@@ -65,7 +65,7 @@ struct EventHandle(HANDLE);
 impl EventHandle {
     fn create_auto_reset() -> Result<Self> {
         let handle = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
-            .map_err(|err| TermusicError::Audio(format!("CreateEventW failed: {err}")))?;
+            .map_err(|err| TunrError::Audio(format!("CreateEventW failed: {err}")))?;
         Ok(Self(handle))
     }
 
@@ -107,7 +107,7 @@ unsafe impl Send for WasapiSink {}
 
 impl WasapiSink {
     /// Verifies that COM and a default Windows render endpoint are accessible without retaining
-    /// COM state across thread handoff (`make_sink()` -> `termusic-engine`).
+    /// COM state across thread handoff (`make_sink()` -> `tunr-engine`).
     pub fn new() -> Result<Self> {
         {
             let _com_guard = ComGuard::init_mta()?;
@@ -124,7 +124,7 @@ impl WasapiSink {
         let com_guard = ComGuard::init_mta()?;
         let device = default_render_endpoint()?;
         let audio_client = unsafe { activate_audio_client(&device) }
-            .map_err(|err| TermusicError::Audio(format!("IMMDevice::Activate(IAudioClient) failed: {err}")))?;
+            .map_err(|err| TunrError::Audio(format!("IMMDevice::Activate(IAudioClient) failed: {err}")))?;
 
         let wfext = build_float_waveformat(sample_rate, channels)?;
         let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
@@ -142,22 +142,22 @@ impl WasapiSink {
                 None,
             )
         }
-        .map_err(|err| TermusicError::Audio(format!("IAudioClient::Initialize failed: {err}")))?;
+        .map_err(|err| TunrError::Audio(format!("IAudioClient::Initialize failed: {err}")))?;
 
         let buffer_frames = unsafe { audio_client.GetBufferSize() }
-            .map_err(|err| TermusicError::Audio(format!("IAudioClient::GetBufferSize failed: {err}")))?;
+            .map_err(|err| TunrError::Audio(format!("IAudioClient::GetBufferSize failed: {err}")))?;
         if buffer_frames == 0 {
-            return Err(TermusicError::Audio(
+            return Err(TunrError::Audio(
                 "WASAPI reported zero buffer frames".to_string(),
             ));
         }
 
         let event_handle = EventHandle::create_auto_reset()?;
         unsafe { audio_client.SetEventHandle(event_handle.raw()) }
-            .map_err(|err| TermusicError::Audio(format!("IAudioClient::SetEventHandle failed: {err}")))?;
+            .map_err(|err| TunrError::Audio(format!("IAudioClient::SetEventHandle failed: {err}")))?;
 
         let render_client: IAudioRenderClient = unsafe { audio_client.GetService() }
-            .map_err(|err| TermusicError::Audio(format!("IAudioClient::GetService(IAudioRenderClient) failed: {err}")))?;
+            .map_err(|err| TunrError::Audio(format!("IAudioClient::GetService(IAudioRenderClient) failed: {err}")))?;
 
         self.stream = Some(WasapiStream {
             render_client,
@@ -184,7 +184,7 @@ impl WasapiSink {
             let stream = self
                 .stream
                 .as_ref()
-                .ok_or_else(|| WasapiStepError::Fatal(TermusicError::Audio("WASAPI stream not open".to_string())))?;
+                .ok_or_else(|| WasapiStepError::Fatal(TunrError::Audio("WASAPI stream not open".to_string())))?;
 
             let padding = unsafe { stream.audio_client.GetCurrentPadding() }.map_err(map_win_err)?;
             let available = stream.buffer_frames.saturating_sub(padding);
@@ -194,7 +194,7 @@ impl WasapiSink {
                 let to_write = remaining.min(available as usize) as u32;
                 let raw_buf = unsafe { stream.render_client.GetBuffer(to_write) }.map_err(map_win_err)?;
                 if raw_buf.is_null() {
-                    return Err(WasapiStepError::Fatal(TermusicError::Audio(
+                    return Err(WasapiStepError::Fatal(TunrError::Audio(
                         "IAudioRenderClient::GetBuffer returned null pointer".to_string(),
                     )));
                 }
@@ -229,13 +229,13 @@ impl WasapiSink {
             if wait == WAIT_TIMEOUT {
                 let start = stall_start.get_or_insert_with(Instant::now);
                 if start.elapsed() >= MAX_WRITE_STALL {
-                    return Err(WasapiStepError::Fatal(TermusicError::Audio(
+                    return Err(WasapiStepError::Fatal(TunrError::Audio(
                         "WASAPI render wait timed out without buffer progress".to_string(),
                     )));
                 }
                 continue;
             }
-            return Err(WasapiStepError::Fatal(TermusicError::Audio(format!(
+            return Err(WasapiStepError::Fatal(TunrError::Audio(format!(
                 "WaitForSingleObject failed with status 0x{:08X}",
                 wait.0
             ))));
@@ -247,26 +247,26 @@ impl WasapiSink {
 
 enum WasapiStepError {
     DeviceInvalidated,
-    Fatal(TermusicError),
+    Fatal(TunrError),
 }
 
 fn map_win_err(err: windows::core::Error) -> WasapiStepError {
     if err.code() == AUDCLNT_E_DEVICE_INVALIDATED {
         WasapiStepError::DeviceInvalidated
     } else {
-        WasapiStepError::Fatal(TermusicError::Audio(format!("WASAPI error: {err}")))
+        WasapiStepError::Fatal(TunrError::Audio(format!("WASAPI error: {err}")))
     }
 }
 
 fn default_render_endpoint() -> Result<IMMDevice> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(|err| {
-            TermusicError::Audio(format!(
+            TunrError::Audio(format!(
                 "CoCreateInstance(MMDeviceEnumerator) failed: {err}"
             ))
         })?;
     unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.map_err(|err| {
-        TermusicError::Audio(format!(
+        TunrError::Audio(format!(
             "GetDefaultAudioEndpoint(eRender, eConsole) failed: {err}"
         ))
     })
@@ -324,15 +324,15 @@ fn channel_mask(channels: u8) -> u32 {
 
 fn build_float_waveformat(sample_rate: u32, channels: u8) -> Result<WAVEFORMATEXTENSIBLE> {
     if sample_rate == 0 {
-        return Err(TermusicError::Audio("WASAPI sample_rate must be > 0".to_string()));
+        return Err(TunrError::Audio("WASAPI sample_rate must be > 0".to_string()));
     }
     if channels == 0 {
-        return Err(TermusicError::Audio("WASAPI channels must be > 0".to_string()));
+        return Err(TunrError::Audio("WASAPI channels must be > 0".to_string()));
     }
     let block_align = u16::from(channels) * 4;
     let avg_bytes_per_sec = sample_rate
         .checked_mul(u32::from(block_align))
-        .ok_or_else(|| TermusicError::Audio("WASAPI sample rate byte rate overflow".to_string()))?;
+        .ok_or_else(|| TunrError::Audio("WASAPI sample rate byte rate overflow".to_string()))?;
     let cb_size = (std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>()) as u16;
 
     Ok(WAVEFORMATEXTENSIBLE {
@@ -356,10 +356,10 @@ fn build_float_waveformat(sample_rate: u32, channels: u8) -> Result<WAVEFORMATEX
 impl AudioSink for WasapiSink {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
         if sample_rate == 0 {
-            return Err(TermusicError::Audio("WASAPI sample_rate must be > 0".to_string()));
+            return Err(TunrError::Audio("WASAPI sample_rate must be > 0".to_string()));
         }
         if channels == 0 {
-            return Err(TermusicError::Audio("WASAPI channels must be > 0".to_string()));
+            return Err(TunrError::Audio("WASAPI channels must be > 0".to_string()));
         }
 
         if self.stream.is_some() && self.spec == Some((sample_rate, channels)) {
@@ -373,10 +373,10 @@ impl AudioSink for WasapiSink {
     fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
         let (sample_rate, channels_u8) = self
             .spec
-            .ok_or_else(|| TermusicError::Audio("WasapiSink::write_f32 called before open()".to_string()))?;
+            .ok_or_else(|| TunrError::Audio("WasapiSink::write_f32 called before open()".to_string()))?;
         let channels = usize::from(channels_u8);
         if samples.len() % channels != 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "PCM sample slice length {} is not divisible by {channels} channels",
                 samples.len()
             )));
@@ -395,7 +395,7 @@ impl AudioSink for WasapiSink {
                 Err(WasapiStepError::DeviceInvalidated) => {
                     reconnects += 1;
                     if reconnects > MAX_RECONNECT_ATTEMPTS {
-                        return Err(TermusicError::Audio(
+                        return Err(TunrError::Audio(
                             "WASAPI endpoint remained invalidated after reopen attempts".to_string(),
                         ));
                     }
@@ -423,7 +423,7 @@ impl AudioSink for WasapiSink {
                     self.close();
                     return Ok(());
                 }
-                return Err(TermusicError::Audio(format!("WASAPI flush failed: {err}")));
+                return Err(TunrError::Audio(format!("WASAPI flush failed: {err}")));
             }
         }
         Ok(())
@@ -451,7 +451,7 @@ impl AudioSink for WasapiSink {
                     self.close();
                     return Ok(());
                 }
-                Err(err) => return Err(TermusicError::Audio(format!("WASAPI drain failed: {err}"))),
+                Err(err) => return Err(TunrError::Audio(format!("WASAPI drain failed: {err}"))),
             }
         }
 

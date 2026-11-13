@@ -1,5 +1,5 @@
 [package]
-name = "termusic"
+name = "tunr"
 version = "1.0.0"
 edition = "2024"
 description = "Command-line music player with interactive TUI"

@@ -5,7 +5,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::audio::{AudioSink, SymphoniaTrack};
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::ipc::{PlayMode, PlaybackState, PlaybackStatus};
 use crate::library::Song;
 
@@ -69,11 +69,11 @@ impl EngineHandle {
                 ack: ack_tx,
             })
             .await
-            .map_err(|_| TermusicError::Daemon("audio engine is not running".to_string()))?;
+            .map_err(|_| TunrError::Daemon("audio engine is not running".to_string()))?;
 
         ack_rx
             .await
-            .map_err(|_| TermusicError::Daemon("audio engine stopped before responding".to_string()))?
+            .map_err(|_| TunrError::Daemon("audio engine stopped before responding".to_string()))?
     }
 }
 
@@ -214,7 +214,7 @@ impl PlaybackEngine {
         loop_playback: bool,
     ) -> Result<()> {
         if queue.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "cannot play an empty queue".to_string(),
             ));
         }
@@ -254,7 +254,7 @@ impl PlaybackEngine {
 
     fn next_track(&mut self) -> Result<()> {
         if self.active_order.is_empty() || self.state == PlaybackState::Stopped {
-            return Err(TermusicError::NotFound(
+            return Err(TunrError::NotFound(
                 "no track is currently queued".to_string(),
             ));
         }
@@ -266,7 +266,7 @@ impl PlaybackEngine {
 
     fn prev_track(&mut self) -> Result<()> {
         if self.active_order.is_empty() || self.state == PlaybackState::Stopped {
-            return Err(TermusicError::NotFound(
+            return Err(TunrError::NotFound(
                 "no track is currently queued".to_string(),
             ));
         }
@@ -332,12 +332,12 @@ impl PlaybackEngine {
 
     fn seek_relative(&mut self, delta: f64) -> Result<()> {
         if !delta.is_finite() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "seek offset must be a finite number of seconds".to_string(),
             ));
         }
         if self.state == PlaybackState::Stopped || self.track.is_none() {
-            return Err(TermusicError::Audio(
+            return Err(TunrError::Audio(
                 "cannot seek when playback is stopped".to_string(),
             ));
         }
@@ -398,12 +398,12 @@ impl PlaybackEngine {
 
     fn seek_absolute(&mut self, target: f64) -> Result<()> {
         if !target.is_finite() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "seek target must be a finite number of seconds".to_string(),
             ));
         }
         if self.state == PlaybackState::Stopped || self.track.is_none() {
-            return Err(TermusicError::Audio(
+            return Err(TunrError::Audio(
                 "cannot seek when playback is stopped".to_string(),
             ));
         }
@@ -414,7 +414,7 @@ impl PlaybackEngine {
 
     fn seek_track_in_place(&mut self, target: f64) -> Result<()> {
         if self.track.is_none() {
-            return Err(TermusicError::Audio("no active track to seek".to_string()));
+            return Err(TunrError::Audio("no active track to seek".to_string()));
         }
 
         self.pending_pcm.clear();
@@ -439,7 +439,7 @@ impl PlaybackEngine {
         match self.state {
             PlaybackState::Playing => self.set_paused(true),
             PlaybackState::Paused => self.set_paused(false),
-            PlaybackState::Stopped => Err(TermusicError::Audio(
+            PlaybackState::Stopped => Err(TunrError::Audio(
                 "cannot toggle pause when playback is stopped".to_string(),
             )),
         }
@@ -447,7 +447,7 @@ impl PlaybackEngine {
 
     fn set_paused(&mut self, paused: bool) -> Result<()> {
         match (self.state, paused) {
-            (PlaybackState::Stopped, _) => Err(TermusicError::Audio(
+            (PlaybackState::Stopped, _) => Err(TunrError::Audio(
                 "playback is stopped; start a track with `play` first".to_string(),
             )),
             (PlaybackState::Paused, true) | (PlaybackState::Playing, false) => Ok(()),
@@ -465,7 +465,7 @@ impl PlaybackEngine {
                 let target = self.paused_position.max(0.0);
                 let (actual, sample_rate, channels) = {
                     let track = self.track.as_mut().ok_or_else(|| {
-                        TermusicError::Audio("no active track to resume".to_string())
+                        TunrError::Audio("no active track to resume".to_string())
                     })?;
                     let actual = track.seek(target)?;
                     (actual, track.sample_rate(), track.channels())
@@ -619,17 +619,17 @@ fn drain_pending_commands(
     }
 }
 
-/// Spawn the audio playback engine on a dedicated OS thread (`termusic-engine`), returning an
+/// Spawn the audio playback engine on a dedicated OS thread (`tunr-engine`), returning an
 /// async [`EngineHandle`] and thread [`std::thread::JoinHandle`].
 pub fn spawn_engine(sink: Box<dyn AudioSink>) -> Result<(EngineHandle, std::thread::JoinHandle<()>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
     let (status_tx, status_rx) = watch::channel(Arc::new(PlaybackStatus::default()));
 
     let handle = std::thread::Builder::new()
-        .name("termusic-engine".to_string())
+        .name("tunr-engine".to_string())
         .spawn(move || run_engine(sink, cmd_rx, status_tx))
         .map_err(|err| {
-            TermusicError::Daemon(format!("failed to spawn audio engine thread: {err}"))
+            TunrError::Daemon(format!("failed to spawn audio engine thread: {err}"))
         })?;
 
     Ok((EngineHandle::new(cmd_tx, status_rx), handle))
@@ -768,7 +768,7 @@ mod tests {
 
     fn temp_workspace(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "termusic-player-test-{label}-{}",
+            "tunr-player-test-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -1337,7 +1337,7 @@ mod tests {
 
         let err = engine.execute(EngineCommand::SeekAbsolute(0.0)).0.unwrap_err();
         assert!(
-            matches!(err, TermusicError::Audio(ref msg) if msg == "cannot seek when playback is stopped"),
+            matches!(err, TunrError::Audio(ref msg) if msg == "cannot seek when playback is stopped"),
             "unexpected error when seeking stopped engine: {err:?}"
         );
 

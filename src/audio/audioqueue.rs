@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioSink;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 const K_AUDIO_FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
 const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
@@ -125,10 +125,10 @@ unsafe extern "C" fn output_callback(
 
 fn build_asbd(sample_rate: u32, channels: u8) -> Result<AudioStreamBasicDescription> {
     if sample_rate == 0 {
-        return Err(TermusicError::Audio("AudioQueue sample_rate must be > 0".to_string()));
+        return Err(TunrError::Audio("AudioQueue sample_rate must be > 0".to_string()));
     }
     if channels == 0 {
-        return Err(TermusicError::Audio("AudioQueue channels must be > 0".to_string()));
+        return Err(TunrError::Audio("AudioQueue channels must be > 0".to_string()));
     }
     let bytes_per_frame = u32::from(channels) * 4;
     Ok(AudioStreamBasicDescription {
@@ -153,7 +153,7 @@ fn check_osstatus(context: &str, status: OSStatus) -> Result<()> {
     if status == 0 {
         Ok(())
     } else {
-        Err(TermusicError::Audio(format!("{context} failed with OSStatus {status}")))
+        Err(TunrError::Audio(format!("{context} failed with OSStatus {status}")))
     }
 }
 
@@ -205,7 +205,7 @@ impl AudioQueueSink {
         };
         if status != 0 || aq_raw.is_null() {
             unsafe { drop(Arc::from_raw(raw_state)) };
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "AudioQueueNewOutput failed with OSStatus {status}"
             )));
         }
@@ -220,7 +220,7 @@ impl AudioQueueSink {
                 }
                 let _ = unsafe { AudioQueueDispose(aq_raw, 1) };
                 unsafe { drop(Arc::from_raw(raw_state)) };
-                return Err(TermusicError::Audio(format!(
+                return Err(TunrError::Audio(format!(
                     "AudioQueueAllocateBuffer failed with OSStatus {alloc_status}"
                 )));
             }
@@ -247,7 +247,7 @@ impl AudioQueueSink {
         let stream = self
             .stream
             .as_ref()
-            .ok_or_else(|| TermusicError::Audio("AudioQueueSink stream not open".to_string()))?;
+            .ok_or_else(|| TunrError::Audio("AudioQueueSink stream not open".to_string()))?;
 
         let aq = stream.aq.as_ptr();
         let byte_len = samples.len() * std::mem::size_of::<f32>();
@@ -258,20 +258,20 @@ impl AudioQueueSink {
             while inner.free_buffers.is_empty() && !inner.disposing {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(TermusicError::Audio(
+                    return Err(TunrError::Audio(
                         "AudioQueue timed out waiting for a free output buffer".to_string(),
                     ));
                 }
                 let (guard, timeout_res) = stream.state.cv.wait_timeout(inner, remaining).unwrap_or_else(|e| e.into_inner());
                 inner = guard;
                 if timeout_res.timed_out() && inner.free_buffers.is_empty() {
-                    return Err(TermusicError::Audio(
+                    return Err(TunrError::Audio(
                         "AudioQueue timed out waiting for a free output buffer".to_string(),
                     ));
                 }
             }
             if inner.disposing {
-                return Err(TermusicError::Audio("AudioQueue is disposing".to_string()));
+                return Err(TunrError::Audio("AudioQueue is disposing".to_string()));
             }
             let buf = inner.free_buffers.pop_front().expect("checked non-empty");
             inner.enqueued_count += 1;
@@ -285,7 +285,7 @@ impl AudioQueueSink {
                 let mut inner = stream.state.inner.lock().unwrap_or_else(|e| e.into_inner());
                 inner.enqueued_count = inner.enqueued_count.saturating_sub(1);
                 inner.free_buffers.push_back(buf);
-                return Err(TermusicError::Audio(format!(
+                return Err(TunrError::Audio(format!(
                     "AudioQueue buffer capacity {} too small for {byte_len} bytes",
                     buf_ref.m_audio_data_bytes_capacity
                 )));
@@ -332,10 +332,10 @@ impl AudioQueueSink {
 impl AudioSink for AudioQueueSink {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
         if sample_rate == 0 {
-            return Err(TermusicError::Audio("AudioQueue sample_rate must be > 0".to_string()));
+            return Err(TunrError::Audio("AudioQueue sample_rate must be > 0".to_string()));
         }
         if channels == 0 {
-            return Err(TermusicError::Audio("AudioQueue channels must be > 0".to_string()));
+            return Err(TunrError::Audio("AudioQueue channels must be > 0".to_string()));
         }
 
         if self.stream.is_some() && self.spec == Some((sample_rate, channels)) {
@@ -349,10 +349,10 @@ impl AudioSink for AudioQueueSink {
     fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
         let (_, channels) = self
             .spec
-            .ok_or_else(|| TermusicError::Audio("AudioQueueSink::write_f32 called before open()".to_string()))?;
+            .ok_or_else(|| TunrError::Audio("AudioQueueSink::write_f32 called before open()".to_string()))?;
         let ch = usize::from(channels);
         if samples.len() % ch != 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "PCM sample slice length {} is not divisible by {ch} channels",
                 samples.len()
             )));
@@ -365,7 +365,7 @@ impl AudioSink for AudioQueueSink {
             .stream
             .as_ref()
             .map(|s| s.buffer_cap_samples)
-            .ok_or_else(|| TermusicError::Audio("AudioQueueSink stream not open".to_string()))?;
+            .ok_or_else(|| TunrError::Audio("AudioQueueSink stream not open".to_string()))?;
 
         // Fast path when staging is empty and input already spans whole coalesced chunks.
         let mut rest = samples;

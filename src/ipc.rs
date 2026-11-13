@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::process::{Child, Command};
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::library::Song;
 use crate::paths::{self, AppPaths, IpcEndpoint};
 pub use crate::platform::is_pid_alive;
@@ -81,7 +81,7 @@ impl fmt::Display for TargetKind {
     }
 }
 
-/// Requests sent from CLI/TUI clients to the Termusic playback daemon over Unix socket.
+/// Requests sent from CLI/TUI clients to the Tunr playback daemon over Unix socket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     Play {
@@ -119,7 +119,7 @@ pub struct PlaybackStatus {
     pub loop_playback: bool,
 }
 
-/// Response returned by the Termusic playback daemon for an `IpcRequest`.
+/// Response returned by the Tunr playback daemon for an `IpcRequest`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcResponse {
     Ok(PlaybackStatus),
@@ -157,16 +157,16 @@ where
         return Ok(None);
     }
     if buf.len() > MAX_IPC_MESSAGE_BYTES {
-        return Err(TermusicError::Ipc(format!(
+        return Err(TunrError::Ipc(format!(
             "IPC message exceeded {MAX_IPC_MESSAGE_BYTES} byte limit"
         )));
     }
 
     let text = std::str::from_utf8(&buf)
-        .map_err(|err| TermusicError::Ipc(format!("IPC message is not valid UTF-8: {err}")))?;
+        .map_err(|err| TunrError::Ipc(format!("IPC message is not valid UTF-8: {err}")))?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(TermusicError::Ipc(
+        return Err(TunrError::Ipc(
             "received empty IPC message frame".to_string(),
         ));
     }
@@ -185,7 +185,7 @@ pub enum IpcStream {
 }
 
 impl IpcStream {
-    /// Connect as a client to `endpoint`, returning `TermusicError::Ipc` if the daemon is offline.
+    /// Connect as a client to `endpoint`, returning `TunrError::Ipc` if the daemon is offline.
     pub async fn connect(endpoint: &IpcEndpoint) -> Result<Self> {
         match endpoint {
             #[cfg(unix)]
@@ -194,12 +194,12 @@ impl IpcStream {
                     .await
                     .map_err(|err| match err.kind() {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
-                            TermusicError::Ipc(format!(
+                            TunrError::Ipc(format!(
                                 "playback daemon is not running at {}: {err}",
                                 socket_path.display()
                             ))
                         }
-                        _ => TermusicError::Io(err),
+                        _ => TunrError::Io(err),
                     })?;
                 Ok(Self::Unix(stream))
             }
@@ -220,7 +220,7 @@ impl IpcStream {
                             if err.raw_os_error()
                                 == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
                         {
-                            return Err(TermusicError::Ipc(format!(
+                            return Err(TunrError::Ipc(format!(
                                 "timed out waiting for busy named pipe at {pipe_name}: {err}"
                             )));
                         }
@@ -228,11 +228,11 @@ impl IpcStream {
                             if err.kind() == io::ErrorKind::NotFound
                                 || err.kind() == io::ErrorKind::ConnectionRefused =>
                         {
-                            return Err(TermusicError::Ipc(format!(
+                            return Err(TunrError::Ipc(format!(
                                 "playback daemon is not running at {pipe_name}: {err}"
                             )));
                         }
-                        Err(err) => return Err(TermusicError::Io(err)),
+                        Err(err) => return Err(TunrError::Io(err)),
                     }
                 }
             }
@@ -317,7 +317,7 @@ mod windows_pipe {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::IpcStream;
-    use crate::error::{Result, TermusicError};
+    use crate::error::{Result, TunrError};
 
     struct HandleGuard(HANDLE);
     impl Drop for HandleGuard {
@@ -483,15 +483,15 @@ mod windows_pipe {
     impl NamedPipeListener {
         pub(super) fn bind(pipe_name: &str) -> Result<Self> {
             let sd = OwnedSecurityDescriptor::current_user_only().map_err(|err| {
-                TermusicError::Ipc(format!(
+                TunrError::Ipc(format!(
                     "failed to build named pipe security descriptor: {err}"
                 ))
             })?;
             let current = create_pipe_instance(pipe_name, true, &sd).map_err(|err| {
-                TermusicError::Ipc(format!("failed to bind named pipe {pipe_name}: {err}"))
+                TunrError::Ipc(format!("failed to bind named pipe {pipe_name}: {err}"))
             })?;
             let standby = create_pipe_instance(pipe_name, false, &sd).map_err(|err| {
-                TermusicError::Ipc(format!(
+                TunrError::Ipc(format!(
                     "failed to prepare standby named pipe {pipe_name}: {err}"
                 ))
             })?;
@@ -534,20 +534,20 @@ impl IpcListener {
 
                 let path_bytes = socket_path.as_os_str().as_encoded_bytes().len();
                 if path_bytes >= MAX_SUN_PATH_BYTES {
-                    return Err(TermusicError::Ipc(format!(
+                    return Err(TunrError::Ipc(format!(
                         "Unix socket path {} exceeds OS sockaddr_un limit ({path_bytes} >= {MAX_SUN_PATH_BYTES} bytes); set XDG_RUNTIME_DIR to a shorter directory",
                         socket_path.display()
                     )));
                 }
 
                 let inner = tokio::net::UnixListener::bind(socket_path).map_err(|err| {
-                    TermusicError::Ipc(format!(
+                    TunrError::Ipc(format!(
                         "failed to bind playback daemon socket {}: {err}",
                         socket_path.display()
                     ))
                 })?;
                 crate::platform::restrict_socket_permissions(socket_path).map_err(|err| {
-                    TermusicError::Ipc(format!(
+                    TunrError::Ipc(format!(
                         "failed to set socket permissions on {}: {err}",
                         socket_path.display()
                     ))
@@ -589,7 +589,7 @@ async fn is_daemon_lock_held_async(lock_path: &Path) -> Result<bool> {
     let lock_path = lock_path.to_path_buf();
     tokio::task::spawn_blocking(move || is_daemon_lock_held(&lock_path))
         .await
-        .map_err(|err| TermusicError::Async(format!("daemon lock check task failed: {err}")))?
+        .map_err(|err| TunrError::Async(format!("daemon lock check task failed: {err}")))?
 }
 
 async fn exchange_on_stream(mut stream: IpcStream, req: &IpcRequest) -> Result<PlaybackStatus> {
@@ -599,15 +599,15 @@ async fn exchange_on_stream(mut stream: IpcStream, req: &IpcRequest) -> Result<P
         let mut reader = BufReader::new(&mut stream);
         match read_message::<_, IpcResponse>(&mut reader).await? {
             Some(IpcResponse::Ok(status)) => Ok(status),
-            Some(IpcResponse::Err(msg)) => Err(TermusicError::Daemon(msg)),
-            None => Err(TermusicError::Ipc(
+            Some(IpcResponse::Err(msg)) => Err(TunrError::Daemon(msg)),
+            None => Err(TunrError::Ipc(
                 "playback daemon closed connection without responding".to_string(),
             )),
         }
     })
     .await
     .map_err(|_| {
-        TermusicError::Ipc(format!(
+        TunrError::Ipc(format!(
             "timed out waiting for playback daemon response after {}s",
             IPC_TIMEOUT.as_secs()
         ))
@@ -659,7 +659,7 @@ pub fn prepare_daemon_spawn(paths: &AppPaths) -> Result<bool> {
 
 async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
     let exe = std::env::current_exe().map_err(|err| {
-        TermusicError::Daemon(format!("could not resolve current executable path: {err}"))
+        TunrError::Daemon(format!("could not resolve current executable path: {err}"))
     })?;
 
     let log_path = paths.log_path.clone();
@@ -691,7 +691,7 @@ async fn spawn_detached_daemon(paths: &AppPaths) -> Result<Option<Child>> {
     crate::platform::configure_detached_daemon(&mut cmd);
 
     let child = cmd.spawn().map_err(|err| {
-        TermusicError::Daemon(format!("failed to spawn playback daemon: {err}"))
+        TunrError::Daemon(format!("failed to spawn playback daemon: {err}"))
     })?;
     Ok(Some(child))
 }
@@ -702,11 +702,11 @@ async fn acquire_spawn_lock(paths: &AppPaths) -> Result<paths::FileLock> {
     tokio::task::spawn_blocking(move || -> Result<paths::FileLock> {
         paths_clone.ensure_dirs()?;
         paths::acquire_file_lock(&spawn_lock_path, true, true)?.ok_or_else(|| {
-            TermusicError::Daemon("failed to acquire daemon spawn lock".to_string())
+            TunrError::Daemon("failed to acquire daemon spawn lock".to_string())
         })
     })
     .await
-    .map_err(|err| TermusicError::Async(format!("daemon spawn lock task failed: {err}")))?
+    .map_err(|err| TunrError::Async(format!("daemon spawn lock task failed: {err}")))?
 }
 
 async fn ensure_daemon_and_send_with<F, Fut>(
@@ -733,7 +733,7 @@ where
     let prep_paths = paths.clone();
     let should_spawn = tokio::task::spawn_blocking(move || prepare_daemon_spawn(&prep_paths))
         .await
-        .map_err(|err| TermusicError::Async(format!("prepare daemon task failed: {err}")))??;
+        .map_err(|err| TunrError::Async(format!("prepare daemon task failed: {err}")))??;
 
     if !should_spawn {
         drop(spawn_guard);
@@ -744,7 +744,7 @@ where
             }
             tokio::time::sleep(DAEMON_SPAWN_POLL_INTERVAL).await;
         }
-        return Err(TermusicError::Daemon(format!(
+        return Err(TunrError::Daemon(format!(
             "existing daemon did not accept connections at {}",
             paths.ipc_endpoint
         )));
@@ -769,7 +769,7 @@ where
                 // Another winning daemon already owns `daemon.lock`; continue polling until it binds.
                 opt_child = None;
             } else {
-                return Err(TermusicError::Daemon(format!(
+                return Err(TunrError::Daemon(format!(
                     "playback daemon exited prematurely with {exit_status} (see {})",
                     paths.log_path.display()
                 )));
@@ -778,7 +778,7 @@ where
         tokio::time::sleep(DAEMON_SPAWN_POLL_INTERVAL).await;
     }
 
-    Err(TermusicError::Daemon(format!(
+    Err(TunrError::Daemon(format!(
         "timed out waiting for playback daemon endpoint at {}",
         paths.ipc_endpoint
     )))
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(status.position_secs, 4.5);
 
         let err = send_request(&paths, &IpcRequest::Next).await.unwrap_err();
-        assert!(matches!(err, TermusicError::Daemon(msg) if msg == "nothing queued"));
+        assert!(matches!(err, TunrError::Daemon(msg) if msg == "nothing queued"));
 
         server.await.unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -980,7 +980,7 @@ mod tests {
 
         let err = server.await.unwrap().unwrap_err();
         assert!(
-            matches!(err, TermusicError::Ipc(ref msg) if msg.contains("limit")),
+            matches!(err, TunrError::Ipc(ref msg) if msg.contains("limit")),
             "expected size limit error, got {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -993,14 +993,14 @@ mod tests {
         let missing_ep = IpcEndpoint::UnixSocket(dir.join("nonexistent.sock"));
         #[cfg(windows)]
         let missing_ep = IpcEndpoint::NamedPipe(format!(
-            r"\\.\pipe\termusic-missing-{}",
+            r"\\.\pipe\tunr-missing-{}",
             uuid::Uuid::new_v4()
         ));
 
         let err = send_request_to(&missing_ep, &IpcRequest::GetStatus)
             .await
             .unwrap_err();
-        assert!(matches!(err, TermusicError::Ipc(ref msg) if msg.contains("not running")));
+        assert!(matches!(err, TunrError::Ipc(ref msg) if msg.contains("not running")));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1022,12 +1022,12 @@ mod tests {
 
         let overlong = PathBuf::from("/tmp")
             .join("a".repeat(120))
-            .join("termusic.sock");
+            .join("tunr.sock");
         let err = match IpcListener::bind(&IpcEndpoint::UnixSocket(overlong)) {
             Ok(_) => panic!("expected overlong socket path to fail"),
             Err(err) => err,
         };
-        assert!(matches!(err, TermusicError::Ipc(ref msg) if msg.contains("sockaddr_un")));
+        assert!(matches!(err, TunrError::Ipc(ref msg) if msg.contains("sockaddr_un")));
 
         let _ = fs::remove_dir_all(&dir);
     }

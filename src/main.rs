@@ -1,11 +1,11 @@
 use std::io::{BufRead, IsTerminal, Write};
 
-use termusic::cli::{AddInput, Command, ListKind, PlayQuery, parse_cli};
-use termusic::error::{Result, TermusicError};
-use termusic::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
-use termusic::library::{DeleteOutcome, Library, PlayResolution, SongCandidate};
-use termusic::paths::{self, AppPaths};
-use termusic::{daemon, download, download_tui, search, search_tui, tui};
+use tunr::cli::{AddInput, Command, ListKind, PlayQuery, parse_cli};
+use tunr::error::{Result, TunrError};
+use tunr::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
+use tunr::library::{DeleteOutcome, Library, PlayResolution, SongCandidate};
+use tunr::paths::{self, AppPaths};
+use tunr::{daemon, download, download_tui, search, search_tui, tui};
 
 #[tokio::main]
 async fn main() {
@@ -22,14 +22,14 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+        .map_err(|err| TunrError::Async(format!("blocking task failed: {err}")))?
 }
 
 async fn run() -> Result<()> {
     let command = parse_cli()?;
     match command {
         Command::Version => {
-            println!("termusic {}", env!("CARGO_PKG_VERSION"));
+            println!("tunr {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Command::Init { path } => {
@@ -46,12 +46,12 @@ async fn run() -> Result<()> {
             #[cfg(target_os = "android")]
             if is_android_shared_storage(&cfg.working_dir) {
                 eprintln!(
-                    "warning: workspace {} is on Android shared storage, where file locking may be unreliable; consider placing the workspace under $HOME (e.g. ~/termusic-workspace) and using `termusic add -f` to import music",
+                    "warning: workspace {} is on Android shared storage, where file locking may be unreliable; consider placing the workspace under $HOME (e.g. ~/tunr-workspace) and using `tunr add -f` to import music",
                     cfg.working_dir.display()
                 );
             }
             println!(
-                "Initialized Termusic workspace at {}",
+                "Initialized Tunr workspace at {}",
                 cfg.working_dir.display()
             );
             println!("  Config:    {}", paths.config_path.display());
@@ -77,7 +77,7 @@ async fn run() -> Result<()> {
 
             if saving_defaults {
                 let paths = paths_opt.as_ref().ok_or_else(|| {
-                    TermusicError::NotInitialized("workspace is not initialized".to_string())
+                    TunrError::NotInitialized("workspace is not initialized".to_string())
                 })?;
                 if let Some(limit) = opts.set_limit {
                     let p = paths.clone();
@@ -120,9 +120,9 @@ async fn run() -> Result<()> {
                 .format_default
                 .or_else(|| workspace_cfg.as_ref().and_then(|c| c.search_format));
 
-            let env_limit = std::env::var("TERMUSIC_SEARCH_LIMIT").ok();
-            let env_provider = std::env::var("TERMUSIC_SEARCH_PROVIDER").ok();
-            let env_format = std::env::var("TERMUSIC_SEARCH_FORMAT").ok();
+            let env_limit = std::env::var("TUNR_SEARCH_LIMIT").ok();
+            let env_provider = std::env::var("TUNR_SEARCH_PROVIDER").ok();
+            let env_format = std::env::var("TUNR_SEARCH_FORMAT").ok();
 
             let effective_limit =
                 search::resolve_search_limit(&opts, env_limit.as_deref(), config_limit)?;
@@ -135,12 +135,12 @@ async fn run() -> Result<()> {
                 let paths = paths_opt
                     .as_ref()
                     .ok_or_else(|| {
-                        TermusicError::NotInitialized("workspace is not initialized".to_string())
+                        TunrError::NotInitialized("workspace is not initialized".to_string())
                     })?
                     .clone();
                 let dest = opts.dest.clone();
                 run_blocking(move || {
-                    termusic::download::validate_search_download_destination(
+                    tunr::download::validate_search_download_destination(
                         &paths,
                         dest.as_deref(),
                     )
@@ -170,7 +170,7 @@ async fn run() -> Result<()> {
             }
 
             if opts.query.is_empty() {
-                return Err(TermusicError::InvalidArg(
+                return Err(TunrError::InvalidArg(
                     "missing search query (pass <QUERY...> when stdout/stdin is not a TTY or with --no-tui)"
                         .to_string(),
                 ));
@@ -187,8 +187,8 @@ async fn run() -> Result<()> {
         }
         Command::Tui => {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                return Err(TermusicError::InvalidArg(
-                    "interactive TUI requires a terminal (stdin/stdout TTY); pass a subcommand such as `termusic status` or `termusic play`".to_string(),
+                return Err(TunrError::InvalidArg(
+                    "interactive TUI requires a terminal (stdin/stdout TTY); pass a subcommand such as `tunr status` or `tunr play`".to_string(),
                 ));
             }
             tui::run_tui(&paths).await
@@ -226,7 +226,7 @@ async fn run() -> Result<()> {
                             })
                             .collect::<Vec<_>>()
                             .join("; ");
-                        return Err(TermusicError::Ambiguous(format!(
+                        return Err(TunrError::Ambiguous(format!(
                             "multiple songs match '{query}': {list}; specify `--artist <ARTIST>`"
                         )));
                     }
@@ -276,7 +276,7 @@ async fn run() -> Result<()> {
                         AddInput::Song(query) => library.add_song(&query, target_pl),
                         AddInput::ExistingSong(query) => {
                             let pl = target_pl.ok_or_else(|| {
-                                TermusicError::InvalidArg(
+                                TunrError::InvalidArg(
                                     "`-e`/`--existing` requires a target playlist (`-p <PLAYLIST>`)"
                                         .to_string(),
                                 )
@@ -388,7 +388,7 @@ async fn run() -> Result<()> {
                 print_playback_status(&status);
                 Ok(())
             }
-            Err(TermusicError::Ipc(_)) => {
+            Err(TunrError::Ipc(_)) => {
                 println!("State: stopped (daemon not running)");
                 Ok(())
             }
@@ -399,7 +399,7 @@ async fn run() -> Result<()> {
                 println!("Stopped playback daemon.");
                 Ok(())
             }
-            Err(TermusicError::Ipc(_)) => {
+            Err(TunrError::Ipc(_)) => {
                 println!("Playback daemon is not running.");
                 Ok(())
             }
@@ -456,7 +456,7 @@ async fn run() -> Result<()> {
                 eprintln!("download failed for {}: {}", failure.url, failure.error);
             }
             if !outcome.failed.is_empty() {
-                return Err(TermusicError::Download(format!(
+                return Err(TunrError::Download(format!(
                     "{} download(s) failed ({} succeeded)",
                     outcome.failed.len(),
                     outcome.downloaded_files.len()
@@ -588,7 +588,7 @@ fn prompt_song_selection<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> Result<usize> {
     if candidates.is_empty() {
-        return Err(TermusicError::NotFound(format!(
+        return Err(TunrError::NotFound(format!(
             "no song found matching '{query}'"
         )));
     }
@@ -610,14 +610,14 @@ fn prompt_song_selection<R: BufRead, W: Write>(
         let mut line = String::new();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "selection cancelled".to_string(),
             ));
         }
 
         let trimmed = line.trim();
         if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "selection cancelled".to_string(),
             ));
         }
@@ -722,14 +722,14 @@ mod tests {
             let err =
                 prompt_song_selection("Sunrise", &candidates, &mut reader, &mut out).unwrap_err();
             assert!(
-                matches!(err, TermusicError::InvalidArg(ref msg) if msg == "selection cancelled"),
+                matches!(err, TunrError::InvalidArg(ref msg) if msg == "selection cancelled"),
                 "unexpected error for input {input:?}: {err:?}"
             );
         }
     }
 
     fn sample_library() -> Library {
-        use termusic::library::{Playlist, Song};
+        use tunr::library::{Playlist, Song};
 
         Library {
             songs: vec![
@@ -834,8 +834,8 @@ Playlists (0):
 
     #[test]
     fn format_playback_status_renders_loop_flag_with_and_without_playlist() {
-        use termusic::ipc::PlayMode;
-        use termusic::library::Song;
+        use tunr::ipc::PlayMode;
+        use tunr::library::Song;
 
         let track = Song {
             id: "s1".to_string(),

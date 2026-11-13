@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::download::{DownloadFormat, parse_download_format_str};
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::paths::{DEFAULT_SEARCH_LIMIT, validate_search_limit};
 use crate::ytdlp::{self, ToolEnv};
 
@@ -17,7 +17,7 @@ const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 512 * 1024;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Number of curated search providers supported by `termusic search -p`.
+/// Number of curated search providers supported by `tunr search -p`.
 pub const SUPPORTED_SEARCH_PROVIDER_COUNT: usize = 2;
 
 /// Curated search providers supported via `yt-dlp` keyword search.
@@ -63,7 +63,7 @@ impl SearchProvider {
             | "youtu.be" => Ok(Self::YouTube),
             "soundcloud" | "sc" | "scsearch" | "soundcloud.com" | "www.soundcloud.com"
             | "m.soundcloud.com" => Ok(Self::SoundCloud),
-            _ => Err(TermusicError::InvalidArg(format!(
+            _ => Err(TunrError::InvalidArg(format!(
                 "unsupported search provider '{raw}'; {SUPPORTED_SEARCH_PROVIDER_COUNT} supported search providers: YouTube (youtube, youtube.com, youtu.be) and SoundCloud (soundcloud, soundcloud.com)"
             ))),
         }
@@ -93,7 +93,7 @@ fn normalize_provider_token(raw: &str) -> String {
     host.trim_end_matches('.').to_string()
 }
 
-/// Parsed options for `termusic search`.
+/// Parsed options for `tunr search`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     pub query: String,
@@ -122,7 +122,7 @@ pub struct SearchResult {
 }
 
 /// Resolve the effective search limit using precedence:
-/// `--limit` -> `--set-limit` -> `TERMUSIC_SEARCH_LIMIT` -> `config.search_limit` -> `DEFAULT_SEARCH_LIMIT`.
+/// `--limit` -> `--set-limit` -> `TUNR_SEARCH_LIMIT` -> `config.search_limit` -> `DEFAULT_SEARCH_LIMIT`.
 pub fn resolve_search_limit(
     opts: &SearchOptions,
     env_limit: Option<&str>,
@@ -136,8 +136,8 @@ pub fn resolve_search_limit(
     }
     if let Some(raw) = env_limit.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = raw.parse::<usize>().map_err(|err| {
-            TermusicError::InvalidArg(format!(
-                "invalid TERMUSIC_SEARCH_LIMIT '{raw}': {err}"
+            TunrError::InvalidArg(format!(
+                "invalid TUNR_SEARCH_LIMIT '{raw}': {err}"
             ))
         })?;
         return validate_search_limit(parsed);
@@ -149,7 +149,7 @@ pub fn resolve_search_limit(
 }
 
 /// Resolve the effective search provider using precedence:
-/// `--provider` -> `--provider-default` -> `TERMUSIC_SEARCH_PROVIDER` -> `config.search_provider` -> `YouTube`.
+/// `--provider` -> `--provider-default` -> `TUNR_SEARCH_PROVIDER` -> `config.search_provider` -> `YouTube`.
 pub fn resolve_search_provider(
     opts: &SearchOptions,
     env_provider: Option<&str>,
@@ -168,7 +168,7 @@ pub fn resolve_search_provider(
 }
 
 /// Resolve the effective download format for `search -d` using precedence:
-/// `--format` -> `--format-default` -> `TERMUSIC_SEARCH_FORMAT` -> `config.search_download_format` -> `Mp3`.
+/// `--format` -> `--format-default` -> `TUNR_SEARCH_FORMAT` -> `config.search_download_format` -> `Mp3`.
 pub fn resolve_search_format(
     opts: &SearchOptions,
     env_format: Option<&str>,
@@ -289,7 +289,7 @@ pub fn parse_yt_dlp_search_json_for_provider(
     provider: SearchProvider,
 ) -> Result<Vec<SearchResult>> {
     let raw: RawSearchResponse = serde_json::from_slice(json_bytes)
-        .map_err(|err| TermusicError::Search(format!("failed to parse yt-dlp search JSON: {err}")))?;
+        .map_err(|err| TunrError::Search(format!("failed to parse yt-dlp search JSON: {err}")))?;
 
     let mut results = Vec::new();
     for entry in raw.entries.into_iter().flatten().flatten() {
@@ -379,7 +379,7 @@ async fn search_yt_dlp_with_env_and_timeout(
 ) -> Result<Vec<SearchResult>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Err(TermusicError::InvalidArg(
+        return Err(TunrError::InvalidArg(
             "search query cannot be empty".to_string(),
         ));
     }
@@ -397,15 +397,15 @@ async fn search_yt_dlp_with_env_and_timeout(
 
     let mut child = cmd
         .spawn()
-        .map_err(|err| TermusicError::Search(format!("failed to start yt-dlp: {err}")))?;
+        .map_err(|err| TunrError::Search(format!("failed to start yt-dlp: {err}")))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| TermusicError::Search("yt-dlp stdout pipe missing".to_string()))?;
+        .ok_or_else(|| TunrError::Search("yt-dlp stdout pipe missing".to_string()))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| TermusicError::Search("yt-dlp stderr pipe missing".to_string()))?;
+        .ok_or_else(|| TunrError::Search("yt-dlp stderr pipe missing".to_string()))?;
 
     let io_and_wait = async {
         tokio::try_join!(
@@ -421,14 +421,14 @@ async fn search_yt_dlp_with_env_and_timeout(
         Ok(Err(err)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(TermusicError::Search(format!(
+            return Err(TunrError::Search(format!(
                 "yt-dlp search failed: {err}"
             )));
         }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(TermusicError::Search(format!(
+            return Err(TunrError::Search(format!(
                 "yt-dlp search timed out after {}s",
                 timeout.as_secs()
             )));
@@ -445,7 +445,7 @@ async fn search_yt_dlp_with_env_and_timeout(
             Some(line) => format!("yt-dlp search failed ({code_info}): {line}"),
             None => format!("yt-dlp search failed ({code_info})"),
         };
-        return Err(TermusicError::Search(detail));
+        return Err(TunrError::Search(detail));
     }
 
     parse_yt_dlp_search_json_for_provider(&stdout_bytes, provider)
@@ -467,7 +467,7 @@ mod tests {
     impl TestBinDir {
         fn new(label: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
-                "termusic-search-test-{label}-{}",
+                "tunr-search-test-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
             let bin_dir = root.join("bin");
@@ -585,7 +585,7 @@ mod tests {
         for bad in ["", "   ", "https://vimeo.com", "spotify", "music.youtube.com"] {
             let err = SearchProvider::parse(bad).unwrap_err();
             match err {
-                TermusicError::InvalidArg(msg) => {
+                TunrError::InvalidArg(msg) => {
                     assert!(msg.contains("2 supported search providers"), "msg={msg}");
                     assert!(msg.contains("YouTube"), "msg={msg}");
                     assert!(msg.contains("SoundCloud"), "msg={msg}");
@@ -626,7 +626,7 @@ mod tests {
         let bare = base_opts();
         assert!(matches!(
             resolve_search_provider(&bare, Some("vimeo.com"), None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
         );
         assert!(matches!(
             resolve_search_format(&bare, Some(".mkv"), None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
     }
 
@@ -675,14 +675,14 @@ mod tests {
         let bare = base_opts();
         for bad in ["0", "101", "-2", "abc"] {
             let err = resolve_search_limit(&bare, Some(bad), None).unwrap_err();
-            assert!(matches!(err, TermusicError::InvalidArg(_)), "bad={bad}");
+            assert!(matches!(err, TunrError::InvalidArg(_)), "bad={bad}");
         }
 
         let mut bad_flag = base_opts();
         bad_flag.limit = Some(0);
         assert!(matches!(
             resolve_search_limit(&bad_flag, None, None),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
     }
 
@@ -791,7 +791,7 @@ mod tests {
 
         assert!(matches!(
             parse_yt_dlp_search_json(b"{not-json"),
-            Err(TermusicError::Search(_))
+            Err(TunrError::Search(_))
         ));
 
         // SoundCloud prefers `webpage_url` over `api.soundcloud.com` `url`, and does not synthesize YouTube URLs.
@@ -850,7 +850,7 @@ mod tests {
                 SEARCH_TIMEOUT
             )
             .await,
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             search_yt_dlp_with_env_and_timeout(
@@ -861,7 +861,7 @@ mod tests {
                 SEARCH_TIMEOUT
             )
             .await,
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             search_yt_dlp_with_env_and_timeout(
@@ -872,7 +872,7 @@ mod tests {
                 SEARCH_TIMEOUT
             )
             .await,
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             search_yt_dlp_with_env_and_timeout(
@@ -883,7 +883,7 @@ mod tests {
                 SEARCH_TIMEOUT
             )
             .await,
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
     }
 
@@ -978,7 +978,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            TermusicError::Search(msg) => {
+            TunrError::Search(msg) => {
                 assert!(msg.contains("ERROR: HTTP Error 429"), "msg={msg}");
             }
             other => panic!("expected Search error, got {other:?}"),
@@ -1021,7 +1021,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, TermusicError::Search(_)));
+        assert!(matches!(err, TunrError::Search(_)));
     }
 
     #[tokio::test]
@@ -1043,7 +1043,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            TermusicError::Search(msg) => assert!(msg.contains("timed out"), "msg={msg}"),
+            TunrError::Search(msg) => assert!(msg.contains("timed out"), "msg={msg}"),
             other => panic!("expected timeout Search error, got {other:?}"),
         }
     }

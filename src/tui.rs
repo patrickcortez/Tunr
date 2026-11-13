@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 use crate::ipc::{self, IpcRequest, PlayMode, PlaybackState, PlaybackStatus, TargetKind};
 use crate::library::{DeleteOutcome, Library, Song};
 use crate::paths::AppPaths;
@@ -115,7 +115,7 @@ struct QueuedIpcAction {
     request: IpcRequest,
 }
 
-/// Synchronous state machine and renderer for the interactive Termusic terminal interface.
+/// Synchronous state machine and renderer for the interactive Tunr terminal interface.
 pub struct TuiApp {
     library: Library,
     library_stamp: Option<(SystemTime, u64)>,
@@ -847,7 +847,7 @@ impl TuiApp {
 
         let mut spans = vec![
             Span::styled(
-                concat!(" Termusic v", env!("CARGO_PKG_VERSION")),
+                concat!(" Tunr v", env!("CARGO_PKG_VERSION")),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled("   |   ", Style::new().fg(Color::DarkGray)),
@@ -965,7 +965,7 @@ impl TuiApp {
             frame.render_widget(block, area);
             if !inner.is_empty() {
                 let empty = Paragraph::new(
-                    "No tracks in this view.\nRun `termusic add <path>` to import music.",
+                    "No tracks in this view.\nRun `tunr add <path>` to import music.",
                 )
                 .style(Style::new().fg(Color::DarkGray))
                 .alignment(Alignment::Center)
@@ -1232,7 +1232,7 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
         Ok((library, stamp))
     })
     .await
-    .map_err(|err| TermusicError::Async(format!("failed to load library: {err}")))??;
+    .map_err(|err| TunrError::Async(format!("failed to load library: {err}")))??;
 
     let mut app = TuiApp::from_loaded(library, library_stamp);
     app.request_poll_status();
@@ -1367,7 +1367,7 @@ fn dispatch_effects(
                     let _ = worker_tx.send(TuiEvent::ActionCompleted {
                         generation,
                         is_play: true,
-                        result: Err(TermusicError::Async(
+                        result: Err(TunrError::Async(
                             "playback action worker unavailable".to_string(),
                         )),
                     });
@@ -1388,7 +1388,7 @@ fn dispatch_effects(
                     let _ = worker_tx.send(TuiEvent::ActionCompleted {
                         generation,
                         is_play: false,
-                        result: Err(TermusicError::Async(
+                        result: Err(TunrError::Async(
                             "playback action worker unavailable".to_string(),
                         )),
                     });
@@ -1417,7 +1417,7 @@ fn dispatch_effects(
                         Err(join_err) => TuiEvent::LibraryChecked {
                             generation,
                             observed_stamp: known_stamp,
-                            result: Err(TermusicError::Async(format!(
+                            result: Err(TunrError::Async(format!(
                                 "library reload task failed: {join_err}"
                             ))),
                         },
@@ -1435,7 +1435,7 @@ fn dispatch_effects(
                     .await
                     {
                         Ok(res) => res,
-                        Err(join_err) => Err(TermusicError::Async(format!(
+                        Err(join_err) => Err(TunrError::Async(format!(
                             "delete task failed: {join_err}"
                         ))),
                     };
@@ -1484,7 +1484,7 @@ async fn stop_daemon_on_quit(
             Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) if is_daemon_offline_error(&err) => Ok(()),
             Ok(Err(err)) => Err(err),
-            Err(_) => Err(TermusicError::Ipc(
+            Err(_) => Err(TunrError::Ipc(
                 "timed out waiting for daemon stop".to_string(),
             )),
         },
@@ -1518,7 +1518,7 @@ fn execute_delete_blocking(
     })?;
     let stamp = file_stamp(lib_path);
     let library = updated_library.ok_or_else(|| {
-        TermusicError::Async("delete transaction completed without updated library".to_string())
+        TunrError::Async("delete transaction completed without updated library".to_string())
     })?;
     Ok((library, stamp, outcome))
 }
@@ -1545,15 +1545,15 @@ fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
     Some((modified, meta.len()))
 }
 
-fn is_daemon_offline_error(err: &TermusicError) -> bool {
+fn is_daemon_offline_error(err: &TunrError) -> bool {
     match err {
-        TermusicError::Ipc(msg) => {
+        TunrError::Ipc(msg) => {
             let lower = msg.to_ascii_lowercase();
             lower.contains("not running")
                 || lower.contains("no such file")
                 || lower.contains("connection refused")
         }
-        TermusicError::Io(io_err) => matches!(
+        TunrError::Io(io_err) => matches!(
             io_err.kind(),
             io::ErrorKind::NotFound
                 | io::ErrorKind::ConnectionRefused
@@ -1606,7 +1606,7 @@ mod tests {
         fn handle_send(&mut self, req: &IpcRequest) -> Result<PlaybackStatus> {
             self.requests.push(req.clone());
             if self.offline {
-                return Err(TermusicError::Ipc("daemon not running".to_string()));
+                return Err(TunrError::Ipc("daemon not running".to_string()));
             }
             Ok(self.next_status.clone().unwrap_or_default())
         }
@@ -1696,7 +1696,7 @@ mod tests {
 
     fn temp_paths(label: &str) -> (PathBuf, AppPaths) {
         let root = std::env::temp_dir().join(format!(
-            "termusic-tui-test-{label}-{}",
+            "tunr-tui-test-{label}-{}",
             Uuid::new_v4()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -1979,7 +1979,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
 
         let screen = terminal.backend().to_string();
-        assert!(screen.contains("Termusic v1.0.0"), "missing header title:\n{screen}");
+        assert!(screen.contains("Tunr v1.0.0"), "missing header title:\n{screen}");
         assert!(screen.contains("[Mode: Shuffle]"), "missing mode:\n{screen}");
         assert!(screen.contains("Playing"), "missing playback state:\n{screen}");
         assert!(screen.contains("[All Songs] (3)"), "missing [All Songs]:\n{screen}");
@@ -2175,22 +2175,22 @@ mod tests {
 
     #[test]
     fn offline_error_classification_keeps_real_ipc_failures_visible() {
-        assert!(is_daemon_offline_error(&TermusicError::Ipc(
+        assert!(is_daemon_offline_error(&TunrError::Ipc(
             "playback daemon is not running at /tmp/x.sock".to_string()
         )));
-        assert!(is_daemon_offline_error(&TermusicError::Io(
+        assert!(is_daemon_offline_error(&TunrError::Io(
             io::Error::from(io::ErrorKind::ConnectionRefused)
         )));
-        assert!(!is_daemon_offline_error(&TermusicError::Ipc(
+        assert!(!is_daemon_offline_error(&TunrError::Ipc(
             "timed out waiting for daemon stop".to_string()
         )));
-        assert!(!is_daemon_offline_error(&TermusicError::Daemon(
+        assert!(!is_daemon_offline_error(&TunrError::Daemon(
             "engine failed".to_string()
         )));
-        assert!(!is_daemon_offline_error(&TermusicError::Io(
+        assert!(!is_daemon_offline_error(&TunrError::Io(
             io::Error::from(io::ErrorKind::TimedOut)
         )));
-        assert!(is_daemon_offline_error(&TermusicError::Io(
+        assert!(is_daemon_offline_error(&TunrError::Io(
             io::Error::from(io::ErrorKind::NotConnected)
         )));
     }

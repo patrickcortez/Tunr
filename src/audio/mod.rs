@@ -9,7 +9,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag, Tag};
 use symphonia::core::units::{Duration, Time, TimeBase};
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 #[cfg(target_os = "android")]
 pub mod aaudio;
@@ -47,7 +47,7 @@ pub struct TrackProbe {
 
 /// Sink abstraction for interleaved `f32` PCM audio output.
 ///
-/// Sinks are [`Send`] so ownership can be transferred into the dedicated `termusic-engine` OS
+/// Sinks are [`Send`] so ownership can be transferred into the dedicated `tunr-engine` OS
 /// thread, where every method is called with exclusive `&mut self` access. Implementations must
 /// treat [`AudioSink::close`] as idempotent so repeated `close()` calls and [`Drop`] teardown
 /// during daemon shutdown are safe.
@@ -59,11 +59,11 @@ pub trait AudioSink: Send {
     fn close(&mut self);
 }
 
-/// Construct the platform default [`AudioSink`], honoring `TERMUSIC_AUDIO_BACKEND`
+/// Construct the platform default [`AudioSink`], honoring `TUNR_AUDIO_BACKEND`
 /// (`auto`, `null`, `pulse`; platform-specific backends such as `aaudio`, `wasapi`, and
 /// `audioqueue` are reported explicitly until implemented).
 pub fn default_sink() -> Result<Box<dyn AudioSink>> {
-    let backend = std::env::var("TERMUSIC_AUDIO_BACKEND").ok();
+    let backend = std::env::var("TUNR_AUDIO_BACKEND").ok();
     default_sink_for_backend(backend.as_deref())
 }
 
@@ -89,7 +89,7 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
                         Ok(sink) => Ok(Box::new(sink)),
                         Err(pulse_err) => match aaudio::AAudioSink::new() {
                             Ok(sink) => Ok(Box::new(sink)),
-                            Err(aaudio_err) => Err(TermusicError::Audio(format!(
+                            Err(aaudio_err) => Err(TunrError::Audio(format!(
                                 "failed to initialize Termux PulseAudio ({pulse_err}) and AAudio ({aaudio_err})"
                             ))),
                         },
@@ -99,7 +99,7 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
                         Ok(sink) => Ok(Box::new(sink)),
                         Err(aaudio_err) => match pulse::PulseSimpleSink::new() {
                             Ok(sink) => Ok(Box::new(sink)),
-                            Err(pulse_err) => Err(TermusicError::Audio(format!(
+                            Err(pulse_err) => Err(TunrError::Audio(format!(
                                 "failed to initialize AAudio ({aaudio_err}) and Termux PulseAudio ({pulse_err})"
                             ))),
                         },
@@ -121,8 +121,8 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
                 target_os = "macos"
             )))]
             {
-                Err(TermusicError::Audio(format!(
-                    "no default audio backend is available for target OS '{}' (use TERMUSIC_AUDIO_BACKEND=null for headless playback)",
+                Err(TunrError::Audio(format!(
+                    "no default audio backend is available for target OS '{}' (use TUNR_AUDIO_BACKEND=null for headless playback)",
                     std::env::consts::OS
                 )))
             }
@@ -134,7 +134,7 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
             }
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {
-                Err(TermusicError::Audio(format!(
+                Err(TunrError::Audio(format!(
                     "audio backend 'pulse' is only supported on Linux and Android (current target OS: '{}')",
                     std::env::consts::OS
                 )))
@@ -147,7 +147,7 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
             }
             #[cfg(not(target_os = "android"))]
             {
-                Err(TermusicError::Audio(format!(
+                Err(TunrError::Audio(format!(
                     "audio backend 'aaudio' is only supported on Android (current target OS: '{}')",
                     std::env::consts::OS
                 )))
@@ -160,7 +160,7 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
             }
             #[cfg(not(target_os = "windows"))]
             {
-                Err(TermusicError::Audio(format!(
+                Err(TunrError::Audio(format!(
                     "audio backend 'wasapi' is only supported on Windows (current target OS: '{}')",
                     std::env::consts::OS
                 )))
@@ -173,14 +173,14 @@ fn default_sink_for_backend(backend: Option<&str>) -> Result<Box<dyn AudioSink>>
             }
             #[cfg(not(target_os = "macos"))]
             {
-                Err(TermusicError::Audio(format!(
+                Err(TunrError::Audio(format!(
                     "audio backend 'audioqueue' is only supported on macOS (current target OS: '{}')",
                     std::env::consts::OS
                 )))
             }
         }
-        other => Err(TermusicError::Audio(format!(
-            "unknown TERMUSIC_AUDIO_BACKEND '{other}' (expected one of: auto, null, pulse, aaudio, wasapi, audioqueue)"
+        other => Err(TunrError::Audio(format!(
+            "unknown TUNR_AUDIO_BACKEND '{other}' (expected one of: auto, null, pulse, aaudio, wasapi, audioqueue)"
         ))),
     }
 }
@@ -194,7 +194,7 @@ pub struct DecodedChunk {
 
 /// Demuxer and decoder state for a single audio track opened via Symphonia.
 ///
-/// Intended for single-owner `&mut self` decoding on the `termusic-engine` playback thread;
+/// Intended for single-owner `&mut self` decoding on the `tunr-engine` playback thread;
 /// dropping releases the underlying demuxer, decoder, and container file handle cleanly.
 pub struct SymphoniaTrack {
     format: Box<dyn FormatReader>,
@@ -214,7 +214,7 @@ pub fn probe_track(path: &Path) -> Result<TrackProbe> {
     let (track_id, duration_secs) = {
         let track = format
             .default_track(TrackType::Audio)
-            .ok_or_else(|| TermusicError::Audio(format!("no audio track found in '{}'", path.display())))?;
+            .ok_or_else(|| TunrError::Audio(format!("no audio track found in '{}'", path.display())))?;
         let id = track.id;
         let track_dur = compute_track_duration_secs(track);
         (id, track_dur)
@@ -249,13 +249,13 @@ impl SymphoniaTrack {
         let (track_id, time_base, audio_params, track_dur) = {
             let track = format
                 .default_track(TrackType::Audio)
-                .ok_or_else(|| TermusicError::Audio(format!("no audio track found in '{}'", path.display())))?;
+                .ok_or_else(|| TunrError::Audio(format!("no audio track found in '{}'", path.display())))?;
             let audio_params = track
                 .codec_params
                 .as_ref()
                 .and_then(|p| p.audio())
                 .ok_or_else(|| {
-                    TermusicError::Audio(format!(
+                    TunrError::Audio(format!(
                         "missing audio codec parameters in '{}'",
                         path.display()
                     ))
@@ -391,14 +391,14 @@ impl SymphoniaTrack {
     /// actual timestamp seeked to in seconds.
     pub fn seek(&mut self, target_secs: f64) -> Result<f64> {
         if !target_secs.is_finite() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "seek target must be a finite number of seconds".to_string(),
             ));
         }
 
         let clamped = target_secs.max(0.0);
         let time = Time::try_from_secs_f64(clamped).ok_or_else(|| {
-            TermusicError::Audio(format!("seek target out of representable range: {clamped}"))
+            TunrError::Audio(format!("seek target out of representable range: {clamped}"))
         })?;
 
         let seeked = self
@@ -429,13 +429,13 @@ impl SymphoniaTrack {
             let track = self
                 .format
                 .default_track(TrackType::Audio)
-                .ok_or_else(|| TermusicError::Audio("no audio track after stream reset".to_string()))?;
+                .ok_or_else(|| TunrError::Audio("no audio track after stream reset".to_string()))?;
             let audio_params = track
                 .codec_params
                 .as_ref()
                 .and_then(|p| p.audio())
                 .ok_or_else(|| {
-                    TermusicError::Audio("missing audio codec parameters after stream reset".to_string())
+                    TunrError::Audio("missing audio codec parameters after stream reset".to_string())
                 })?
                 .clone();
             (
@@ -506,7 +506,7 @@ fn extract_audio_spec(
         .sample_rate
         .or(decoder_params.sample_rate)
         .filter(|&r| r > 0)
-        .ok_or_else(|| TermusicError::Audio("missing or zero audio sample rate".to_string()))?;
+        .ok_or_else(|| TunrError::Audio("missing or zero audio sample rate".to_string()))?;
 
     let ch_count = track_params
         .channels
@@ -514,10 +514,10 @@ fn extract_audio_spec(
         .or(decoder_params.channels.as_ref())
         .map(|c| c.count())
         .filter(|&c| c > 0)
-        .ok_or_else(|| TermusicError::Audio("missing or zero audio channel count".to_string()))?;
+        .ok_or_else(|| TunrError::Audio("missing or zero audio channel count".to_string()))?;
 
     let channels = u8::try_from(ch_count).map_err(|_| {
-        TermusicError::Audio(format!("unsupported channel count {ch_count} (exceeds u8::MAX)"))
+        TunrError::Audio(format!("unsupported channel count {ch_count} (exceeds u8::MAX)"))
     })?;
 
     Ok((sample_rate, channels))
@@ -575,10 +575,10 @@ fn set_non_empty(slot: &mut Option<String>, val: &str) {
     }
 }
 
-fn map_symphonia_err(context: &str, err: SymError) -> TermusicError {
+fn map_symphonia_err(context: &str, err: SymError) -> TunrError {
     match err {
-        SymError::IoError(io_err) => TermusicError::Io(io_err),
-        other => TermusicError::Audio(format!("{context}: {other}")),
+        SymError::IoError(io_err) => TunrError::Io(io_err),
+        other => TunrError::Audio(format!("{context}: {other}")),
     }
 }
 
@@ -595,7 +595,7 @@ mod tests {
     fn temp_wav_path(label: &str) -> PathBuf {
         let idx = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "termusic-audio-test-{}-{idx}",
+            "tunr-audio-test-{}-{idx}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -700,18 +700,18 @@ mod tests {
         let unknown_err = default_sink_for_backend(Some("bogus"))
             .err()
             .expect("unknown backend must error");
-        assert!(matches!(unknown_err, TermusicError::Audio(ref msg) if msg.contains("unknown TERMUSIC_AUDIO_BACKEND")));
+        assert!(matches!(unknown_err, TunrError::Audio(ref msg) if msg.contains("unknown TUNR_AUDIO_BACKEND")));
 
         #[cfg(not(target_os = "android"))]
         {
             let err = default_sink_for_backend(Some("aaudio")).err().expect("aaudio is Android-only");
-            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("aaudio")));
+            assert!(matches!(err, TunrError::Audio(ref msg) if msg.contains("aaudio")));
         }
 
         #[cfg(not(target_os = "windows"))]
         {
             let err = default_sink_for_backend(Some("wasapi")).err().expect("wasapi is Windows-only");
-            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("wasapi")));
+            assert!(matches!(err, TunrError::Audio(ref msg) if msg.contains("wasapi")));
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -719,7 +719,7 @@ mod tests {
             let err = default_sink_for_backend(Some("audioqueue"))
                 .err()
                 .expect("audioqueue is macOS-only");
-            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("audioqueue")));
+            assert!(matches!(err, TunrError::Audio(ref msg) if msg.contains("audioqueue")));
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -727,7 +727,7 @@ mod tests {
             let err = default_sink_for_backend(Some("pulse"))
                 .err()
                 .expect("pulse is Linux/Android-only");
-            assert!(matches!(err, TermusicError::Audio(ref msg) if msg.contains("pulse")));
+            assert!(matches!(err, TunrError::Audio(ref msg) if msg.contains("pulse")));
         }
 
         #[cfg(target_os = "linux")]
