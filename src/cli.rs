@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,7 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
 use crate::download::{DownloadFormat, DownloadOptions, normalize_urls, parse_download_format_str};
 use crate::error::{Result, TermusicError};
 use crate::ipc::{PlayMode, TargetKind};
+use crate::link::{DownloadTarget, is_link_file_arg};
 use crate::paths::{self, AppPaths, IpcEndpoint};
 use crate::search::{SearchOptions, SearchProvider};
 
@@ -259,8 +261,8 @@ pub enum RawCommand {
         /// Disable interactive TUI loading screen and print line progress
         #[arg(long = "no-tui")]
         no_tui: bool,
-        /// One or more media URLs to download
-        #[arg(value_name = "URL")]
+        /// One or more media URLs or .link files to download
+        #[arg(value_name = "URL|LINK_FILE")]
         urls: Vec<String>,
     },
 
@@ -959,14 +961,40 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 }
                 None => None,
             };
-            let normalized_urls = normalize_urls(&urls)?;
-            if normalized_urls.is_empty() && set_dest.is_none() {
+            let has_link_files = urls.iter().any(|arg| is_link_file_arg(arg));
+            let (normalized_urls, targets) = if !has_link_files {
+                (normalize_urls(&urls)?, Vec::new())
+            } else {
+                let mut seen_urls = HashSet::new();
+                let mut out_targets = Vec::new();
+                for raw in &urls {
+                    if raw.trim().is_empty() {
+                        return Err(TermusicError::InvalidArg(
+                            "URL or .link path cannot be empty".to_string(),
+                        ));
+                    }
+                    if is_link_file_arg(raw) {
+                        // Preserve literal path including internal spaces; do not split_whitespace().
+                        out_targets.push(DownloadTarget::LinkFile(PathBuf::from(raw.trim())));
+                    } else {
+                        for u in normalize_urls(std::slice::from_ref(raw))? {
+                            if seen_urls.insert(u.clone()) {
+                                out_targets.push(DownloadTarget::Url(u));
+                            }
+                        }
+                    }
+                }
+                (Vec::new(), out_targets)
+            };
+            if normalized_urls.is_empty() && targets.is_empty() && set_dest.is_none() {
                 return Err(TermusicError::InvalidArg(
-                    "missing URL (pass <URL...> or --set-dest <DIR>)".to_string(),
+                    "missing URL or .link file (pass <URL|LINK_FILE...> or --set-dest <DIR>)"
+                        .to_string(),
                 ));
             }
             Ok(Command::Download(DownloadOptions {
                 urls: normalized_urls,
+                targets,
                 dest,
                 set_dest,
                 format,
@@ -2368,6 +2396,7 @@ mod tests {
             parse_cli_from(["termusic", "download", "https://youtu.be/dQw4w9WgXcQ"]).unwrap(),
             Command::Download(DownloadOptions {
                 urls: vec!["https://youtu.be/dQw4w9WgXcQ".to_string()],
+                targets: Vec::new(),
                 dest: None,
                 set_dest: None,
                 format: DownloadFormat::Mp3,
@@ -2400,6 +2429,7 @@ mod tests {
             .unwrap(),
             Command::Download(DownloadOptions {
                 urls: vec!["https://example.com/list".to_string()],
+                targets: Vec::new(),
                 dest: Some(PathBuf::from("/tmp/music")),
                 set_dest: None,
                 format: DownloadFormat::Flac,
@@ -2416,6 +2446,7 @@ mod tests {
             parse_cli_from(["termusic", "download", "--set-dest", "/tmp/saved"]).unwrap(),
             Command::Download(DownloadOptions {
                 urls: Vec::new(),
+                targets: Vec::new(),
                 dest: None,
                 set_dest: Some(PathBuf::from("/tmp/saved")),
                 format: DownloadFormat::Mp3,
@@ -2448,6 +2479,7 @@ mod tests {
                     "https://example.com/b".to_string(),
                     "https://example.com/c".to_string(),
                 ],
+                targets: Vec::new(),
                 dest: None,
                 set_dest: Some(PathBuf::from("/tmp/saved")),
                 format: DownloadFormat::Mp3,
@@ -2520,6 +2552,131 @@ mod tests {
         ));
         assert!(matches!(
             parse_cli_from(["termusic", "download", "-p", "  ", "https://example.com/a"]),
+            Err(TermusicError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn download_parses_link_files_and_mixed_targets() {
+        // Positional .link file (disk-free: path does not need to exist at parse time).
+        assert_eq!(
+            parse_cli_from(["termusic", "download", "test-links/test.link"]).unwrap(),
+            Command::Download(DownloadOptions {
+                urls: Vec::new(),
+                targets: vec![DownloadTarget::LinkFile(PathBuf::from(
+                    "test-links/test.link"
+                ))],
+                dest: None,
+                set_dest: None,
+                format: DownloadFormat::Mp3,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // .link paths with internal spaces and surrounding whitespace are trimmed and preserved intact.
+        assert_eq!(
+            parse_cli_from(["termusic", "download", "  my links/chill mix.LINK  "]).unwrap(),
+            Command::Download(DownloadOptions {
+                urls: Vec::new(),
+                targets: vec![DownloadTarget::LinkFile(PathBuf::from(
+                    "my links/chill mix.LINK"
+                ))],
+                dest: None,
+                set_dest: None,
+                format: DownloadFormat::Mp3,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // Mixed .link files and URLs preserve positional order and deduplicate URLs.
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "download",
+                "first.link",
+                "https://example.com/a https://example.com/b",
+                "my lists/second file.link",
+                "https://example.com/a",
+                "https://example.com/c",
+            ])
+            .unwrap(),
+            Command::Download(DownloadOptions {
+                urls: Vec::new(),
+                targets: vec![
+                    DownloadTarget::LinkFile(PathBuf::from("first.link")),
+                    DownloadTarget::Url("https://example.com/a".to_string()),
+                    DownloadTarget::Url("https://example.com/b".to_string()),
+                    DownloadTarget::LinkFile(PathBuf::from("my lists/second file.link")),
+                    DownloadTarget::Url("https://example.com/c".to_string()),
+                ],
+                dest: None,
+                set_dest: None,
+                format: DownloadFormat::Mp3,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // URL ending in `.link` is still parsed as a raw URL, not a local .link file.
+        assert_eq!(
+            parse_cli_from(["termusic", "download", "https://example.com/foo.link"]).unwrap(),
+            Command::Download(DownloadOptions {
+                urls: vec!["https://example.com/foo.link".to_string()],
+                targets: Vec::new(),
+                dest: None,
+                set_dest: None,
+                format: DownloadFormat::Mp3,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // `.link` file combined with `--set-dest`.
+        assert_eq!(
+            parse_cli_from([
+                "termusic",
+                "download",
+                "--set-dest",
+                "/tmp/saved",
+                "my lists/mix.link",
+            ])
+            .unwrap(),
+            Command::Download(DownloadOptions {
+                urls: Vec::new(),
+                targets: vec![DownloadTarget::LinkFile(PathBuf::from("my lists/mix.link"))],
+                dest: None,
+                set_dest: Some(PathBuf::from("/tmp/saved")),
+                format: DownloadFormat::Mp3,
+                playlist: false,
+                embed_thumbnail: true,
+                auto_add: true,
+                playlist_name: None,
+                jobs: 4,
+                no_tui: false,
+            })
+        );
+
+        // Empty/whitespace argument alongside a `.link` file is still rejected.
+        assert!(matches!(
+            parse_cli_from(["termusic", "download", "a.link", "   "]),
             Err(TermusicError::InvalidArg(_))
         ));
     }
@@ -2780,6 +2937,7 @@ mod tests {
             parse_cli_from(["termusic", "download", "-f", ".mp4", "https://youtu.be/abc"]).unwrap(),
             Command::Download(DownloadOptions {
                 urls: vec!["https://youtu.be/abc".to_string()],
+                targets: Vec::new(),
                 dest: None,
                 set_dest: None,
                 format: DownloadFormat::Mp4,

@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(windows)]
@@ -16,6 +18,7 @@ use tokio::task::JoinSet;
 
 use crate::error::{Result, TermusicError};
 use crate::library::{AddSummary, Library};
+use crate::link::{self, DownloadTarget, LinkExpr, LinkStatement};
 use crate::paths::{AppPaths, load_workspace_config, set_workspace_download_dest};
 use crate::platform::canonicalize_clean;
 use crate::ytdlp::{self, ToolEnv};
@@ -100,6 +103,7 @@ impl fmt::Display for DownloadFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadOptions {
     pub urls: Vec<String>,
+    pub targets: Vec<DownloadTarget>,
     pub dest: Option<PathBuf>,
     pub set_dest: Option<PathBuf>,
     pub format: DownloadFormat,
@@ -109,6 +113,14 @@ pub struct DownloadOptions {
     pub playlist_name: Option<String>,
     pub jobs: usize,
     pub no_tui: bool,
+}
+
+/// Transition kind for a conditional step inside a `.link` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTransition {
+    Primary,
+    Fallback,
+    Then,
 }
 
 /// Lifecycle phase for an individual URL inside `termusic download`.
@@ -134,7 +146,8 @@ pub enum DownloadPhase {
     },
 }
 
-/// Real-time batch and per-track progress events emitted by [`run_download_with_progress`].
+/// Real-time batch and per-track progress events emitted by [`run_download_with_progress`]
+/// and [`run_download_plan_with_progress`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadProgressEvent {
     BatchStarted {
@@ -144,6 +157,13 @@ pub enum DownloadProgressEvent {
         jobs: usize,
     },
     Notice(String),
+    ItemStepStarted {
+        index: usize,
+        url: String,
+        step: usize,
+        total_steps: usize,
+        transition: StepTransition,
+    },
     ItemUpdate {
         index: usize,
         title: Option<String>,
@@ -166,11 +186,12 @@ pub struct DownloadFailure {
     pub error: String,
 }
 
-/// Result returned by [`run_download`].
+/// Result returned by [`run_download`] and [`run_download_plan`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DownloadOutcome {
     pub saved_dest: Option<PathBuf>,
     pub downloaded_files: Vec<PathBuf>,
+    pub warnings: Vec<String>,
     pub failed: Vec<DownloadFailure>,
     pub add_summary: Option<AddSummary>,
 }
@@ -305,6 +326,41 @@ where
         .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
 }
 
+/// Resolve [`DownloadOptions`] (`targets` or `urls`) into an ordered list of top-level
+/// [`LinkStatement`]s, expanding any `.link` files from disk.
+pub fn resolve_download_plan(opts: &DownloadOptions) -> Result<Vec<LinkStatement>> {
+    if opts.targets.is_empty() {
+        let urls = normalize_urls(&opts.urls)?;
+        return Ok(urls
+            .into_iter()
+            .map(|url| LinkStatement {
+                line_number: None,
+                source_file: None,
+                expr: LinkExpr::Url(url),
+            })
+            .collect());
+    }
+
+    let mut plan = Vec::new();
+    for target in &opts.targets {
+        match target {
+            DownloadTarget::Url(url) => {
+                for normalized in normalize_urls(std::slice::from_ref(url))? {
+                    plan.push(LinkStatement {
+                        line_number: None,
+                        source_file: None,
+                        expr: LinkExpr::Url(normalized),
+                    });
+                }
+            }
+            DownloadTarget::LinkFile(path) => {
+                plan.extend(link::parse_link_file(path)?);
+            }
+        }
+    }
+    Ok(plan)
+}
+
 /// Download tracks concurrently with `yt-dlp` and optionally index them into the workspace library.
 pub async fn run_download(paths: &AppPaths, opts: &DownloadOptions) -> Result<DownloadOutcome> {
     run_download_with_progress(paths, opts, None).await
@@ -318,6 +374,28 @@ pub async fn run_download_with_progress(
 ) -> Result<DownloadOutcome> {
     let env = DownloadEnv::from_system();
     run_download_with_env_and_progress(paths, opts, &env, progress_tx).await
+}
+
+/// Download a pre-resolved [`LinkStatement`] plan concurrently with `yt-dlp` and optionally index
+/// into the workspace library.
+pub async fn run_download_plan(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
+) -> Result<DownloadOutcome> {
+    run_download_plan_with_progress(paths, opts, plan, None).await
+}
+
+/// Download a pre-resolved [`LinkStatement`] plan concurrently with `yt-dlp` while streaming
+/// batch/per-item progress events.
+pub async fn run_download_plan_with_progress(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
+    progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
+) -> Result<DownloadOutcome> {
+    let env = DownloadEnv::from_system();
+    run_download_plan_with_env_and_progress(paths, opts, plan, &env, progress_tx).await
 }
 
 #[cfg(test)]
@@ -335,6 +413,18 @@ async fn run_download_with_env_and_progress(
     env: &DownloadEnv,
     progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
 ) -> Result<DownloadOutcome> {
+    let opts_cloned = opts.clone();
+    let plan = run_blocking(move || resolve_download_plan(&opts_cloned)).await?;
+    run_download_plan_with_env_and_progress(paths, opts, &plan, env, progress_tx).await
+}
+
+async fn run_download_plan_with_env_and_progress(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
+    env: &DownloadEnv,
+    progress_tx: Option<mpsc::UnboundedSender<DownloadProgressEvent>>,
+) -> Result<DownloadOutcome> {
     let saved_dest = match opts.set_dest.as_deref() {
         Some(dir) => {
             validate_non_empty_path(dir, "--set-dest")?;
@@ -347,8 +437,7 @@ async fn run_download_with_env_and_progress(
         None => None,
     };
 
-    let urls = normalize_urls(&opts.urls)?;
-    if urls.is_empty() {
+    if plan.is_empty() {
         if saved_dest.is_some() {
             return Ok(DownloadOutcome {
                 saved_dest,
@@ -382,10 +471,11 @@ async fn run_download_with_env_and_progress(
     let embed_thumbnail = should_embed_thumbnail_with_progress(opts, env, progress_tx.as_ref()).await;
     let staging_root = dest_dir.join(".termusic-dl-tmp");
     let effective_jobs = opts.jobs.max(1);
+    let batch_labels: Vec<String> = plan.iter().map(|stmt| stmt.expr.to_string()).collect();
     emit_progress(
         progress_tx.as_ref(),
         DownloadProgressEvent::BatchStarted {
-            urls: urls.clone(),
+            urls: batch_labels,
             dest_dir: dest_dir.clone(),
             format: opts.format,
             jobs: effective_jobs,
@@ -409,64 +499,82 @@ async fn run_download_with_env_and_progress(
     let semaphore = Arc::new(Semaphore::new(effective_jobs));
     let mut join_set = JoinSet::new();
 
-    for (idx, url) in urls.iter().cloned().enumerate() {
+    for (stmt_idx, stmt) in plan.iter().cloned().enumerate() {
         let ctx = Arc::clone(&ctx);
         let semaphore = Arc::clone(&semaphore);
         join_set.spawn(async move {
             let _permit = semaphore.acquire_owned().await.map_err(|_| {
                 TermusicError::Async("download concurrency semaphore closed".to_string())
             })?;
-            ctx.emit(DownloadProgressEvent::ItemUpdate {
-                index: idx,
-                title: None,
-                phase: DownloadPhase::Starting,
-            });
-            let outcome = download_single_url(&ctx, idx, &url).await;
-            match &outcome {
-                Ok(files) => ctx.emit(DownloadProgressEvent::ItemUpdate {
-                    index: idx,
-                    title: files
-                        .first()
+            let mut tracker = StepTracker {
+                attempt: 0,
+                total_leaves: stmt.expr.leaf_count(),
+            };
+            let res = eval_link_expr(
+                &ctx,
+                stmt_idx,
+                &stmt.expr,
+                &mut tracker,
+                StepTransition::Primary,
+            )
+            .await;
+
+            if res.succeeded {
+                ctx.emit(DownloadProgressEvent::ItemUpdate {
+                    index: stmt_idx,
+                    title: res
+                        .downloaded_files
+                        .last()
                         .and_then(|p| p.file_stem())
                         .and_then(|s| s.to_str())
                         .map(str::to_string),
                     phase: DownloadPhase::Completed {
-                        files: files.clone(),
+                        files: res.downloaded_files.clone(),
                     },
-                }),
-                Err(err) => ctx.emit(DownloadProgressEvent::ItemUpdate {
-                    index: idx,
+                });
+            } else {
+                let error = match res.unhandled_failures.as_slice() {
+                    [single] => single.error.clone(),
+                    [] => "download failed".to_string(),
+                    many => many
+                        .iter()
+                        .map(|f| format!("{}: {}", f.url, f.error))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                ctx.emit(DownloadProgressEvent::ItemUpdate {
+                    index: stmt_idx,
                     title: None,
-                    phase: DownloadPhase::Failed {
-                        error: err.to_string(),
-                    },
-                }),
+                    phase: DownloadPhase::Failed { error },
+                });
             }
-            Ok::<_, TermusicError>((idx, outcome))
+
+            Ok::<_, TermusicError>((stmt_idx, res))
         });
     }
 
-    let mut slots: Vec<Option<std::result::Result<Vec<PathBuf>, String>>> = vec![None; urls.len()];
+    let mut slots: Vec<Option<ExprEvalResult>> = (0..plan.len()).map(|_| None).collect();
     while let Some(joined) = join_set.join_next().await {
-        let (idx, outcome) = joined.map_err(|err| {
+        let (idx, res) = joined.map_err(|err| {
             TermusicError::Async(format!("download worker task failed: {err}"))
         })??;
-        slots[idx] = Some(outcome.map_err(|err| err.to_string()));
+        slots[idx] = Some(res);
     }
 
     let _ = tokio::fs::remove_dir(&ctx.staging_root).await;
 
     let mut downloaded_files = Vec::new();
+    let mut warnings = Vec::new();
     let mut failed = Vec::new();
     for (idx, slot) in slots.into_iter().enumerate() {
         match slot {
-            Some(Ok(files)) => downloaded_files.extend(files),
-            Some(Err(error)) => failed.push(DownloadFailure {
-                url: urls[idx].clone(),
-                error,
-            }),
+            Some(res) => {
+                downloaded_files.extend(res.downloaded_files);
+                warnings.extend(res.warnings);
+                failed.extend(res.unhandled_failures);
+            }
             None => failed.push(DownloadFailure {
-                url: urls[idx].clone(),
+                url: plan[idx].expr.to_string(),
                 error: "download worker exited without a result".to_string(),
             }),
         }
@@ -511,8 +619,134 @@ async fn run_download_with_env_and_progress(
     Ok(DownloadOutcome {
         saved_dest,
         downloaded_files,
+        warnings,
         failed,
         add_summary,
+    })
+}
+
+#[derive(Debug, Default)]
+struct ExprEvalResult {
+    succeeded: bool,
+    downloaded_files: Vec<PathBuf>,
+    warnings: Vec<String>,
+    unhandled_failures: Vec<DownloadFailure>,
+}
+
+struct StepTracker {
+    attempt: usize,
+    total_leaves: usize,
+}
+
+fn eval_link_expr<'a>(
+    ctx: &'a DownloadContext,
+    stmt_idx: usize,
+    expr: &'a LinkExpr,
+    tracker: &'a mut StepTracker,
+    transition: StepTransition,
+) -> Pin<Box<dyn Future<Output = ExprEvalResult> + Send + 'a>> {
+    Box::pin(async move {
+        match expr {
+            LinkExpr::Url(url) => {
+                tracker.attempt += 1;
+                if tracker.total_leaves > 1 {
+                    ctx.emit(DownloadProgressEvent::ItemStepStarted {
+                        index: stmt_idx,
+                        url: url.clone(),
+                        step: tracker.attempt,
+                        total_steps: tracker.total_leaves,
+                        transition,
+                    });
+                }
+                let emit_starting = tracker.total_leaves == 1;
+                match download_single_url(ctx, stmt_idx, url, emit_starting).await {
+                    Ok(files) => ExprEvalResult {
+                        succeeded: true,
+                        downloaded_files: files,
+                        warnings: Vec::new(),
+                        unhandled_failures: Vec::new(),
+                    },
+                    Err(err) => ExprEvalResult {
+                        succeeded: false,
+                        downloaded_files: Vec::new(),
+                        warnings: Vec::new(),
+                        unhandled_failures: vec![DownloadFailure {
+                            url: url.clone(),
+                            error: err.to_string(),
+                        }],
+                    },
+                }
+            }
+            LinkExpr::And(left, right) => {
+                let l = eval_link_expr(ctx, stmt_idx, left, tracker, transition).await;
+                if !l.succeeded {
+                    let failed_desc = l
+                        .unhandled_failures
+                        .first()
+                        .map(|f| f.url.as_str())
+                        .unwrap_or("previous step");
+                    ctx.emit(DownloadProgressEvent::Notice(format!(
+                        "skipping '{right}' because '{failed_desc}' failed"
+                    )));
+                    return l;
+                }
+                let r =
+                    eval_link_expr(ctx, stmt_idx, right, tracker, StepTransition::Then).await;
+                let mut downloaded_files = l.downloaded_files;
+                downloaded_files.extend(r.downloaded_files);
+                let mut warnings = l.warnings;
+                warnings.extend(r.warnings);
+                ExprEvalResult {
+                    succeeded: r.succeeded,
+                    downloaded_files,
+                    warnings,
+                    unhandled_failures: r.unhandled_failures,
+                }
+            }
+            LinkExpr::Or(left, right) => {
+                let l = eval_link_expr(ctx, stmt_idx, left, tracker, transition).await;
+                if l.succeeded {
+                    return l;
+                }
+                let failed_desc = l
+                    .unhandled_failures
+                    .first()
+                    .map(|f| f.url.as_str())
+                    .unwrap_or("primary");
+                ctx.emit(DownloadProgressEvent::Notice(format!(
+                    "'{failed_desc}' failed; trying fallback '{right}'"
+                )));
+                let r =
+                    eval_link_expr(ctx, stmt_idx, right, tracker, StepTransition::Fallback).await;
+                let mut downloaded_files = l.downloaded_files;
+                downloaded_files.extend(r.downloaded_files);
+                let mut warnings = l.warnings;
+                warnings.extend(r.warnings);
+                if r.succeeded {
+                    for f in l.unhandled_failures {
+                        let warning =
+                            format!("{} failed ({}); fallback succeeded", f.url, f.error);
+                        ctx.emit(DownloadProgressEvent::Notice(warning.clone()));
+                        warnings.push(warning);
+                    }
+                    ExprEvalResult {
+                        succeeded: true,
+                        downloaded_files,
+                        warnings,
+                        unhandled_failures: Vec::new(),
+                    }
+                } else {
+                    let mut unhandled_failures = l.unhandled_failures;
+                    unhandled_failures.extend(r.unhandled_failures);
+                    ExprEvalResult {
+                        succeeded: false,
+                        downloaded_files,
+                        warnings,
+                        unhandled_failures,
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -520,7 +754,15 @@ async fn download_single_url(
     ctx: &DownloadContext,
     index: usize,
     url: &str,
+    emit_starting: bool,
 ) -> Result<Vec<PathBuf>> {
+    if emit_starting {
+        ctx.emit(DownloadProgressEvent::ItemUpdate {
+            index,
+            title: None,
+            phase: DownloadPhase::Starting,
+        });
+    }
     let guard = StageDirGuard::create(&ctx.staging_root).await?;
     let res = download_into_stage_and_finalize(ctx, index, guard.path(), url).await;
     guard.cleanup().await;
@@ -1528,6 +1770,7 @@ mod tests {
     fn base_options(urls: Vec<&str>) -> DownloadOptions {
         DownloadOptions {
             urls: urls.into_iter().map(str::to_string).collect(),
+            targets: Vec::new(),
             dest: None,
             set_dest: None,
             format: DownloadFormat::Mp3,
@@ -2574,5 +2817,430 @@ printf '%s\n' "$out""#,
         let logged_lines: Vec<&str> = logged.lines().collect();
         assert!(logged_lines.windows(2).any(|w| w == ["-t", "mp4"]));
         assert!(!logged_lines.contains(&"-x"));
+    }
+
+    fn setup_conditional_mock_yt_dlp(
+        ws: &TestWorkspace,
+        invocation_log: &Path,
+        fail_substrs: &[&str],
+    ) {
+        let template_wav = write_wav_template(&ws.root.join("template.wav"));
+        write_noop_executable(&ws.bin_dir, "ffmpeg");
+
+        let unix_fail_cases = fail_substrs
+            .iter()
+            .map(|pat| {
+                format!(
+                    "  *{pat}*)\n    echo \"ERROR: simulated failure for $last\" >&2\n    exit 3\n    ;;"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let win_fail_checks = fail_substrs
+            .iter()
+            .map(|pat| {
+                format!(
+                    "if (last.indexOf(\"{pat}\") >= 0) {{\n\
+                       WScript.StdErr.WriteLine(\"ERROR: simulated failure for \" + last);\n\
+                       WScript.Quit(3);\n\
+                     }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        write_mock_yt_dlp(
+            &ws.bin_dir,
+            &format!(
+                r#"printf '%s\n' "$last" >> "{log}"
+case "$last" in
+{unix_fail_cases}
+esac
+name=$(printf '%s' "$last" | awk -F/ '{{print $NF}}')
+out="$stage/$name.wav"
+cp "{template}" "$out"
+printf '%s\n' "$out""#,
+                log = invocation_log.display(),
+                template = template_wav.display(),
+            ),
+            &format!(
+                "for (var attempt = 0; attempt < 20; attempt++) {{\n\
+                   try {{\n\
+                     var lf = fso.OpenTextFile(\"{log}\", 8, true);\n\
+                     lf.WriteLine(last);\n\
+                     lf.Close();\n\
+                     break;\n\
+                   }} catch (e) {{ WScript.Sleep(15); }}\n\
+                 }}\n\
+                 {win_fail_checks}\n\
+                 var slash = last.lastIndexOf(\"/\");\n\
+                 var name = slash >= 0 ? last.slice(slash + 1) : last;\n\
+                 var out = stage + \"\\\\\" + name + \".wav\";\n\
+                 fso.CopyFile(\"{template}\", out, true);\n\
+                 WScript.StdOut.WriteLine(out);",
+                log = js_escape(invocation_log),
+                template = js_escape(&template_wav),
+            ),
+        );
+    }
+
+    fn read_invocations(log: &Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .expect("read invocation log")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn file_stems(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resolve_download_plan_handles_urls_mixed_targets_and_missing_link_before_set_dest() {
+        let ws = TestWorkspace::new();
+
+        // Fallback to opts.urls when targets is empty
+        let url_opts = base_options(vec!["https://example.com/a https://example.com/b"]);
+        let url_plan = resolve_download_plan(&url_opts).expect("resolve url plan");
+        assert_eq!(url_plan.len(), 2);
+        assert_eq!(url_plan[0].expr, LinkExpr::Url("https://example.com/a".into()));
+        assert_eq!(url_plan[1].expr, LinkExpr::Url("https://example.com/b".into()));
+
+        // Mixed targets: .link file + standalone URL preserve order and conditional ASTs
+        let link_file = ws.root.join("mix.link");
+        fs::write(
+            &link_file,
+            "# comment\nhttps://example.com/first || https://example.com/second\n",
+        )
+        .unwrap();
+        let mut mixed_opts = base_options(vec![]);
+        mixed_opts.targets = vec![
+            DownloadTarget::LinkFile(link_file.clone()),
+            DownloadTarget::Url("https://example.com/third".into()),
+        ];
+        let mixed_plan = resolve_download_plan(&mixed_opts).expect("resolve mixed plan");
+        assert_eq!(mixed_plan.len(), 2);
+        assert_eq!(mixed_plan[0].source_file.as_deref(), Some(link_file.as_path()));
+        assert_eq!(mixed_plan[0].line_number, Some(2));
+        assert_eq!(
+            mixed_plan[0].expr,
+            LinkExpr::Or(
+                Box::new(LinkExpr::Url("https://example.com/first".into())),
+                Box::new(LinkExpr::Url("https://example.com/second".into())),
+            )
+        );
+        assert_eq!(mixed_plan[1].source_file, None);
+        assert_eq!(mixed_plan[1].expr, LinkExpr::Url("https://example.com/third".into()));
+
+        // Missing .link file aborts with NotFound before --set-dest mutates workspace config
+        let mut missing_opts = base_options(vec![]);
+        missing_opts.set_dest = Some(ws.root.join("should_not_persist"));
+        missing_opts.targets = vec![DownloadTarget::LinkFile(ws.root.join("missing.link"))];
+        let err = run_download_with_env(&ws.paths, &missing_opts, &ws.env(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TermusicError::NotFound(_)));
+        let cfg = load_workspace_config(&ws.paths).expect("load workspace config");
+        assert!(cfg.download_dest.is_none());
+    }
+
+    #[tokio::test]
+    async fn link_or_primary_succeeds_skips_fallback_without_warnings() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &[]);
+
+        let link_file = ws.root.join("or_ok.link");
+        fs::write(&link_file, "https://example.com/a || https://example.com/b\n").unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &ws.env(None))
+            .await
+            .expect("or primary succeeds");
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(file_stems(&outcome.downloaded_files), vec!["a"]);
+        assert_eq!(read_invocations(&log), vec!["https://example.com/a"]);
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn link_or_fallback_recovers_with_warning_and_no_failure() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/a"]);
+
+        let link_file = ws.root.join("or_recover.link");
+        fs::write(&link_file, "https://example.com/a || https://example.com/b\n").unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = run_download_with_env_and_progress(&ws.paths, &opts, &ws.env(None), Some(tx))
+            .await
+            .expect("or fallback recovers");
+        assert!(outcome.failed.is_empty());
+        assert_eq!(file_stems(&outcome.downloaded_files), vec!["b"]);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("https://example.com/a failed"));
+        assert!(outcome.warnings[0].contains("fallback succeeded"));
+        assert_eq!(
+            read_invocations(&log),
+            vec!["https://example.com/a", "https://example.com/b"]
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::Notice(msg) if msg.contains("fallback succeeded")
+        )));
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn link_or_both_fail_records_both_failures() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/a", "/b"]);
+
+        let link_file = ws.root.join("or_both_fail.link");
+        fs::write(&link_file, "https://example.com/a || https://example.com/b\n").unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &ws.env(None))
+            .await
+            .expect("outcome captures both failures");
+        assert!(outcome.downloaded_files.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(outcome.failed.len(), 2);
+        assert_eq!(outcome.failed[0].url, "https://example.com/a");
+        assert_eq!(outcome.failed[1].url, "https://example.com/b");
+        assert_eq!(
+            read_invocations(&log),
+            vec!["https://example.com/a", "https://example.com/b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn link_and_short_circuits_when_left_fails() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/a"]);
+
+        let link_file = ws.root.join("and_left_fail.link");
+        fs::write(&link_file, "https://example.com/a && https://example.com/b\n").unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = run_download_with_env_and_progress(&ws.paths, &opts, &ws.env(None), Some(tx))
+            .await
+            .expect("outcome captures left failure");
+        assert!(outcome.downloaded_files.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].url, "https://example.com/a");
+        assert_eq!(read_invocations(&log), vec!["https://example.com/a"]);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::Notice(msg) if msg.contains("skipping")
+        )));
+    }
+
+    #[tokio::test]
+    async fn link_and_preserves_and_indexes_left_when_right_fails() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/b"]);
+
+        let link_file = ws.root.join("and_right_fail.link");
+        fs::write(&link_file, "https://example.com/a && https://example.com/b\n").unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &ws.env(None))
+            .await
+            .expect("outcome preserves left track");
+        assert_eq!(file_stems(&outcome.downloaded_files), vec!["a"]);
+        assert!(outcome.downloaded_files[0].exists());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].url, "https://example.com/b");
+        assert_eq!(
+            read_invocations(&log),
+            vec!["https://example.com/a", "https://example.com/b"]
+        );
+
+        let summary = outcome.add_summary.expect("left track indexed");
+        assert_eq!(summary.added_count, 1);
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 1);
+        assert_eq!(lib.songs[0].path, outcome.downloaded_files[0]);
+    }
+
+    #[tokio::test]
+    async fn link_mixed_and_or_precedence_a_and_b_or_c() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/b"]);
+
+        let link_file = ws.root.join("mixed_and_or.link");
+        fs::write(
+            &link_file,
+            "https://example.com/a && https://example.com/b || https://example.com/c\n",
+        )
+        .unwrap();
+
+        let mut opts = base_options(vec![]);
+        opts.targets = vec![DownloadTarget::LinkFile(link_file)];
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let outcome = run_download_with_env(&ws.paths, &opts, &ws.env(None))
+            .await
+            .expect("mixed A && B || C succeeds via C");
+        assert!(outcome.failed.is_empty());
+        assert_eq!(file_stems(&outcome.downloaded_files), vec!["a", "c"]);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("https://example.com/b failed"));
+        assert!(outcome.warnings[0].contains("fallback succeeded"));
+        assert_eq!(
+            read_invocations(&log),
+            vec![
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+            ]
+        );
+
+        let lib = Library::load(&ws.paths.library_path).unwrap();
+        assert_eq!(lib.songs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn link_step_events_and_transitions_on_or_and_chain() {
+        let ws = TestWorkspace::new();
+        let dest = ws.root.join("downloads");
+        let log = ws.root.join("invocations.log");
+        setup_conditional_mock_yt_dlp(&ws, &log, &["/a"]);
+
+        let plan = vec![LinkStatement {
+            line_number: Some(1),
+            source_file: None,
+            expr: LinkExpr::Or(
+                Box::new(LinkExpr::Url("https://example.com/a".into())),
+                Box::new(LinkExpr::And(
+                    Box::new(LinkExpr::Url("https://example.com/b".into())),
+                    Box::new(LinkExpr::Url("https://example.com/c".into())),
+                )),
+            ),
+        }];
+
+        let mut opts = base_options(vec![]);
+        opts.dest = Some(dest);
+        opts.format = DownloadFormat::Wav;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = run_download_plan_with_env_and_progress(
+            &ws.paths,
+            &opts,
+            &plan,
+            &ws.env(None),
+            Some(tx),
+        )
+        .await
+        .expect("A || B && C succeeds via B && C");
+        assert!(outcome.failed.is_empty());
+        assert_eq!(file_stems(&outcome.downloaded_files), vec!["b", "c"]);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("https://example.com/a failed"));
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::BatchStarted { urls, .. }
+                if urls.as_slice() == ["https://example.com/a || https://example.com/b && https://example.com/c"]
+        )));
+
+        let steps: Vec<(usize, String, usize, usize, StepTransition)> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                DownloadProgressEvent::ItemStepStarted {
+                    index,
+                    url,
+                    step,
+                    total_steps,
+                    transition,
+                } => Some((*index, url.clone(), *step, *total_steps, *transition)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (0, "https://example.com/a".into(), 1, 3, StepTransition::Primary),
+                (0, "https://example.com/b".into(), 2, 3, StepTransition::Fallback),
+                (0, "https://example.com/c".into(), 3, 3, StepTransition::Then),
+            ]
+        );
+
+        assert!(!events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::ItemUpdate {
+                phase: DownloadPhase::Starting,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            DownloadProgressEvent::ItemUpdate {
+                index: 0,
+                phase: DownloadPhase::Completed { files },
+                ..
+            } if files.len() == 2
+        )));
+        assert!(matches!(events.last(), Some(DownloadProgressEvent::BatchFinished)));
     }
 }

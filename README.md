@@ -2,6 +2,8 @@
 
 A fast, cross-platform command-line music player with a background playback daemon, `yt-dlp` search and download integration, and an interactive terminal UI (TUI).
 
+> **Personal Use Only:** Termusic (including `termusic download`, `.link` batch downloading, and `termusic search`) is meant for personal, non-commercial use only and not for commercial distribution. See [`LEGAL.md`](LEGAL.md) for details; source code is licensed under the MIT License ([`LICENSE`](LICENSE)).
+
 ## Prerequisites
 
 - **Rust toolchain** (edition 2024) if building from source (`cargo install` / `cargo build`).
@@ -106,7 +108,7 @@ termusic search "lofi"    # Search YouTube interactively
 | `termusic init <path>` | Initialize a workspace for config, library index, playlists, and downloads |
 | `termusic tui` (or `termusic`) | Launch the interactive player TUI |
 | `termusic search [OPTIONS] [QUERY...]` | Search supported providers via `yt-dlp`, copy URLs, or download tracks/videos |
-| `termusic download [OPTIONS] <URL...>` | Download media via `yt-dlp` and auto-index audio tracks into the library |
+| `termusic download [OPTIONS] <URL\|LINK_FILE...>` | Download media via `yt-dlp` from URLs or `.link` batch files and auto-index audio tracks into the library |
 | `termusic add [-p <PLAYLIST>] [-f \| -e] [<PATH> \| -s <SONG>]` | Add an audio file, folder (`-f`), or existing library song (`-e` / `-s` with `-p`) to the library and/or a playlist |
 | `termusic list [songs\|playlists]` | List indexed songs and playlists with 1-based numbers |
 | `termusic play [OPTIONS] [TARGET] [MODE]` | Play a song, playlist, `<playlist>[<index>]` (1-based start track), or 1-based `list` index, or resume paused playback when omitted |
@@ -411,6 +413,59 @@ Settings resolve in the following order (highest priority first):
 - **Search download format**: `-f`/`--format` -> `-fd`/`-format-default`/`--format-default` -> `TERMUSIC_SEARCH_FORMAT` -> workspace `config.json` -> `mp3`
 - **Download destination** (`search -d` and `download`): `--dest` -> saved destination (`download --set-dest`) -> `TERMUSIC_DEST` -> workspace `config.json`
 
+## `termusic download`
+
+Download audio or video via `yt-dlp` from one or more media URLs, `.link` batch files, or a mix of both, and automatically index downloaded audio tracks into your music library.
+
+> **Legal Reminder:** `termusic download` and `.link` batch downloads are intended strictly for personal, private, non-commercial use and not for commercial distribution. See [`LEGAL.md`](LEGAL.md).
+
+### Options
+
+| Flag / Argument | Description |
+| --- | --- |
+| `[URL\|LINK_FILE...]` | One or more media URLs or `.link` file paths (required unless `--set-dest` is passed alone) |
+| `-d`, `--dest <DIR>` | Destination directory for this download run |
+| `--set-dest <DIR>` | Persist default download destination directory in workspace `config.json` |
+| `-f`, `--format <FORMAT>` | Target audio/video format (`mp3`, `mp4`, `flac`, `m4a`, `ogg`, `wav`, `aac`; defaults to `mp3`) |
+| `--playlist` | Allow downloading playlists (by default, single-track downloads are requested) |
+| `--no-embed-thumbnail` | Do not embed thumbnail artwork into downloaded media |
+| `--no-add` | Do not add downloaded audio tracks to the library index (conflicts with `-p` / `--playlist-name`) |
+| `-p`, `--playlist-name <PLAYLIST>` | Add downloaded audio tracks to `<PLAYLIST>` (created automatically if absent; conflicts with `--no-add`) |
+| `-j`, `--jobs <N>` | Maximum number of concurrent download statements (defaults to `4`) |
+| `--no-tui` | Disable the interactive download TUI and print line-by-line progress |
+
+### `.link` Batch Files
+
+Any positional argument without `://` ending in `.link` (case-insensitive, such as `test-links/test.link`) is parsed as a `.link` file containing one download statement per line. Statements run concurrently up to `-j` / `--jobs`, while conditional operators within a statement execute sequentially.
+
+- **Blank lines & comments**:
+  - Blank and whitespace-only lines are ignored.
+  - `#` starts a full-line comment, and whitespace followed by `#` starts an inline comment (for example, `https://example.com/track # backup mirror`).
+  - `#` immediately after non-whitespace is preserved so URL fragments (such as `https://example.com/watch#t=30s`) remain intact.
+- **Conditional operators (`||` and `&&`)**:
+  - **`<first> || <other>` (fallback)**: Attempts `<first>`; if it succeeds, `<other>` is skipped. If `<first>` fails, `<other>` is attempted as a fallback—if `<other>` succeeds, `<first>`'s error is reported as a warning and the run still exits `0`.
+  - **`<first> && <other>` (sequential dependency)**: Attempts `<first>`; only if `<first>` succeeds is `<other>` downloaded. If `<first>` fails, `<other>` is skipped and the statement fails.
+  - **Precedence & associativity**: Arbitrary chains of `&&` and `||` on a single line are supported, with `&&` binding tighter than `||` and both operators associating left-to-right. Parentheses `(` `)` are not supported.
+
+### Examples
+
+```bash
+# Download a single URL as MP3 and index it into the library
+termusic download https://youtube.com/example-youtube-link
+
+# Run a .link batch/conditional download file (see test-links/test.link)
+termusic download test-links/test.link
+
+# Mix .link files and direct URLs with custom format, concurrency, and playlist
+termusic download -f flac -j 2 -p Favorites test-links/test.link https://example.com/track
+
+# Save a default download destination without starting a download
+termusic download --set-dest ~/Music/Downloads
+
+# Print line progress instead of launching the interactive download TUI
+termusic download --no-tui test-links/test.link
+```
+
 ## Download Formats
 
 Supported formats for `termusic search -d` (`-f` / `-fd` / `TERMUSIC_SEARCH_FORMAT`) and `termusic download -f`:
@@ -440,3 +495,15 @@ Format arguments are case-insensitive and accept an optional leading dot (for ex
 > Although `yt-dlp` (`2026.03.17`) ships 1,872 total extractors ([`supportedsites.md`](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)), only 20 are `*search*` keyword-search extractors, and most of the others are niche video/archive search engines or defunct/broken without site-specific auth/API keys. Termusic curates **YouTube** (`ytsearch`) and **SoundCloud** (`scsearch`) because both reliably support fast metadata keyword search via `yt-dlp --flat-playlist --dump-single-json`.
 >
 > To download directly from any other website supported by `yt-dlp`, pass the media URL directly to `termusic download <URL>` instead.
+
+## Legal Notice
+
+Termusic — including `termusic download`, `.link` batch downloading, and `termusic search` — is meant for **personal, private, non-commercial use only** and **not for commercial distribution**, resale, or commercial hosting. You are solely responsible for complying with applicable copyright laws and third-party platform terms of service when using `yt-dlp` or other external tools.
+
+Please read [`LEGAL.md`](LEGAL.md) for the full legal notice, acceptable-use terms, and warranty disclaimer.
+
+## License
+
+Termusic's source code is licensed under the **MIT License** (`Copyright (c) 2026 Tezzzieee`). See [`LICENSE`](LICENSE) for the full license text.
+
+[`LICENSE`](LICENSE) governs the Termusic software itself, while [`LEGAL.md`](LEGAL.md) covers the project's personal-use, non-commercial-distribution, and acceptable-use terms (including user responsibility for third-party copyright and platform compliance).

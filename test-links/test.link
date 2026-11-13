@@ -1,0 +1,15 @@
+# This is a comment
+# Downloads normally
+https://google.com/example-link
+https://youtube.com/example-youtube-link
+
+# Conditional Downloading
+
+# if first fails then download the other
+# <first> <operator> <other>
+# operators: || and &&
+
+https://failure.com/possible-failure || https://success.com/will-succeed
+https://must-succeed.com && https://run-next.com/this-will-download 
+
+# Command: termusic download test.link

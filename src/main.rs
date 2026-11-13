@@ -412,15 +412,18 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Download(opts) => {
-            let outcome = if opts.urls.is_empty() {
-                download::run_download(&paths, &opts).await?
+            let opts_for_plan = opts.clone();
+            let plan =
+                run_blocking(move || download::resolve_download_plan(&opts_for_plan)).await?;
+            let outcome = if plan.is_empty() {
+                download::run_download_plan(&paths, &opts, &plan).await?
             } else if !opts.no_tui
                 && std::io::stdout().is_terminal()
                 && std::io::stdin().is_terminal()
             {
-                download_tui::run_download_tui(&paths, &opts).await?
+                download_tui::run_download_tui_plan(&paths, &opts, &plan).await?
             } else {
-                download_tui::run_download_with_line_progress(&paths, &opts).await?
+                download_tui::run_download_plan_with_line_progress(&paths, &opts, &plan).await?
             };
             if let Some(saved_dest) = &outcome.saved_dest {
                 println!(
@@ -445,6 +448,9 @@ async fn run() -> Result<()> {
                 for skipped in &summary.skipped_files {
                     eprintln!("warning: skipped {skipped}");
                 }
+            }
+            for warning in &outcome.warnings {
+                eprintln!("warning: {warning}");
             }
             for failure in &outcome.failed {
                 eprintln!("download failed for {}: {}", failure.url, failure.error);

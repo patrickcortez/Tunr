@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,10 @@ use tokio::time::MissedTickBehavior;
 
 use crate::download::{
     self, DownloadFormat, DownloadOptions, DownloadOutcome, DownloadPhase, DownloadProgressEvent,
+    StepTransition,
 };
 use crate::error::{Result, TermusicError};
+use crate::link::{DownloadTarget, LinkStatement};
 use crate::paths::AppPaths;
 use crate::platform::ShutdownSignals;
 use crate::tui_common::{
@@ -31,19 +34,42 @@ struct DownloadItemState {
     url: String,
     title: Option<String>,
     phase: DownloadPhase,
+    step: usize,
+    total_steps: usize,
+    transition: Option<StepTransition>,
 }
 
 impl DownloadItemState {
     fn new(url: String) -> Self {
+        Self::with_steps(url, 1)
+    }
+
+    fn with_steps(url: String, total_steps: usize) -> Self {
         Self {
             url,
             title: None,
             phase: DownloadPhase::Queued,
+            step: 0,
+            total_steps: total_steps.max(1),
+            transition: None,
         }
     }
 
-    fn display_label(&self) -> &str {
-        self.title.as_deref().unwrap_or(&self.url)
+    fn display_label(&self) -> Cow<'_, str> {
+        let base = self.title.as_deref().unwrap_or(&self.url);
+        if self.total_steps > 1 && self.step >= 1 {
+            let tag = match self.transition {
+                Some(StepTransition::Fallback) => " fallback",
+                Some(StepTransition::Then) => " then",
+                Some(StepTransition::Primary) | None => "",
+            };
+            Cow::Owned(format!(
+                "[step {}/{}{}] {}",
+                self.step, self.total_steps, tag, base
+            ))
+        } else {
+            Cow::Borrowed(base)
+        }
     }
 
     fn is_active(&self) -> bool {
@@ -105,13 +131,41 @@ pub struct DownloadTuiState {
 impl DownloadTuiState {
     /// Initialize state from validated download options before background workers begin.
     pub fn from_options(opts: &DownloadOptions) -> Self {
-        let urls = download::normalize_urls(&opts.urls).unwrap_or_else(|_| opts.urls.clone());
+        if let Ok(plan) = download::resolve_download_plan(opts) {
+            return Self::from_plan(&plan, opts.format, opts.jobs);
+        }
+        let urls = if !opts.targets.is_empty() {
+            opts.targets
+                .iter()
+                .map(|target| match target {
+                    DownloadTarget::Url(u) => u.clone(),
+                    DownloadTarget::LinkFile(p) => p.display().to_string(),
+                })
+                .collect()
+        } else {
+            download::normalize_urls(&opts.urls).unwrap_or_else(|_| opts.urls.clone())
+        };
         Self::new(urls, opts.format, opts.jobs.max(1))
+    }
+
+    /// Construct a download UI state from a resolved `.link` / CLI download plan.
+    pub fn from_plan(plan: &[LinkStatement], format: DownloadFormat, jobs: usize) -> Self {
+        let items = plan
+            .iter()
+            .map(|stmt| {
+                DownloadItemState::with_steps(stmt.expr.to_string(), stmt.expr.leaf_count())
+            })
+            .collect();
+        Self::from_items(items, format, jobs)
     }
 
     /// Construct a download UI state from explicit normalized URLs, format, and concurrency.
     pub fn new(urls: Vec<String>, format: DownloadFormat, jobs: usize) -> Self {
         let items: Vec<DownloadItemState> = urls.into_iter().map(DownloadItemState::new).collect();
+        Self::from_items(items, format, jobs)
+    }
+
+    fn from_items(items: Vec<DownloadItemState>, format: DownloadFormat, jobs: usize) -> Self {
         let mut list_state = ListState::default();
         if !items.is_empty() {
             list_state.select(Some(0));
@@ -191,6 +245,22 @@ impl DownloadTuiState {
             }
             DownloadProgressEvent::Notice(msg) => {
                 self.notice = Some(msg);
+            }
+            DownloadProgressEvent::ItemStepStarted {
+                index,
+                url,
+                step,
+                total_steps,
+                transition,
+            } => {
+                if let Some(item) = self.items.get_mut(index) {
+                    item.url = url;
+                    item.title = None;
+                    item.step = step;
+                    item.total_steps = total_steps.max(1);
+                    item.transition = Some(transition);
+                    item.phase = DownloadPhase::Starting;
+                }
             }
             DownloadProgressEvent::ItemUpdate {
                 index,
@@ -422,7 +492,7 @@ impl DownloadTuiState {
                 let header_line = Line::from(vec![
                     Span::styled(prefix, Style::new().fg(icon_color).add_modifier(Modifier::BOLD)),
                     Span::styled(
-                        truncate_to_width(label, inner_width.saturating_sub(prefix_width)),
+                        truncate_to_width(label.as_ref(), inner_width.saturating_sub(prefix_width)),
                         Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
                     ),
                 ]);
@@ -592,10 +662,27 @@ pub enum DownloadTuiOutcome {
     Cancelled,
 }
 
+async fn resolve_plan_blocking(opts: &DownloadOptions) -> Result<Vec<LinkStatement>> {
+    let opts_cloned = opts.clone();
+    tokio::task::spawn_blocking(move || download::resolve_download_plan(&opts_cloned))
+        .await
+        .map_err(|err| TermusicError::Async(format!("blocking task failed: {err}")))?
+}
+
 /// Run [`download::run_download_with_progress`] with an interactive ratatui loading TUI.
 pub async fn run_download_tui(
     paths: &AppPaths,
     opts: &DownloadOptions,
+) -> Result<DownloadOutcome> {
+    let plan = resolve_plan_blocking(opts).await?;
+    run_download_tui_plan(paths, opts, &plan).await
+}
+
+/// Run [`download::run_download_plan_with_progress`] with an interactive ratatui loading TUI.
+pub async fn run_download_tui_plan(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
 ) -> Result<DownloadOutcome> {
     let mut session = TerminalSession::enter()?;
     let mut signals = ShutdownSignals::new()?;
@@ -603,8 +690,15 @@ pub async fn run_download_tui(
     // Instantiate EventStream after TerminalSession so EventStream drops before raw mode restores.
     let mut events = EventStream::new();
 
-    let res =
-        run_download_tui_on_session(&mut session, &mut events, &mut signals, paths, opts).await;
+    let res = run_download_tui_plan_on_session(
+        &mut session,
+        &mut events,
+        &mut signals,
+        paths,
+        opts,
+        plan,
+    )
+    .await;
     drop(events);
     drop(session);
 
@@ -624,13 +718,28 @@ pub async fn run_download_tui_on_session(
     paths: &AppPaths,
     opts: &DownloadOptions,
 ) -> Result<DownloadTuiOutcome> {
-    let mut state = DownloadTuiState::from_options(opts);
+    let plan = resolve_plan_blocking(opts).await?;
+    run_download_tui_plan_on_session(session, events, signals, paths, opts, &plan).await
+}
+
+/// Run [`download::run_download_plan_with_progress`] inside an existing [`TerminalSession`].
+pub async fn run_download_tui_plan_on_session(
+    session: &mut TerminalSession,
+    events: &mut EventStream,
+    signals: &mut ShutdownSignals,
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
+) -> Result<DownloadTuiOutcome> {
+    let mut state = DownloadTuiState::from_plan(plan, opts.format, opts.jobs);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let paths_cloned = paths.clone();
     let opts_cloned = opts.clone();
+    let plan_cloned = plan.to_vec();
     let mut download_task = tokio::spawn(async move {
-        download::run_download_with_progress(&paths_cloned, &opts_cloned, Some(tx)).await
+        download::run_download_plan_with_progress(&paths_cloned, &opts_cloned, &plan_cloned, Some(tx))
+            .await
     });
 
     let mut tick = tokio::time::interval(TUI_TICK_INTERVAL);
@@ -702,15 +811,28 @@ pub async fn run_download_with_line_progress(
     paths: &AppPaths,
     opts: &DownloadOptions,
 ) -> Result<DownloadOutcome> {
+    let plan = resolve_plan_blocking(opts).await?;
+    run_download_plan_with_line_progress(paths, opts, &plan).await
+}
+
+/// Run [`download::run_download_plan_with_progress`] emitting non-TTY milestone lines to `stderr`.
+pub async fn run_download_plan_with_line_progress(
+    paths: &AppPaths,
+    opts: &DownloadOptions,
+    plan: &[LinkStatement],
+) -> Result<DownloadOutcome> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let paths_cloned = paths.clone();
     let opts_cloned = opts.clone();
+    let plan_cloned = plan.to_vec();
     let download_task = tokio::spawn(async move {
-        download::run_download_with_progress(&paths_cloned, &opts_cloned, Some(tx)).await
+        download::run_download_plan_with_progress(&paths_cloned, &opts_cloned, &plan_cloned, Some(tx))
+            .await
     });
 
     let mut total = 0usize;
     let mut last_percent_bucket: Vec<Option<u8>> = Vec::new();
+    let mut active_urls: Vec<String> = Vec::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             DownloadProgressEvent::BatchStarted {
@@ -721,6 +843,7 @@ pub async fn run_download_with_line_progress(
             } => {
                 total = urls.len();
                 last_percent_bucket = vec![None; total];
+                active_urls = urls;
                 eprintln!(
                     "Downloading {total} track(s) as {format} into {} (jobs={jobs})...",
                     dest_dir.display()
@@ -729,13 +852,42 @@ pub async fn run_download_with_line_progress(
             DownloadProgressEvent::Notice(msg) => {
                 eprintln!("note: {msg}");
             }
+            DownloadProgressEvent::ItemStepStarted {
+                index,
+                url,
+                step,
+                total_steps,
+                transition,
+            } => {
+                if let Some(slot) = last_percent_bucket.get_mut(index) {
+                    *slot = None;
+                }
+                if let Some(slot) = active_urls.get_mut(index) {
+                    *slot = url.clone();
+                }
+                let n = index + 1;
+                match transition {
+                    StepTransition::Fallback => {
+                        eprintln!("[{n}/{total}] Fallback ({step}/{total_steps}): {url}");
+                    }
+                    StepTransition::Then => {
+                        eprintln!("[{n}/{total}] Next ({step}/{total_steps}): {url}");
+                    }
+                    StepTransition::Primary => {
+                        eprintln!("[{n}/{total}] Step {step}/{total_steps}: {url}");
+                    }
+                }
+            }
             DownloadProgressEvent::ItemUpdate {
                 index,
                 title,
                 phase,
             } => {
                 let n = index + 1;
-                let label = title.as_deref().unwrap_or("track");
+                let label = title
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| active_urls.get(index).map(String::as_str).unwrap_or("track"));
                 match phase {
                     DownloadPhase::Starting => {
                         eprintln!("[{n}/{total}] Starting...");
@@ -948,5 +1100,176 @@ mod tests {
         assert!(rendered.contains("[##########]"));
         assert!(!rendered.contains('╭'), "unexpected rounded border:\n{rendered}");
         assert!(!rendered.contains('✓'), "unexpected unicode check:\n{rendered}");
+    }
+
+    #[test]
+    fn from_plan_and_item_step_started_update_url_title_labels_and_counts() {
+        use crate::link::LinkExpr;
+
+        let plan = vec![
+            LinkStatement {
+                line_number: Some(1),
+                source_file: Some(PathBuf::from("test.link")),
+                expr: LinkExpr::Or(
+                    Box::new(LinkExpr::Url("https://primary.example/a".to_string())),
+                    Box::new(LinkExpr::Url("https://fallback.example/a".to_string())),
+                ),
+            },
+            LinkStatement {
+                line_number: Some(2),
+                source_file: Some(PathBuf::from("test.link")),
+                expr: LinkExpr::And(
+                    Box::new(LinkExpr::Url("https://first.example/b".to_string())),
+                    Box::new(LinkExpr::Url("https://second.example/b".to_string())),
+                ),
+            },
+            LinkStatement {
+                line_number: None,
+                source_file: None,
+                expr: LinkExpr::Url("https://single.example/c".to_string()),
+            },
+        ];
+
+        let mut state = DownloadTuiState::from_plan(&plan, DownloadFormat::Mp3, 2);
+        assert_eq!(state.items.len(), 3);
+        assert_eq!(state.items[0].step, 0);
+        assert_eq!(state.items[0].total_steps, 2);
+        assert_eq!(state.items[0].transition, None);
+        assert_eq!(
+            state.items[0].display_label().as_ref(),
+            "https://primary.example/a || https://fallback.example/a"
+        );
+        assert_eq!(
+            state.items[2].display_label().as_ref(),
+            "https://single.example/c"
+        );
+        assert_eq!(state.summary_counts(), (0, 0, 3, 0));
+        assert_eq!(state.overall_ratio(), 0.0);
+
+        state.apply_event(DownloadProgressEvent::BatchStarted {
+            urls: plan.iter().map(|s| s.expr.to_string()).collect(),
+            dest_dir: PathBuf::from("/tmp/music"),
+            format: DownloadFormat::Mp3,
+            jobs: 2,
+        });
+        assert_eq!(state.items[0].total_steps, 2);
+
+        state.apply_event(DownloadProgressEvent::ItemStepStarted {
+            index: 0,
+            url: "https://primary.example/a".to_string(),
+            step: 1,
+            total_steps: 2,
+            transition: StepTransition::Primary,
+        });
+        assert_eq!(state.items[0].url, "https://primary.example/a");
+        assert_eq!(state.items[0].phase, DownloadPhase::Starting);
+        assert_eq!(
+            state.items[0].display_label().as_ref(),
+            "[step 1/2] https://primary.example/a"
+        );
+        assert_eq!(state.summary_counts(), (0, 1, 2, 0));
+        assert!(state.overall_ratio() > 0.0);
+
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 0,
+            title: Some("Primary Track".to_string()),
+            phase: DownloadPhase::Downloading {
+                downloaded_bytes: Some(50),
+                total_bytes: Some(100),
+                speed_bytes_per_sec: None,
+                eta_secs: None,
+            },
+        });
+        assert_eq!(
+            state.items[0].display_label().as_ref(),
+            "[step 1/2] Primary Track"
+        );
+
+        state.apply_event(DownloadProgressEvent::ItemStepStarted {
+            index: 0,
+            url: "https://fallback.example/a".to_string(),
+            step: 2,
+            total_steps: 2,
+            transition: StepTransition::Fallback,
+        });
+        assert_eq!(state.items[0].url, "https://fallback.example/a");
+        assert_eq!(state.items[0].title, None);
+        assert_eq!(state.items[0].phase, DownloadPhase::Starting);
+        assert_eq!(
+            state.items[0].display_label().as_ref(),
+            "[step 2/2 fallback] https://fallback.example/a"
+        );
+
+        state.apply_event(DownloadProgressEvent::ItemStepStarted {
+            index: 1,
+            url: "https://second.example/b".to_string(),
+            step: 2,
+            total_steps: 2,
+            transition: StepTransition::Then,
+        });
+        assert_eq!(
+            state.items[1].display_label().as_ref(),
+            "[step 2/2 then] https://second.example/b"
+        );
+
+        state.apply_event(DownloadProgressEvent::ItemStepStarted {
+            index: 2,
+            url: "https://single.example/c".to_string(),
+            step: 1,
+            total_steps: 1,
+            transition: StepTransition::Primary,
+        });
+        assert_eq!(
+            state.items[2].display_label().as_ref(),
+            "https://single.example/c"
+        );
+
+        let backend = TestBackend::new(110, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| state.render(frame)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("[step 2/2 fallback] https://fallback.example/a"));
+        assert!(rendered.contains("[step 2/2 then] https://second.example/b"));
+
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 0,
+            title: Some("Fallback Track".to_string()),
+            phase: DownloadPhase::Completed {
+                files: vec![PathBuf::from("/tmp/music/fallback.mp3")],
+            },
+        });
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 1,
+            title: None,
+            phase: DownloadPhase::Failed {
+                error: "step 2 failed".to_string(),
+            },
+        });
+        assert_eq!(state.summary_counts(), (1, 1, 0, 1));
+        assert!(state.overall_ratio() > 0.6);
+
+        state.apply_event(DownloadProgressEvent::BatchFinished);
+        assert_eq!(state.overall_ratio(), 1.0);
+    }
+
+    #[test]
+    fn from_options_supports_inline_targets() {
+        let opts = DownloadOptions {
+            urls: Vec::new(),
+            targets: vec![DownloadTarget::Url("https://example.com/inline".to_string())],
+            dest: None,
+            set_dest: None,
+            format: DownloadFormat::Mp3,
+            playlist: false,
+            embed_thumbnail: true,
+            auto_add: true,
+            playlist_name: None,
+            jobs: 2,
+            no_tui: false,
+        };
+        let state = DownloadTuiState::from_options(&opts);
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].url, "https://example.com/inline");
+        assert_eq!(state.items[0].total_steps, 1);
     }
 }

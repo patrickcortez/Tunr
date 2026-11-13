@@ -6,6 +6,7 @@ pub mod download_tui;
 pub mod error;
 pub mod ipc;
 pub mod library;
+pub mod link;
 pub mod paths;
 pub mod platform;
 pub mod player;

@@ -823,6 +823,7 @@ fn build_search_download_options(
 ) -> DownloadOptions {
     DownloadOptions {
         urls: vec![url],
+        targets: Vec::new(),
         dest: cfg.dest.clone(),
         set_dest: None,
         format: cfg.format,
