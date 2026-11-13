@@ -6,7 +6,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph,
@@ -22,9 +22,10 @@ use crate::error::{Result, TunrError};
 use crate::link::{DownloadTarget, LinkStatement};
 use crate::paths::AppPaths;
 use crate::platform::ShutdownSignals;
+use crate::theme::Theme;
 use crate::tui_common::{
     SPINNER_FRAMES, TerminalSession, active_spinner, border_type, format_duration,
-    truncate_to_width, use_ascii_glyphs,
+    paint_background, passive_highlight_style, truncate_to_width, use_ascii_glyphs,
 };
 
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(80);
@@ -126,6 +127,7 @@ pub struct DownloadTuiState {
     indexing_count: usize,
     finished: bool,
     notice: Option<String>,
+    theme: Theme,
 }
 
 impl DownloadTuiState {
@@ -183,7 +185,19 @@ impl DownloadTuiState {
             indexing_count: 0,
             finished: false,
             notice: None,
+            theme: Theme::default(),
         }
+    }
+
+    /// Apply a [`Theme`] to the download TUI state.
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Return the active [`Theme`].
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     /// Advance the spinner frame.
@@ -327,6 +341,7 @@ impl DownloadTuiState {
 
     fn render_with_ascii(&mut self, frame: &mut Frame, ascii: bool) {
         let area = frame.area();
+        paint_background(frame, area, &self.theme);
         let [header_area, overall_area, list_area, footer_area] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(3),
@@ -351,28 +366,28 @@ impl DownloadTuiState {
             if failed > 0 {
                 (
                     "Finished (with errors)".to_string(),
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    self.theme.warning_bold_style(),
                 )
             } else {
                 (
                     "Complete".to_string(),
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    self.theme.playing_bold_style(),
                 )
             }
         } else if self.indexing {
             (
                 format!("{spinner} Indexing {} track(s)...", self.indexing_count),
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                self.theme.accent_bold_style(),
             )
         } else if active > 0 || done > 0 || failed > 0 {
             (
                 format!("{spinner} Downloading..."),
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                self.theme.playing_bold_style(),
             )
         } else {
             (
                 format!("{spinner} Preparing tools..."),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                self.theme.warning_bold_style(),
             )
         };
 
@@ -381,35 +396,41 @@ impl DownloadTuiState {
             Line::from(vec![
                 Span::styled(
                     " Tunr Downloader",
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    self.theme.accent_bold_style(),
                 ),
-                Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+                Span::styled(" | ", self.theme.muted_style()),
                 Span::styled(state_label, state_style),
-                Span::styled(" | ", Style::new().fg(Color::DarkGray)),
-                Span::styled(elapsed, Style::new().fg(Color::Gray)),
+                Span::styled(" | ", self.theme.muted_style()),
+                Span::styled(elapsed, self.theme.secondary_style()),
             ])
         } else {
             Line::from(vec![
                 Span::styled(
                     concat!(" Tunr Downloader v", env!("CARGO_PKG_VERSION")),
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    self.theme.accent_bold_style(),
                 ),
-                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
+                Span::styled("  |  ", self.theme.muted_style()),
                 Span::styled(state_label, state_style),
-                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
+                Span::styled("  |  ", self.theme.muted_style()),
                 Span::styled(
                     format!("Format: {}  Jobs: {}", self.format, self.jobs),
-                    Style::new().fg(Color::Magenta),
+                    self.theme.accent_secondary_style(),
                 ),
-                Span::styled("  |  ", Style::new().fg(Color::DarkGray)),
-                Span::styled(elapsed, Style::new().fg(Color::Gray)),
+                Span::styled("  |  ", self.theme.muted_style()),
+                Span::styled(elapsed, self.theme.secondary_style()),
             ])
         };
 
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray));
-        frame.render_widget(Paragraph::new(line).block(block), area);
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false));
+        frame.render_widget(
+            Paragraph::new(line)
+                .style(self.theme.base_style())
+                .block(block),
+            area,
+        );
     }
 
     fn render_overall(&self, frame: &mut Frame, area: Rect, ascii: bool) {
@@ -431,11 +452,9 @@ impl DownloadTuiState {
 
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::Cyan))
-            .title(Span::styled(
-                title,
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(true))
+            .title(Span::styled(title, self.theme.accent_bold_style()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.is_empty() {
@@ -445,8 +464,8 @@ impl DownloadTuiState {
         let gauge = Gauge::default()
             .ratio(ratio)
             .label(format!("{pct}%"))
-            .style(Style::new().fg(Color::White).bg(Color::DarkGray))
-            .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray));
+            .style(self.theme.gauge_style())
+            .gauge_style(self.theme.gauge_fill_style());
         frame.render_widget(gauge, inner);
     }
 
@@ -457,10 +476,11 @@ impl DownloadTuiState {
         let total = self.items.len();
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray))
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false))
             .title(Span::styled(
                 format!(" Downloads ({total}) "),
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                self.theme.panel_title_style(),
             ));
 
         let inner_width = area.width.saturating_sub(4) as usize;
@@ -471,16 +491,23 @@ impl DownloadTuiState {
             .iter()
             .enumerate()
             .map(|(idx, item)| {
-                let (icon, icon_color) = match &item.phase {
-                    DownloadPhase::Queued => (if ascii { "-" } else { "·" }, Color::DarkGray),
+                let (icon, phase_style) = match &item.phase {
+                    DownloadPhase::Queued => (
+                        if ascii { "-" } else { "·" },
+                        self.theme.muted_style(),
+                    ),
                     DownloadPhase::Starting
                     | DownloadPhase::Downloading { .. }
                     | DownloadPhase::PostProcessing { .. }
-                    | DownloadPhase::Finalizing => (spinner, Color::Cyan),
-                    DownloadPhase::Completed { .. } => {
-                        (if ascii { "+" } else { "✓" }, Color::Green)
-                    }
-                    DownloadPhase::Failed { .. } => (if ascii { "x" } else { "✗" }, Color::Red),
+                    | DownloadPhase::Finalizing => (spinner, self.theme.accent_style()),
+                    DownloadPhase::Completed { .. } => (
+                        if ascii { "+" } else { "✓" },
+                        self.theme.playing_style(),
+                    ),
+                    DownloadPhase::Failed { .. } => (
+                        if ascii { "x" } else { "✗" },
+                        self.theme.error_style(),
+                    ),
                 };
 
                 let status_detail = format_item_detail(item, ascii);
@@ -490,26 +517,27 @@ impl DownloadTuiState {
                 let label = item.display_label();
 
                 let header_line = Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(icon_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(prefix, phase_style.add_modifier(Modifier::BOLD)),
                     Span::styled(
                         truncate_to_width(label.as_ref(), inner_width.saturating_sub(prefix_width)),
-                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                        self.theme.emphasis_bold_style(),
                     ),
                 ]);
 
+                let detail_style = if item.is_failed() {
+                    self.theme.error_style()
+                } else if item.is_done() {
+                    self.theme.playing_style()
+                } else {
+                    self.theme.secondary_style()
+                };
                 let detail_line = Line::from(vec![
                     Span::styled("      ", Style::new()),
-                    Span::styled(bar, Style::new().fg(icon_color)),
+                    Span::styled(bar, phase_style),
                     Span::raw(" "),
                     Span::styled(
                         truncate_to_width(&status_detail, inner_width.saturating_sub(19)),
-                        Style::new().fg(if item.is_failed() {
-                            Color::Red
-                        } else if item.is_done() {
-                            Color::Green
-                        } else {
-                            Color::Gray
-                        }),
+                        detail_style,
                     ),
                 ]);
 
@@ -518,14 +546,11 @@ impl DownloadTuiState {
             .collect();
 
         let list = List::new(list_items)
+            .style(self.theme.base_style())
             .block(block)
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(passive_highlight_style(&self.theme));
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
@@ -540,13 +565,14 @@ impl DownloadTuiState {
             .unwrap_or_else(|| "resolving...".to_string());
         let mut block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray));
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false));
 
         if let Some(notice) = &self.notice {
             block = block.title_bottom(
                 Line::from(Span::styled(
                     format!(" note: {notice} "),
-                    Style::new().fg(Color::Yellow),
+                    self.theme.warning_style(),
                 ))
                 .right_aligned(),
             );
@@ -567,12 +593,17 @@ impl DownloadTuiState {
         };
 
         let line = Line::from(vec![
-            Span::styled(" Dest: ", Style::new().fg(Color::Cyan)),
-            Span::styled(dest_text, Style::new().fg(Color::White)),
-            Span::styled("   |   ", Style::new().fg(Color::DarkGray)),
-            Span::styled(help_text, Style::new().fg(Color::Gray)),
+            Span::styled(" Dest: ", self.theme.accent_style()),
+            Span::styled(dest_text, self.theme.emphasis_style()),
+            Span::styled("   |   ", self.theme.muted_style()),
+            Span::styled(help_text, self.theme.secondary_style()),
         ]);
-        frame.render_widget(Paragraph::new(line).block(block), area);
+        frame.render_widget(
+            Paragraph::new(line)
+                .style(self.theme.base_style())
+                .block(block),
+            area,
+        );
     }
 }
 
@@ -673,9 +704,10 @@ async fn resolve_plan_blocking(opts: &DownloadOptions) -> Result<Vec<LinkStateme
 pub async fn run_download_tui(
     paths: &AppPaths,
     opts: &DownloadOptions,
+    theme: &Theme,
 ) -> Result<DownloadOutcome> {
     let plan = resolve_plan_blocking(opts).await?;
-    run_download_tui_plan(paths, opts, &plan).await
+    run_download_tui_plan(paths, opts, &plan, theme, None).await
 }
 
 /// Run [`download::run_download_plan_with_progress`] with an interactive ratatui loading TUI.
@@ -683,6 +715,8 @@ pub async fn run_download_tui_plan(
     paths: &AppPaths,
     opts: &DownloadOptions,
     plan: &[LinkStatement],
+    theme: &Theme,
+    theme_warning: Option<String>,
 ) -> Result<DownloadOutcome> {
     let mut session = TerminalSession::enter()?;
     let mut signals = ShutdownSignals::new()?;
@@ -697,6 +731,8 @@ pub async fn run_download_tui_plan(
         paths,
         opts,
         plan,
+        theme,
+        theme_warning,
     )
     .await;
     drop(events);
@@ -717,12 +753,14 @@ pub async fn run_download_tui_on_session(
     signals: &mut ShutdownSignals,
     paths: &AppPaths,
     opts: &DownloadOptions,
+    theme: &Theme,
 ) -> Result<DownloadTuiOutcome> {
     let plan = resolve_plan_blocking(opts).await?;
-    run_download_tui_plan_on_session(session, events, signals, paths, opts, &plan).await
+    run_download_tui_plan_on_session(session, events, signals, paths, opts, &plan, theme, None).await
 }
 
 /// Run [`download::run_download_plan_with_progress`] inside an existing [`TerminalSession`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_download_tui_plan_on_session(
     session: &mut TerminalSession,
     events: &mut EventStream,
@@ -730,8 +768,15 @@ pub async fn run_download_tui_plan_on_session(
     paths: &AppPaths,
     opts: &DownloadOptions,
     plan: &[LinkStatement],
+    theme: &Theme,
+    theme_warning: Option<String>,
 ) -> Result<DownloadTuiOutcome> {
-    let mut state = DownloadTuiState::from_plan(plan, opts.format, opts.jobs);
+    let mut state = DownloadTuiState::from_plan(plan, opts.format, opts.jobs).with_theme(theme.clone());
+    if state.notice.is_none()
+        && let Some(warn) = theme_warning
+    {
+        state.notice = Some(warn);
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let paths_cloned = paths.clone();
@@ -944,6 +989,7 @@ pub async fn run_download_plan_with_line_progress(
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     use super::*;
 
@@ -1271,5 +1317,147 @@ mod tests {
         assert_eq!(state.items.len(), 1);
         assert_eq!(state.items[0].url, "https://example.com/inline");
         assert_eq!(state.items[0].total_steps, 1);
+    }
+
+    fn find_text_pos(terminal: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                let col = row[..byte_idx].chars().count() as u16;
+                return (col, y);
+            }
+        }
+        panic!("text {needle:?} not found in buffer:\n{}", buffer_text(terminal));
+    }
+
+    #[test]
+    fn tunr_dark_theme_preserves_download_styles() {
+        let mut state = DownloadTuiState::new(
+            vec![
+                "https://example.com/1".to_string(),
+                "https://example.com/2".to_string(),
+                "https://example.com/3".to_string(),
+                "https://example.com/4".to_string(),
+            ],
+            DownloadFormat::Mp3,
+            4,
+        );
+        state.elapsed_override = Some(Duration::from_secs(5));
+        state.apply_event(DownloadProgressEvent::Notice("retrying".to_string()));
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 0,
+            title: Some("Active Song".to_string()),
+            phase: DownloadPhase::Downloading {
+                downloaded_bytes: Some(50),
+                total_bytes: Some(100),
+                speed_bytes_per_sec: None,
+                eta_secs: None,
+            },
+        });
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 1,
+            title: Some("Done Song".to_string()),
+            phase: DownloadPhase::Completed {
+                files: vec![PathBuf::from("/tmp/done.mp3")],
+            },
+        });
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 2,
+            title: Some("Broken Song".to_string()),
+            phase: DownloadPhase::Failed {
+                error: "network timeout".to_string(),
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| state.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(buf[(95, 1)].bg, Color::Reset);
+        let (fmt_x, fmt_y) = find_text_pos(&terminal, "Format: mp3");
+        assert_eq!(buf[(fmt_x, fmt_y)].fg, Color::Magenta);
+        let (done_x, done_y) = find_text_pos(&terminal, "Saved: done.mp3");
+        assert_eq!(buf[(done_x, done_y)].fg, Color::Green);
+        let (err_x, err_y) = find_text_pos(&terminal, "network timeout");
+        assert_eq!(buf[(err_x, err_y)].fg, Color::Red);
+        let (q_prefix_x, q_prefix_y) = find_text_pos(&terminal, "[4/4]");
+        assert_eq!(buf[(q_prefix_x, q_prefix_y)].fg, Color::DarkGray);
+        let (q_x, q_y) = find_text_pos(&terminal, "Queued");
+        assert_eq!(buf[(q_x, q_y)].fg, Color::Gray);
+        let (note_x, note_y) = find_text_pos(&terminal, "note: retrying");
+        assert_eq!(buf[(note_x, note_y)].fg, Color::Yellow);
+        // Selected item (index 0) uses DarkGray highlight bg
+        let (active_x, active_y) = find_text_pos(&terminal, "Active Song");
+        assert_eq!(buf[(active_x, active_y)].bg, Color::DarkGray);
+        // Gauge uses DarkGray track bg and Cyan filled bar
+        assert_eq!(buf[(2, 4)].bg, Color::DarkGray);
+    }
+
+    #[test]
+    fn tunr_light_theme_paints_explicit_bg_and_gauge_surface() {
+        let light = Theme::tunr_light();
+        let light_bg = light.bg.to_color();
+        assert_eq!(light_bg, Color::Rgb(246, 248, 250));
+
+        let mut state = DownloadTuiState::new(
+            vec![
+                "https://example.com/1".to_string(),
+                "https://example.com/2".to_string(),
+            ],
+            DownloadFormat::Flac,
+            2,
+        )
+        .with_theme(light.clone());
+        state.elapsed_override = Some(Duration::from_secs(12));
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 0,
+            title: Some("Light Active".to_string()),
+            phase: DownloadPhase::Downloading {
+                downloaded_bytes: Some(50),
+                total_bytes: Some(100),
+                speed_bytes_per_sec: None,
+                eta_secs: None,
+            },
+        });
+        state.apply_event(DownloadProgressEvent::ItemUpdate {
+            index: 1,
+            title: Some("Light Failed".to_string()),
+            phase: DownloadPhase::Failed {
+                error: "http 404".to_string(),
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|f| state.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        for y in 0..16u16 {
+            for x in 0..100u16 {
+                assert_ne!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "dark terminal bleed-through at ({x}, {y})"
+                );
+            }
+        }
+
+        // Empty header/footer padding uses explicit light bg
+        assert_eq!(buf[(96, 1)].bg, light_bg);
+        assert_eq!(buf[(96, 14)].bg, light_bg);
+        // Gauge track uses light surface (#e6ebf1) and filled section uses accent (#0969da)
+        assert_eq!(buf[(96, 4)].bg, light.surface.to_color());
+        assert_eq!(buf[(2, 4)].fg, light.accent.to_color());
+        // Selected item (index 0) uses selection_bg while preserving accent fg on [1/2]
+        let (prefix_x, prefix_y) = find_text_pos(&terminal, "[1/2]");
+        assert_eq!(buf[(prefix_x, prefix_y)].fg, light.accent.to_color());
+        assert_eq!(buf[(prefix_x, prefix_y)].bg, light.selection_bg.to_color());
+        // Unselected failed item keeps light bg and error fg
+        let (fail_x, fail_y) = find_text_pos(&terminal, "http 404");
+        assert_eq!(buf[(fail_x, fail_y)].fg, light.error.to_color());
+        assert_eq!(buf[(fail_x, fail_y)].bg, light_bg);
     }
 }

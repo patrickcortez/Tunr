@@ -5,7 +5,6 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
@@ -19,9 +18,10 @@ use crate::error::{Result, TunrError};
 use crate::paths::AppPaths;
 use crate::platform::{ClipboardMethod, ShutdownSignals, copy_to_clipboard};
 use crate::search::{self, SearchProvider, SearchResult};
+use crate::theme::Theme;
 use crate::tui_common::{
     SPINNER_FRAMES, TerminalSession, active_spinner, border_type, format_duration,
-    truncate_to_width, use_ascii_glyphs,
+    paint_background, passive_highlight_style, truncate_to_width, use_ascii_glyphs,
 };
 
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(80);
@@ -36,6 +36,8 @@ pub struct SearchRunConfig {
     pub format: DownloadFormat,
     pub paths: Option<AppPaths>,
     pub dest: Option<PathBuf>,
+    pub theme: Theme,
+    pub theme_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,7 @@ pub struct SearchAppState {
     status_toast: Option<(String, bool)>,
     ascii: bool,
     page_step: usize,
+    theme: Theme,
 }
 
 impl SearchAppState {
@@ -81,7 +84,7 @@ impl SearchAppState {
 
     /// Initialize search TUI state from an optional initial query and full [`SearchRunConfig`].
     pub fn from_run_config(initial_query: Option<String>, cfg: &SearchRunConfig) -> Self {
-        Self::with_ascii_and_config(
+        let mut state = Self::with_ascii_and_config(
             initial_query,
             cfg.limit,
             cfg.provider,
@@ -89,6 +92,22 @@ impl SearchAppState {
             cfg.format,
             use_ascii_glyphs(),
         )
+        .with_theme(cfg.theme.clone());
+        if let Some(warn) = &cfg.theme_warning {
+            state.status_toast = Some((warn.clone(), true));
+        }
+        state
+    }
+
+    /// Apply a [`Theme`] to the search TUI state.
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Return the active [`Theme`].
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -138,6 +157,7 @@ impl SearchAppState {
             status_toast: None,
             ascii,
             page_step: DEFAULT_PAGE_STEP,
+            theme: Theme::default(),
         }
     }
 
@@ -387,6 +407,7 @@ impl SearchAppState {
 
     fn render_with_ascii(&mut self, frame: &mut Frame, ascii: bool) {
         let area = frame.area();
+        paint_background(frame, area, &self.theme);
         let [header_area, results_area, footer_area] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
@@ -403,14 +424,10 @@ impl SearchAppState {
         if area.is_empty() {
             return;
         }
-        let border_style = if self.editing_query {
-            Style::new().fg(Color::Cyan)
-        } else {
-            Style::new().fg(Color::DarkGray)
-        };
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(border_style);
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(self.editing_query));
 
         let inner_width = area.width.saturating_sub(2) as usize;
         let sep = if ascii { " | " } else { " · " };
@@ -434,11 +451,11 @@ impl SearchAppState {
 
         let mut spans = vec![Span::styled(
             prefix_label,
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            self.theme.accent_bold_style(),
         )];
 
         if self.editing_query {
-            spans.push(Span::styled("Query: ", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("Query: ", self.theme.warning_bold_style()));
             let cursor = clamp_char_boundary(&self.query_input, self.cursor_pos);
             let before = &self.query_input[..cursor];
             let (cursor_ch, after) = if cursor < self.query_input.len() {
@@ -453,15 +470,9 @@ impl SearchAppState {
                 .saturating_sub(Span::raw(cursor_ch).width());
             let visible_after = truncate_to_width(after, remaining);
 
-            spans.push(Span::styled(visible_before, Style::new().fg(Color::White)));
-            spans.push(Span::styled(
-                cursor_ch,
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(visible_after, Style::new().fg(Color::White)));
+            spans.push(Span::styled(visible_before, self.theme.emphasis_style()));
+            spans.push(Span::styled(cursor_ch, self.theme.cursor_style()));
+            spans.push(Span::styled(visible_after, self.theme.emphasis_style()));
         } else if let Some(active) = &self.active_query {
             let quoted = format!("\"{active}\"");
             let count_suffix = match &self.phase {
@@ -472,33 +483,30 @@ impl SearchAppState {
                 &quoted,
                 query_budget.saturating_sub(Span::raw(&count_suffix).width()),
             );
-            spans.push(Span::styled("Query: ", Style::new().fg(Color::Gray)));
-            spans.push(Span::styled(
-                fitted,
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("Query: ", self.theme.secondary_style()));
+            spans.push(Span::styled(fitted, self.theme.emphasis_bold_style()));
             if !count_suffix.is_empty() {
-                spans.push(Span::styled(count_suffix, Style::new().fg(Color::Green)));
+                spans.push(Span::styled(count_suffix, self.theme.playing_style()));
             }
         } else {
             spans.push(Span::styled(
                 "Press / to search",
-                Style::new().fg(Color::DarkGray),
+                self.theme.muted_style(),
             ));
         }
 
-        frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .style(self.theme.base_style())
+                .block(block),
+            area,
+        );
     }
 
     fn render_results(&mut self, frame: &mut Frame, area: Rect, ascii: bool) {
         if area.is_empty() {
             return;
         }
-        let border_style = if !self.editing_query {
-            Style::new().fg(Color::Cyan)
-        } else {
-            Style::new().fg(Color::DarkGray)
-        };
         let title_text = match &self.phase {
             SearchPhase::Results => format!(" Results ({}) ", self.results.len()),
             SearchPhase::Searching { .. } => " Searching ".to_string(),
@@ -507,11 +515,9 @@ impl SearchAppState {
         };
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(border_style)
-            .title(Span::styled(
-                title_text,
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            ));
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(!self.editing_query))
+            .title(Span::styled(title_text, self.theme.panel_title_style()));
 
         match &self.phase {
             SearchPhase::Idle => {
@@ -519,7 +525,7 @@ impl SearchAppState {
                 frame.render_widget(block, area);
                 if !inner.is_empty() {
                     let prompt = Paragraph::new("Enter a search query above and press Enter.")
-                        .style(Style::new().fg(Color::DarkGray))
+                        .style(self.theme.base_style().patch(self.theme.muted_style()))
                         .alignment(Alignment::Center)
                         .wrap(Wrap { trim: true });
                     frame.render_widget(prompt, inner);
@@ -536,9 +542,9 @@ impl SearchAppState {
                         "{spinner} Searching {} for \"{query}\"...",
                         self.provider.display_name()
                     ))
-                        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                        .alignment(Alignment::Center)
-                        .wrap(Wrap { trim: true });
+                    .style(self.theme.base_style().patch(self.theme.accent_bold_style()))
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true });
                     frame.render_widget(text, inner);
                 }
                 return;
@@ -548,7 +554,7 @@ impl SearchAppState {
                 frame.render_widget(block, area);
                 if !inner.is_empty() {
                     let msg = Paragraph::new(format!("Search failed: {err}\n\nPress / to try another query or q to quit."))
-                        .style(Style::new().fg(Color::Red))
+                        .style(self.theme.base_style().patch(self.theme.error_style()))
                         .alignment(Alignment::Center)
                         .wrap(Wrap { trim: true });
                     frame.render_widget(msg, inner);
@@ -564,7 +570,7 @@ impl SearchAppState {
                     let empty = Paragraph::new(format!(
                         "No results found for \"{query}\".\nPress / to search again or q to quit."
                     ))
-                    .style(Style::new().fg(Color::Yellow))
+                    .style(self.theme.base_style().patch(self.theme.warning_style()))
                     .alignment(Alignment::Center)
                     .wrap(Wrap { trim: true });
                     frame.render_widget(empty, inner);
@@ -588,8 +594,8 @@ impl SearchAppState {
                 let title = truncate_to_width(&item.title, inner_width.saturating_sub(prefix_width));
 
                 let title_line = Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(title, Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(prefix, self.theme.accent_bold_style()),
+                    Span::styled(title, self.theme.emphasis_bold_style()),
                 ]);
 
                 let channel = item.channel.as_deref().unwrap_or("Unknown channel");
@@ -607,16 +613,14 @@ impl SearchAppState {
                 detail_parts.push(item.url.clone());
                 let detail = truncate_to_width(&detail_parts.join(sep), inner_width.saturating_sub(4));
 
+                let detail_style = if item.is_live {
+                    self.theme.live_style()
+                } else {
+                    self.theme.secondary_style()
+                };
                 let detail_line = Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(
-                        detail,
-                        Style::new().fg(if item.is_live {
-                            Color::LightRed
-                        } else {
-                            Color::Gray
-                        }),
-                    ),
+                    Span::styled(detail, detail_style),
                 ]);
 
                 ListItem::new(vec![title_line, detail_line])
@@ -624,14 +628,11 @@ impl SearchAppState {
             .collect();
 
         let list = List::new(list_items)
+            .style(self.theme.base_style())
             .block(block)
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(
-                Style::new()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(passive_highlight_style(&self.theme));
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
@@ -641,7 +642,8 @@ impl SearchAppState {
         }
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray));
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.is_empty() {
@@ -679,9 +681,9 @@ impl SearchAppState {
 
         if let Some((toast_msg, is_err)) = &self.status_toast {
             let toast_style = if *is_err {
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                self.theme.error_bold_style()
             } else {
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+                self.theme.playing_bold_style()
             };
             let min_hints = 22usize;
             let total_w = inner.width as usize;
@@ -698,11 +700,13 @@ impl SearchAppState {
                     truncate_to_width(&hints, left_area.width.saturating_sub(1) as usize);
                 let right_text = truncate_to_width(toast_msg, right_area.width as usize);
                 frame.render_widget(
-                    Paragraph::new(Span::styled(left_text, Style::new().fg(Color::Gray))),
+                    Paragraph::new(Span::styled(left_text, self.theme.secondary_style()))
+                        .style(self.theme.base_style()),
                     left_area,
                 );
                 frame.render_widget(
                     Paragraph::new(Span::styled(right_text, toast_style))
+                        .style(self.theme.base_style())
                         .alignment(Alignment::Right),
                     right_area,
                 );
@@ -710,7 +714,8 @@ impl SearchAppState {
             }
             let right_text = truncate_to_width(toast_msg, total_w);
             frame.render_widget(
-                Paragraph::new(Span::styled(right_text, toast_style)),
+                Paragraph::new(Span::styled(right_text, toast_style))
+                    .style(self.theme.base_style()),
                 inner,
             );
             return;
@@ -718,7 +723,8 @@ impl SearchAppState {
 
         let hint_text = truncate_to_width(&hints, inner.width as usize);
         frame.render_widget(
-            Paragraph::new(Span::styled(hint_text, Style::new().fg(Color::Gray))),
+            Paragraph::new(Span::styled(hint_text, self.theme.secondary_style()))
+                .style(self.theme.base_style()),
             inner,
         );
     }
@@ -976,6 +982,7 @@ pub async fn run_search_tui(initial_query: Option<String>, cfg: SearchRunConfig)
                                         &mut signals,
                                         &paths,
                                         &dl_opts,
+                                        &state.theme,
                                     )
                                     .await
                                     {
@@ -1084,6 +1091,7 @@ pub async fn run_search_plain(query: &str, cfg: SearchRunConfig) -> Result<()> {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     use crate::error::TunrError;
 
@@ -1379,6 +1387,8 @@ mod tests {
             format: DownloadFormat::Mp4,
             paths: None,
             dest: Some(PathBuf::from("/tmp/music")),
+            theme: Theme::default(),
+            theme_warning: None,
         };
         let dl_mp4 = build_search_download_options("https://example.com/1".to_string(), &cfg_mp4, false);
         assert!(!dl_mp4.auto_add);
@@ -1410,5 +1420,124 @@ mod tests {
             format_download_toast("Track", &err_outcome),
             ("Download failed: network error".to_string(), true)
         );
+    }
+
+    fn find_text_pos(terminal: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                let col = row[..byte_idx].chars().count() as u16;
+                return (col, y);
+            }
+        }
+        panic!("text {needle:?} not found in buffer:\n{}", buffer_text(terminal));
+    }
+
+    #[test]
+    fn tunr_dark_theme_preserves_search_styles() {
+        let mut state = SearchAppState::with_ascii(Some("lofi".to_string()), 10, false);
+        state.apply_search_result(Ok(sample_results(2)));
+        state.apply_copy_result(
+            "https://www.youtube.com/watch?v=id1",
+            Ok(ClipboardMethod::WlCopy),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal.draw(|f| state.render(f)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        // Frame background remains terminal Reset for tunr-dark
+        assert_eq!(buf[(95, 1)].bg, Color::Reset);
+        // Active results border is Cyan, inactive header border is DarkGray
+        assert_eq!(buf[(0, 0)].fg, Color::DarkGray);
+        assert_eq!(buf[(0, 3)].fg, Color::Cyan);
+        // Selected first row uses DarkGray bg and preserves Cyan index + White title
+        let (idx_x, idx_y) = find_text_pos(&terminal, "1.");
+        assert_eq!(buf[(idx_x, idx_y)].fg, Color::Cyan);
+        assert_eq!(buf[(idx_x, idx_y)].bg, Color::DarkGray);
+        let (title_x, title_y) = find_text_pos(&terminal, "Sample Track 1");
+        assert_eq!(buf[(title_x, title_y)].fg, Color::White);
+        assert_eq!(buf[(title_x, title_y)].bg, Color::DarkGray);
+        // LIVE stream row detail uses LightRed
+        let (live_x, live_y) = find_text_pos(&terminal, "LIVE");
+        assert_eq!(buf[(live_x, live_y)].fg, Color::LightRed);
+        // Success toast in footer uses Green
+        let (toast_x, toast_y) = find_text_pos(&terminal, "Copied via wl-copy");
+        assert_eq!(buf[(toast_x, toast_y)].fg, Color::Green);
+
+        // Edit mode uses Yellow "Query: " and Black-on-Cyan cursor
+        state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE, KeyEventKind::Press));
+        terminal.draw(|f| state.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].fg, Color::Cyan);
+        let (q_x, q_y) = find_text_pos(&terminal, "Query: ");
+        assert_eq!(buf[(q_x, q_y)].fg, Color::Yellow);
+        let (lofi_x, lofi_y) = find_text_pos(&terminal, "lofi");
+        let cursor_cell = &buf[(lofi_x + 4, lofi_y)];
+        assert_eq!(cursor_cell.fg, Color::Black);
+        assert_eq!(cursor_cell.bg, Color::Cyan);
+    }
+
+    #[test]
+    fn tunr_light_theme_paints_explicit_bg_without_bleed_through() {
+        let light = Theme::tunr_light();
+        let light_bg = light.bg.to_color();
+        assert_eq!(light_bg, Color::Rgb(246, 248, 250));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+
+        // Idle phase
+        let mut state = SearchAppState::with_ascii(None, 10, false).with_theme(light.clone());
+        terminal.draw(|f| state.render(f)).unwrap();
+        for y in 0..14u16 {
+            for x in 0..90u16 {
+                let cell = &terminal.backend().buffer()[(x, y)];
+                assert_ne!(
+                    cell.bg,
+                    Color::Reset,
+                    "dark terminal bleed-through at ({x}, {y}) in Idle phase"
+                );
+            }
+        }
+        assert_eq!(terminal.backend().buffer()[(88, 1)].bg, light_bg);
+        assert_eq!(terminal.backend().buffer()[(45, 5)].bg, light_bg);
+
+        // Searching phase
+        state.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press));
+        state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press));
+        terminal.draw(|f| state.render(f)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(45, 6)].bg, light_bg);
+
+        // Error phase
+        state.apply_search_result(Err(TunrError::Search("boom".to_string())));
+        terminal.draw(|f| state.render(f)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(45, 6)].bg, light_bg);
+        let (err_x, err_y) = find_text_pos(&terminal, "Search failed: search error: boom");
+        assert_eq!(terminal.backend().buffer()[(err_x, err_y)].fg, light.error.to_color());
+        assert_eq!(terminal.backend().buffer()[(err_x, err_y)].bg, light_bg);
+
+        // Results phase (including selected row & LIVE row)
+        state.apply_search_result(Ok(sample_results(2)));
+        terminal.draw(|f| state.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..14u16 {
+            for x in 0..90u16 {
+                assert_ne!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "dark terminal bleed-through at ({x}, {y}) in Results phase"
+                );
+            }
+        }
+        let (title_x, title_y) = find_text_pos(&terminal, "Sample Track 1");
+        assert_eq!(buf[(title_x, title_y)].fg, light.fg_emphasis.to_color());
+        assert_eq!(buf[(title_x, title_y)].bg, light.selection_bg.to_color());
+        let (live_x, live_y) = find_text_pos(&terminal, "LIVE");
+        assert_eq!(buf[(live_x, live_y)].fg, light.live.to_color());
+        assert_eq!(buf[(live_x, live_y)].bg, light_bg);
     }
 }

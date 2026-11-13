@@ -338,6 +338,12 @@ pub enum RawCommand {
         query: Vec<String>,
     },
 
+    /// Manage TUI color themes
+    Theme {
+        #[command(subcommand)]
+        action: ThemeAction,
+    },
+
     /// Manage the background playback daemon
     #[command(name = "daemon")]
     DaemonControl {
@@ -348,6 +354,22 @@ pub enum RawCommand {
     /// Internal background playback daemon entrypoint
     #[command(name = "__daemon", hide = true)]
     Daemon(DaemonOverrides),
+}
+
+/// Subcommands for `tunr theme`.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ThemeAction {
+    /// List available themes
+    List,
+    /// Set the active theme
+    Set {
+        /// Name of the theme to activate
+        name: String,
+    },
+    /// Show the currently active theme name
+    Current,
+    /// Print the active themes.json file path
+    Path,
 }
 
 /// Subcommands for `tunr daemon`.
@@ -413,6 +435,7 @@ pub enum Command {
     Update,
     Download(DownloadOptions),
     Search(SearchOptions),
+    Theme(ThemeAction),
     DaemonStop,
     Daemon(DaemonOverrides),
 }
@@ -1090,6 +1113,13 @@ fn validate_cli(cli: Cli) -> Result<Command> {
                 format_default,
             }))
         }
+        RawCommand::Theme { action } => match action {
+            ThemeAction::Set { name } => {
+                let trimmed = trim_non_empty(&name, "theme name cannot be empty")?;
+                Ok(Command::Theme(ThemeAction::Set { name: trimmed }))
+            }
+            other => Ok(Command::Theme(other)),
+        },
         RawCommand::DaemonControl {
             action: DaemonAction::Stop,
         } => Ok(Command::DaemonStop),
@@ -3124,5 +3154,51 @@ mod tests {
             parse_cli_from(["tunr", "update", "extra"]),
             Err(TunrError::InvalidArg(_))
         ));
+    }
+
+    #[test]
+    fn theme_commands_parse_and_reject_invalid_args() {
+        assert_eq!(
+            parse_cli_from(["tunr", "theme", "list"]).unwrap(),
+            Command::Theme(ThemeAction::List)
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "theme", "current"]).unwrap(),
+            Command::Theme(ThemeAction::Current)
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "theme", "path"]).unwrap(),
+            Command::Theme(ThemeAction::Path)
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "theme", "set", "nord"]).unwrap(),
+            Command::Theme(ThemeAction::Set {
+                name: "nord".to_string()
+            })
+        );
+        assert_eq!(
+            parse_cli_from(["tunr", "theme", "set", "  rose-pine  "]).unwrap(),
+            Command::Theme(ThemeAction::Set {
+                name: "rose-pine".to_string()
+            })
+        );
+
+        for invalid in [
+            ["tunr", "theme"].as_slice(),
+            ["tunr", "theme", "set"].as_slice(),
+            ["tunr", "theme", "set", ""].as_slice(),
+            ["tunr", "theme", "set", "   "].as_slice(),
+            ["tunr", "theme", "list", "extra"].as_slice(),
+            ["tunr", "theme", "current", "extra"].as_slice(),
+            ["tunr", "theme", "path", "extra"].as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    parse_cli_from(invalid.iter().copied()),
+                    Err(TunrError::InvalidArg(_))
+                ),
+                "expected InvalidArg for {invalid:?}"
+            );
+        }
     }
 }

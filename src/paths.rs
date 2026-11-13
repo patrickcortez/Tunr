@@ -10,6 +10,7 @@ use crate::download::DownloadFormat;
 use crate::error::{Result, TunrError};
 pub use crate::platform::canonicalize_clean as normalize_canonical_path;
 use crate::search::SearchProvider;
+use crate::theme::{DEFAULT_THEME_NAME, Theme, ThemesFile};
 
 pub const WORKSPACE_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -128,6 +129,7 @@ pub struct WorkspacePointer {
 pub struct AppPaths {
     pub working_dir: PathBuf,
     pub config_path: PathBuf,
+    pub themes_path: PathBuf,
     pub playlists_dir: PathBuf,
     pub music_dir: PathBuf,
     pub library_path: PathBuf,
@@ -150,6 +152,7 @@ impl AppPaths {
         Self {
             working_dir: data_dir.to_path_buf(),
             config_path: data_dir.join("config").join("config.json"),
+            themes_path: data_dir.join("config").join("themes.json"),
             playlists_dir: data_dir.join("playlists"),
             music_dir: data_dir.join("music"),
             library_path: data_dir.join("library.json"),
@@ -232,6 +235,7 @@ impl AppPaths {
         Ok(Self {
             working_dir: cfg.working_dir,
             config_path: cfg.config_dir.join("config.json"),
+            themes_path: cfg.config_dir.join("themes.json"),
             library_path: cfg.playlists_dir.join("library.json"),
             playlists_dir: cfg.playlists_dir,
             music_dir: cfg.music_dir,
@@ -451,12 +455,14 @@ fn initialize_workspace_with_env_and_os(
     };
 
     let config_file = config_dir.join("config.json");
+    let themes_file = config_dir.join("themes.json");
     let pointer_path =
         resolve_workspace_pointer_path_with_os(xdg_config_home, home_dir, os_config_dir)?;
     with_file_lock(&lock_path_for(&pointer_path), true, || {
         with_file_lock(&lock_path_for(&config_file), true, || {
             write_json_atomic(&config_file, &workspace_cfg)
         })?;
+        ensure_themes_file(&themes_file)?;
         let pointer = WorkspacePointer { working_dir };
         write_json_atomic(&pointer_path, &pointer)
     })?;
@@ -599,45 +605,208 @@ pub fn set_workspace_volume(paths: &AppPaths, volume: u8) -> Result<u8> {
     })
 }
 
-fn resolve_workspace_pointer_path_with_os(
+/// Result of resolving the active TUI [`Theme`] from workspace or global `themes.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeLoadOutcome {
+    pub theme: Theme,
+    pub active_name: String,
+    pub source_path: Option<PathBuf>,
+    pub warning: Option<String>,
+}
+
+/// Seed `themes_path` with [`ThemesFile::default_seeded`] if it does not already exist.
+pub fn ensure_themes_file(themes_path: &Path) -> Result<()> {
+    with_file_lock(&lock_path_for(themes_path), true, || {
+        if !themes_path.exists() {
+            write_json_atomic(themes_path, &ThemesFile::default_seeded())?;
+        }
+        Ok(())
+    })
+}
+
+fn load_themes_file_unlocked(themes_path: &Path) -> Result<ThemesFile> {
+    let raw = fs::read_to_string(themes_path)?;
+    let parsed: ThemesFile = serde_json::from_str(&raw)?;
+    Ok(parsed)
+}
+
+/// Load and deserialize a [`ThemesFile`] under a shared advisory file lock.
+pub fn load_themes_file(themes_path: &Path) -> Result<ThemesFile> {
+    with_file_lock(&lock_path_for(themes_path), false, || {
+        load_themes_file_unlocked(themes_path)
+    })
+}
+
+/// Validate and persist `name` as the active theme in `themes_path` atomically.
+pub fn set_active_theme(themes_path: &Path, name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(TunrError::InvalidArg(
+            "theme name cannot be empty".to_string(),
+        ));
+    }
+
+    with_file_lock(&lock_path_for(themes_path), true, || {
+        if !themes_path.exists() {
+            write_json_atomic(themes_path, &ThemesFile::default_seeded())?;
+        }
+        let mut file = load_themes_file_unlocked(themes_path)?;
+        if !file.contains_theme(trimmed) {
+            return Err(TunrError::NotFound(format!(
+                "unknown theme '{trimmed}' (run `tunr theme list` to view available themes)"
+            )));
+        }
+        file.resolve_theme_named(trimmed, true)
+            .map_err(TunrError::InvalidArg)?;
+        file.active = trimmed.to_string();
+        write_json_atomic(themes_path, &file)?;
+        Ok(trimmed.to_string())
+    })
+}
+
+/// Return the first existing `themes.json` path checking workspace first, then `global_path`.
+pub fn resolve_existing_themes_path_with_global(
+    paths: Option<&AppPaths>,
+    global_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = paths
+        && p.themes_path.exists()
+    {
+        return Some(p.themes_path.clone());
+    }
+    if let Some(g) = global_path
+        && g.exists()
+    {
+        return Some(g.to_path_buf());
+    }
+    None
+}
+
+/// Return the first existing `themes.json` path (workspace first, then global fallback).
+pub fn resolve_existing_themes_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
+    let global = resolve_global_themes_path().ok();
+    resolve_existing_themes_path_with_global(paths, global.as_deref())
+}
+
+/// Load the active TUI [`Theme`] using explicit `global_path` fallback (never fails on bad JSON/tokens).
+pub fn load_active_theme_for_paths_with_global(
+    paths: Option<&AppPaths>,
+    global_path: Option<&Path>,
+) -> ThemeLoadOutcome {
+    let Some(source_path) = resolve_existing_themes_path_with_global(paths, global_path) else {
+        return ThemeLoadOutcome {
+            theme: Theme::tunr_dark(),
+            active_name: DEFAULT_THEME_NAME.to_string(),
+            source_path: None,
+            warning: None,
+        };
+    };
+
+    match load_themes_file(&source_path) {
+        Ok(file) => {
+            let active_name = file.active.clone();
+            let (theme, warning) = file.resolve_active();
+            ThemeLoadOutcome {
+                theme,
+                active_name,
+                source_path: Some(source_path),
+                warning: warning.map(|w| format!("themes.json: {w}")),
+            }
+        }
+        Err(err) => ThemeLoadOutcome {
+            theme: Theme::tunr_dark(),
+            active_name: DEFAULT_THEME_NAME.to_string(),
+            source_path: Some(source_path),
+            warning: Some(format!(
+                "failed to load themes.json ({err}); using '{DEFAULT_THEME_NAME}'"
+            )),
+        },
+    }
+}
+
+/// Load the active TUI [`Theme`] from workspace or global `themes.json`, falling back safely on error.
+pub fn load_active_theme_for_paths(paths: Option<&AppPaths>) -> ThemeLoadOutcome {
+    let global = resolve_global_themes_path().ok();
+    load_active_theme_for_paths_with_global(paths, global.as_deref())
+}
+
+fn resolve_config_root_with_os(
     xdg_config_home: Option<OsString>,
     home_dir: Option<PathBuf>,
     os_config_dir: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let config_root = match xdg_config_home.filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
+    match xdg_config_home.filter(|v| !v.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir)),
         None => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if let Some(dir) = os_config_dir.filter(|p| !p.as_os_str().is_empty()) {
-                    dir
+                    Ok(dir)
                 } else if let Some(home) = home_dir.filter(|p| !p.as_os_str().is_empty()) {
-                    home.join(".config")
+                    Ok(home.join(".config"))
                 } else {
-                    return Err(TunrError::Io(io::Error::new(
+                    Err(TunrError::Io(io::Error::new(
                         io::ErrorKind::NotFound,
                         "could not determine XDG_CONFIG_HOME or home directory",
-                    )));
+                    )))
                 }
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 match home_dir.filter(|p| !p.as_os_str().is_empty()) {
-                    Some(home) => home.join(".config"),
+                    Some(home) => Ok(home.join(".config")),
                     None => match os_config_dir.filter(|p| !p.as_os_str().is_empty()) {
-                        Some(dir) => dir,
-                        None => {
-                            return Err(TunrError::Io(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "could not determine XDG_CONFIG_HOME or home directory",
-                            )));
-                        }
+                        Some(dir) => Ok(dir),
+                        None => Err(TunrError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "could not determine XDG_CONFIG_HOME or home directory",
+                        ))),
                     },
                 }
             }
         }
-    };
-    Ok(config_root.join("tunr").join("workspace.json"))
+    }
+}
+
+fn resolve_workspace_pointer_path_with_os(
+    xdg_config_home: Option<OsString>,
+    home_dir: Option<PathBuf>,
+    os_config_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    Ok(
+        resolve_config_root_with_os(xdg_config_home, home_dir, os_config_dir)?
+            .join("tunr")
+            .join("workspace.json"),
+    )
+}
+
+pub(crate) fn resolve_global_themes_path_with_os(
+    xdg_config_home: Option<OsString>,
+    home_dir: Option<PathBuf>,
+    os_config_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    Ok(
+        resolve_config_root_with_os(xdg_config_home, home_dir, os_config_dir)?
+            .join("tunr")
+            .join("themes.json"),
+    )
+}
+
+/// Resolve the global fallback themes file path (`<config_root>/tunr/themes.json`).
+pub fn resolve_global_themes_path() -> Result<PathBuf> {
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home_dir = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let os_config_dir = dirs::config_dir();
+    resolve_global_themes_path_with_os(xdg_config_home, home_dir, os_config_dir)
+}
+
+/// Resolve the target `themes.json` path: workspace `config/themes.json` when initialized,
+/// or the global `<config_root>/tunr/themes.json` fallback otherwise.
+pub fn resolve_themes_target_path(paths: Option<&AppPaths>) -> Result<PathBuf> {
+    match paths {
+        Some(p) => Ok(p.themes_path.clone()),
+        None => resolve_global_themes_path(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1974,6 +2143,239 @@ mod tests {
         let reloaded = load_workspace_config(&paths).unwrap();
         assert_eq!(reloaded.volume, Some(MAX_VOLUME));
         assert_eq!(effective_volume(&reloaded), MAX_VOLUME);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_global_themes_path_prefers_xdg_then_platform_defaults() {
+        let xdg = PathBuf::from("/custom/xdg");
+        let home = PathBuf::from("/custom/home");
+        let os_cfg = PathBuf::from("/custom/os-cfg");
+
+        let from_xdg = resolve_global_themes_path_with_os(
+            Some(xdg.clone().into_os_string()),
+            Some(home.clone()),
+            Some(os_cfg.clone()),
+        )
+        .unwrap();
+        assert_eq!(from_xdg, xdg.join("tunr").join("themes.json"));
+
+        let without_xdg =
+            resolve_global_themes_path_with_os(None, Some(home.clone()), Some(os_cfg.clone()))
+                .unwrap();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(without_xdg, os_cfg.join("tunr").join("themes.json"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            without_xdg,
+            home.join(".config").join("tunr").join("themes.json")
+        );
+    }
+
+    #[test]
+    fn init_seeds_themes_json_without_overwriting_existing() {
+        let root = temp_dir("init-themes");
+        let cfg_home = root.join("xdg_config");
+        let home = root.join("home");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        let init_cfg = initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(home.clone()),
+        )
+        .unwrap();
+
+        let themes_path = init_cfg.config_dir.join("themes.json");
+        assert!(themes_path.exists());
+        let seeded = load_themes_file(&themes_path).unwrap();
+        assert_eq!(seeded.active, "tunr-dark");
+        for name in crate::theme::BUILTIN_THEME_NAMES {
+            assert!(seeded.themes.contains_key(name), "missing {name}");
+        }
+
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.clone().into_os_string()),
+            Some(home.clone()),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+        assert_eq!(paths.themes_path, themes_path);
+
+        assert_eq!(set_active_theme(&themes_path, "nord").unwrap(), "nord");
+        initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.into_os_string()),
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(load_themes_file(&themes_path).unwrap().active, "nord");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_and_set_active_theme_persists_and_rejects_unknown_or_corrupt() {
+        let root = temp_dir("set-theme");
+        let themes_path = root.join("config").join("themes.json");
+
+        ensure_themes_file(&themes_path).unwrap();
+        assert_eq!(load_themes_file(&themes_path).unwrap().active, "tunr-dark");
+
+        assert_eq!(
+            set_active_theme(&themes_path, "rose-pine").unwrap(),
+            "rose-pine"
+        );
+        assert_eq!(load_themes_file(&themes_path).unwrap().active, "rose-pine");
+
+        assert!(matches!(
+            set_active_theme(&themes_path, "   "),
+            Err(TunrError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            set_active_theme(&themes_path, "nonexistent-theme"),
+            Err(TunrError::NotFound(_))
+        ));
+        assert_eq!(load_themes_file(&themes_path).unwrap().active, "rose-pine");
+
+        // Invalid color token in a custom theme is rejected on `set`, preserving previous file.
+        let mut custom = load_themes_file(&themes_path).unwrap();
+        custom.themes.insert(
+            "broken".to_string(),
+            crate::theme::PartialTheme {
+                accent: Some("not-a-color".to_string()),
+                ..Default::default()
+            },
+        );
+        write_json_atomic(&themes_path, &custom).unwrap();
+        assert!(matches!(
+            set_active_theme(&themes_path, "broken"),
+            Err(TunrError::InvalidArg(_))
+        ));
+        assert_eq!(load_themes_file(&themes_path).unwrap().active, "rose-pine");
+
+        // Corrupt JSON is never overwritten by `set_active_theme` or `ensure_themes_file`.
+        fs::write(&themes_path, "{ not valid json").unwrap();
+        ensure_themes_file(&themes_path).unwrap();
+        assert_eq!(fs::read_to_string(&themes_path).unwrap(), "{ not valid json");
+        assert!(matches!(
+            set_active_theme(&themes_path, "nord"),
+            Err(TunrError::Json(_))
+        ));
+        assert_eq!(fs::read_to_string(&themes_path).unwrap(), "{ not valid json");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_active_theme_precedence_partial_inheritance_and_fallbacks() {
+        let root = temp_dir("theme-precedence");
+        let ws_paths = AppPaths::from_roots(root.join("ws"), root.join("run"));
+        let global_path = root.join("global").join("themes.json");
+
+        // Missing both -> tunr-dark with no warning.
+        let none_outcome =
+            load_active_theme_for_paths_with_global(Some(&ws_paths), Some(&global_path));
+        assert_eq!(none_outcome.theme, Theme::tunr_dark());
+        assert_eq!(none_outcome.active_name, "tunr-dark");
+        assert_eq!(none_outcome.source_path, None);
+        assert_eq!(none_outcome.warning, None);
+
+        // Missing workspace themes.json falls back to global.
+        ensure_themes_file(&global_path).unwrap();
+        set_active_theme(&global_path, "dracula").unwrap();
+        let global_outcome =
+            load_active_theme_for_paths_with_global(Some(&ws_paths), Some(&global_path));
+        assert_eq!(global_outcome.theme, Theme::dracula());
+        assert_eq!(global_outcome.active_name, "dracula");
+        assert_eq!(global_outcome.source_path.as_deref(), Some(global_path.as_path()));
+        assert_eq!(global_outcome.warning, None);
+
+        // Workspace overrides global, including partial custom `base` inheritance.
+        ensure_themes_file(&ws_paths.themes_path).unwrap();
+        let mut ws_file = load_themes_file(&ws_paths.themes_path).unwrap();
+        ws_file.active = "my-nord".to_string();
+        ws_file.themes.insert(
+            "my-nord".to_string(),
+            crate::theme::PartialTheme {
+                base: Some("nord".to_string()),
+                accent: Some("#ff79c6".to_string()),
+                ..Default::default()
+            },
+        );
+        write_json_atomic(&ws_paths.themes_path, &ws_file).unwrap();
+
+        let ws_outcome =
+            load_active_theme_for_paths_with_global(Some(&ws_paths), Some(&global_path));
+        assert_eq!(ws_outcome.source_path.as_deref(), Some(ws_paths.themes_path.as_path()));
+        assert_eq!(ws_outcome.warning, None);
+        assert_eq!(ws_outcome.theme.bg, Theme::nord().bg);
+        assert_eq!(
+            ws_outcome.theme.accent,
+            crate::theme::ThemeColor::parse("#ff79c6").unwrap()
+        );
+
+        // Unknown active theme falls back to tunr-dark with warning.
+        ws_file.active = "missing-theme".to_string();
+        write_json_atomic(&ws_paths.themes_path, &ws_file).unwrap();
+        let unknown_outcome =
+            load_active_theme_for_paths_with_global(Some(&ws_paths), Some(&global_path));
+        assert_eq!(unknown_outcome.theme, Theme::tunr_dark());
+        assert!(unknown_outcome.warning.is_some());
+
+        // Corrupt JSON falls back to tunr-dark with warning without failing.
+        fs::write(&ws_paths.themes_path, "{broken").unwrap();
+        let corrupt_outcome =
+            load_active_theme_for_paths_with_global(Some(&ws_paths), Some(&global_path));
+        assert_eq!(corrupt_outcome.theme, Theme::tunr_dark());
+        assert!(corrupt_outcome.warning.is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_set_active_theme_preserves_valid_json_and_leaves_no_tmp() {
+        let root = temp_dir("concurrent-theme");
+        let themes_path = root.join("config").join("themes.json");
+        ensure_themes_file(&themes_path).unwrap();
+
+        let names = crate::theme::BUILTIN_THEME_NAMES;
+        std::thread::scope(|scope| {
+            for &name in &names {
+                let themes_path = &themes_path;
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let res = set_active_theme(themes_path, name);
+                        assert!(res.is_ok(), "writer thread name={name} failed: {res:?}");
+                        let loaded = load_themes_file(themes_path).unwrap();
+                        assert!(names.contains(&loaded.active.as_str()));
+                    }
+                });
+            }
+        });
+
+        let final_file = load_themes_file(&themes_path).unwrap();
+        assert!(names.contains(&final_file.active.as_str()));
+
+        let config_dir = themes_path.parent().unwrap();
+        let leftover_tmps: Vec<PathBuf> = fs::read_dir(config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "leftover tmp files: {leftover_tmps:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

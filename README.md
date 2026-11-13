@@ -120,6 +120,7 @@ tunr search "lofi"    # Search YouTube interactively
 | `tunr create <name> [songs=<s1,s2,...>]... [-s <song>]...` | Create a playlist from existing library songs |
 | `tunr delete [-s \| -p] <target>` | Remove a song or playlist from the library index (`-p MyList[<index>]` removes only that track from `MyList`; leaves files on disk untouched) |
 | `tunr status` | Show current daemon playback status |
+| `tunr theme <list\|set <name>\|current\|path>` | List, switch, inspect, or locate TUI color themes (`themes.json`) |
 | `tunr daemon stop` | Gracefully stop the background playback daemon |
 | `tunr version` | Print version information |
 
@@ -377,6 +378,40 @@ Launch the full-screen player UI with `tunr` (or `tunr tui`):
 - `d`: delete selected song or playlist from the library index (with confirmation)
 - `q` / `Esc`: quit the TUI (keeps background daemon playing)
 - `Q`: stop playback and quit the TUI
+
+## Themes
+
+Tunr's interactive TUIs (`tunr`, `tunr search`, and `tunr download`) support customizable color themes stored in `themes.json`:
+
+- **File location**: Workspace `<working-dir>/config/themes.json` (seeded on `tunr init`), falling back to your global config directory (`$XDG_CONFIG_HOME/tunr/themes.json`, `~/.config/tunr/themes.json`, `~/Library/Application Support/tunr/themes.json` on macOS, or `%APPDATA%\tunr\themes.json` on Windows) when no workspace `themes.json` exists.
+- **Built-in themes**: `tunr-dark` (default, preserves your terminal background via `"reset"`), `tunr-light`, `rose-pine`, `nord`, and `dracula`.
+
+### Managing Themes
+
+```bash
+tunr theme list               # List available themes (* marks active)
+tunr theme set rose-pine      # Switch active theme
+tunr theme current            # Print active theme name
+tunr theme path               # Print active themes.json path
+```
+
+### Custom Themes
+
+Edit `themes.json` directly to customize colors or add new entries under `"themes"`. Each token accepts `#RRGGBB` hex strings or ANSI color names (`"reset"`, `"black"`, `"red"`, `"green"`, `"yellow"`, `"blue"`, `"magenta"`, `"cyan"`, `"gray"`, `"dark_gray"`, `"light_red"`, `"white"`, etc.). Partial custom themes can inherit from any built-in or other theme via `"base"`:
+
+```json
+{
+  "version": 1,
+  "active": "my-nord",
+  "themes": {
+    "my-nord": {
+      "base": "nord",
+      "accent": "#ff79c6",
+      "playing": "light_green"
+    }
+  }
+}
+```
 
 ## `tunr search`
 

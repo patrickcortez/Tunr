@@ -1,10 +1,12 @@
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::Path;
 
-use tunr::cli::{AddInput, Command, ListKind, PlayQuery, parse_cli};
+use tunr::cli::{AddInput, Command, ListKind, PlayQuery, ThemeAction, parse_cli};
 use tunr::error::{Result, TunrError};
 use tunr::ipc::{self, IpcRequest, PlaybackState, PlaybackStatus};
 use tunr::library::{DeleteOutcome, Library, PlayResolution, SongCandidate, UpdateSummary};
 use tunr::paths::{self, AppPaths};
+use tunr::theme::{DEFAULT_THEME_NAME, Theme, ThemesFile};
 use tunr::{daemon, download, download_tui, search, search_tui, tui};
 
 #[tokio::main]
@@ -148,19 +150,27 @@ async fn run() -> Result<()> {
                 .await?;
             }
 
-            let cfg = search_tui::SearchRunConfig {
+            let mut cfg = search_tui::SearchRunConfig {
                 limit: effective_limit,
                 provider: effective_provider,
                 download_mode: opts.download,
                 format: effective_format,
-                paths: paths_opt,
+                paths: paths_opt.clone(),
                 dest: opts.dest,
+                theme: Theme::default(),
+                theme_warning: None,
             };
 
             if !opts.no_tui
                 && std::io::stdin().is_terminal()
                 && std::io::stdout().is_terminal()
             {
+                let theme_outcome = run_blocking(move || {
+                    Ok(paths::load_active_theme_for_paths(paths_opt.as_ref()))
+                })
+                .await?;
+                cfg.theme = theme_outcome.theme;
+                cfg.theme_warning = theme_outcome.warning;
                 let initial_query = if opts.query.is_empty() {
                     None
                 } else {
@@ -177,12 +187,38 @@ async fn run() -> Result<()> {
             }
             return search_tui::run_search_plain(&opts.query, cfg).await;
         }
+        Command::Theme(action) => {
+            return run_blocking(move || {
+                let paths_opt = match AppPaths::resolve() {
+                    Ok(p) => Some(p),
+                    Err(TunrError::NotInitialized(_)) => None,
+                    Err(err) => return Err(err),
+                };
+                let global_path = paths::resolve_global_themes_path()?;
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut out = stdout.lock();
+                let mut err_out = stderr.lock();
+                execute_theme_action_with_paths(
+                    action,
+                    paths_opt.as_ref(),
+                    &global_path,
+                    &mut out,
+                    &mut err_out,
+                )
+            })
+            .await;
+        }
         _ => {}
     }
 
     let paths = run_blocking(AppPaths::resolve).await?;
     match command {
-        Command::Version | Command::Init { .. } | Command::Daemon(_) | Command::Search(_) => {
+        Command::Version
+        | Command::Init { .. }
+        | Command::Daemon(_)
+        | Command::Search(_)
+        | Command::Theme(_) => {
             unreachable!()
         }
         Command::Tui => {
@@ -191,7 +227,10 @@ async fn run() -> Result<()> {
                     "interactive TUI requires a terminal (stdin/stdout TTY); pass a subcommand such as `tunr status` or `tunr play`".to_string(),
                 ));
             }
-            tui::run_tui(&paths).await
+            let p = paths.clone();
+            let theme_outcome =
+                run_blocking(move || Ok(paths::load_active_theme_for_paths(Some(&p)))).await?;
+            tui::run_tui(&paths, &theme_outcome.theme, theme_outcome.warning).await
         }
         Command::Play {
             query,
@@ -463,7 +502,17 @@ async fn run() -> Result<()> {
                 && std::io::stdout().is_terminal()
                 && std::io::stdin().is_terminal()
             {
-                download_tui::run_download_tui_plan(&paths, &opts, &plan).await?
+                let p = paths.clone();
+                let theme_outcome =
+                    run_blocking(move || Ok(paths::load_active_theme_for_paths(Some(&p)))).await?;
+                download_tui::run_download_tui_plan(
+                    &paths,
+                    &opts,
+                    &plan,
+                    &theme_outcome.theme,
+                    theme_outcome.warning,
+                )
+                .await?
             } else {
                 download_tui::run_download_plan_with_line_progress(&paths, &opts, &plan).await?
             };
@@ -507,6 +556,60 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn format_theme_list(file: &ThemesFile) -> String {
+    let mut out = String::new();
+    for name in file.available_names() {
+        let marker = if name == file.active { "*" } else { " " };
+        out.push_str(&format!("{marker} {name}\n"));
+    }
+    out
+}
+
+fn execute_theme_action_with_paths<W: Write, E: Write>(
+    action: ThemeAction,
+    paths_opt: Option<&AppPaths>,
+    global_path: &Path,
+    out: &mut W,
+    err_out: &mut E,
+) -> Result<()> {
+    let target = match paths_opt {
+        Some(p) => p.themes_path.clone(),
+        None => global_path.to_path_buf(),
+    };
+
+    match action {
+        ThemeAction::Path => {
+            paths::ensure_themes_file(&target)?;
+            writeln!(out, "{}", target.display())?;
+        }
+        ThemeAction::List => {
+            paths::ensure_themes_file(&target)?;
+            let file = paths::load_themes_file(&target)?;
+            write!(out, "{}", format_theme_list(&file))?;
+        }
+        ThemeAction::Set { name } => {
+            let chosen = paths::set_active_theme(&target, &name)?;
+            writeln!(out, "Active theme: {chosen}")?;
+        }
+        ThemeAction::Current => {
+            match paths::resolve_existing_themes_path_with_global(paths_opt, Some(global_path)) {
+                Some(existing) => {
+                    let file = paths::load_themes_file(&existing)?;
+                    let (_theme, warn) = file.resolve_active();
+                    if let Some(w) = warn {
+                        writeln!(err_out, "warning: {w}")?;
+                    }
+                    writeln!(out, "{}", file.active)?;
+                }
+                None => {
+                    writeln!(out, "{DEFAULT_THEME_NAME}")?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_workspace_update(paths: &AppPaths) -> Result<UpdateSummary> {
@@ -1126,5 +1229,117 @@ Playlists (0):
         let lib = Library::load(&paths.library_path).unwrap();
         assert_eq!(lib.songs.len(), 1);
         assert_eq!(lib.songs[0].path, std::fs::canonicalize(&moved_a).unwrap());
+    }
+
+    #[test]
+    fn theme_command_handlers_work_initialized_and_uninitialized() {
+        let guard = TempWorkspaceGuard::new("theme-cmd");
+        let global_path = guard.root.join("global").join("themes.json");
+        let ws_paths = AppPaths::from_roots(guard.root.join("ws"), guard.root.join("run"));
+
+        // Uninitialized `current` reports default without creating global themes.json.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Current,
+            None,
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "tunr-dark\n");
+        assert!(err.is_empty());
+        assert!(!global_path.exists());
+
+        // Uninitialized `set` and `list` lazily create global themes.json.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Set {
+                name: "nord".to_string(),
+            },
+            None,
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Active theme: nord\n");
+        assert!(global_path.exists());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::List,
+            None,
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        let listed = String::from_utf8(out).unwrap();
+        assert!(listed.contains("* nord\n"), "list output: {listed}");
+        assert!(listed.contains("  tunr-dark\n"));
+        assert!(listed.contains("  tunr-light\n"));
+        assert!(listed.contains("  rose-pine\n"));
+        assert!(listed.contains("  dracula\n"));
+
+        // Legacy initialized workspace without config/themes.json: `current` reads global without shadowing!
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Current,
+            Some(&ws_paths),
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "nord\n");
+        assert!(!ws_paths.themes_path.exists());
+
+        // Workspace `path` & `set` target workspace themes.json independently of global.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Path,
+            Some(&ws_paths),
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            ws_paths.themes_path.to_string_lossy()
+        );
+        assert!(ws_paths.themes_path.exists());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Set {
+                name: "rose-pine".to_string(),
+            },
+            Some(&ws_paths),
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Active theme: rose-pine\n");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        execute_theme_action_with_paths(
+            ThemeAction::Current,
+            Some(&ws_paths),
+            &global_path,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "rose-pine\n");
     }
 }

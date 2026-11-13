@@ -4,12 +4,16 @@ use std::sync::Once;
 use crossterm::cursor::Show;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::Span;
-use ratatui::widgets::BorderType;
+use ratatui::widgets::{Block, BorderType};
 use ratatui::{DefaultTerminal, Terminal};
 
 use crate::error::{Result, TunrError};
+use crate::theme::Theme;
 
 static PANIC_HOOK_ONCE: Once = Once::new();
 
@@ -29,6 +33,27 @@ pub(crate) fn border_type(ascii: bool) -> BorderType {
     } else {
         BorderType::Rounded
     }
+}
+
+/// Fill `area` with the theme's base foreground and background colors.
+pub(crate) fn paint_background(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if !area.is_empty() {
+        frame.render_widget(Block::new().style(theme.base_style()), area);
+    }
+}
+
+/// Return the two-pane list highlight style for focused vs unfocused panes.
+pub(crate) fn list_highlight_style(theme: &Theme, focused: bool) -> Style {
+    if focused {
+        theme.focused_selection_style()
+    } else {
+        theme.unfocused_selection_style()
+    }
+}
+
+/// Return the single-pane list highlight style that preserves item span foreground colors.
+pub(crate) fn passive_highlight_style(theme: &Theme) -> Style {
+    theme.passive_selection_style()
 }
 
 /// Return the spinner glyph for `tick` in Unicode or ASCII mode.

@@ -7,7 +7,7 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyM
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
@@ -21,7 +21,11 @@ use crate::ipc::{self, IpcRequest, PlayMode, PlaybackState, PlaybackStatus, Targ
 use crate::library::{DeleteOutcome, Library, Song};
 use crate::paths::{self, AppPaths, DEFAULT_VOLUME, MAX_VOLUME};
 use crate::platform::ShutdownSignals;
-use crate::tui_common::{TerminalSession, fit_to_width, use_ascii_glyphs};
+use crate::theme::Theme;
+use crate::tui_common::{
+    TerminalSession, border_type, fit_to_width, list_highlight_style, paint_background,
+    use_ascii_glyphs,
+};
 
 const SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const SEEK_STEP_SECS: f64 = 5.0;
@@ -153,6 +157,7 @@ pub struct TuiApp {
     library_gen: u64,
     reload_in_flight: bool,
     delete_in_flight: bool,
+    theme: Theme,
     effects: Vec<TuiEffect>,
 }
 
@@ -165,7 +170,10 @@ impl TuiApp {
         let library = Library::load(&paths.library_path)?;
         let library_stamp = file_stamp(&paths.library_path);
         let initial_volume = load_initial_volume(&paths);
-        Ok(Self::from_loaded(library, library_stamp).with_volume(initial_volume))
+        let theme = paths::load_active_theme_for_paths(Some(&paths)).theme;
+        Ok(Self::from_loaded(library, library_stamp)
+            .with_volume(initial_volume)
+            .with_theme(theme))
     }
 
     /// Construct a [`TuiApp`] from pre-loaded library contents and file metadata stamp.
@@ -200,8 +208,20 @@ impl TuiApp {
             library_gen: 0,
             reload_in_flight: false,
             delete_in_flight: false,
+            theme: Theme::default(),
             effects: Vec::new(),
         }
+    }
+
+    /// Override the active TUI theme.
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Return the active TUI theme.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     /// Override the initial volume percentage shown by [`TuiApp`].
@@ -879,6 +899,8 @@ impl TuiApp {
 
     fn render_with_ascii(&mut self, frame: &mut Frame, ascii: bool) {
         let area = frame.area();
+        paint_background(frame, area, &self.theme);
+
         let [header_area, main_area, footer_area] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(0),
@@ -904,51 +926,39 @@ impl TuiApp {
             PlayMode::Shuffle => "[Mode: Shuffle]",
         };
         let (state_text, state_style) = match self.status.state {
-            PlaybackState::Playing => (
-                "Playing",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            PlaybackState::Paused => (
-                "Paused",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            PlaybackState::Stopped => (
-                "Stopped",
-                Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            ),
+            PlaybackState::Playing => ("Playing", self.theme.playing_bold_style()),
+            PlaybackState::Paused => ("Paused", self.theme.warning_bold_style()),
+            PlaybackState::Stopped => ("Stopped", self.theme.muted_bold_style()),
         };
 
         let mut spans = vec![
             Span::styled(
                 concat!(" Tunr v", env!("CARGO_PKG_VERSION")),
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                self.theme.accent_bold_style(),
             ),
-            Span::styled("   |   ", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                mode_text,
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("   |   ", self.theme.muted_style()),
+            Span::styled(mode_text, self.theme.accent_secondary_bold_style()),
         ];
         if self.status.loop_playback {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                "[Loop]",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("[Loop]", self.theme.warning_bold_style()));
         }
-        spans.push(Span::styled("   |   ", Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled("   |   ", self.theme.muted_style()));
         spans.push(Span::styled(state_text, state_style));
-        spans.push(Span::styled("   |   ", Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled("   |   ", self.theme.muted_style()));
         spans.push(Span::styled(
             format!("Vol: {}%", self.volume),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            self.theme.accent_bold_style(),
         ));
         let title_line = Line::from(spans);
 
         let block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray));
-        let paragraph = Paragraph::new(title_line).block(block);
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false));
+        let paragraph = Paragraph::new(title_line)
+            .style(self.theme.base_style())
+            .block(block);
         frame.render_widget(paragraph, area);
     }
 
@@ -981,11 +991,12 @@ impl TuiApp {
             return;
         }
         let focused = self.focus == FocusPane::Playlists;
-        let border_style = pane_border_style(focused);
-        let title_style = pane_title_style(focused);
+        let border_style = self.theme.border_style(focused);
+        let title_style = self.theme.pane_title_style(focused);
 
         let block = Block::bordered()
             .border_type(border_type(ascii))
+            .style(self.theme.base_style())
             .border_style(border_style)
             .title(Span::styled(" Playlists ", title_style));
 
@@ -999,19 +1010,10 @@ impl TuiApp {
             items.push(ListItem::new(format!("{} ({})", pl.name, count)));
         }
 
-        let highlight_style = if focused {
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
-        };
+        let highlight_style = list_highlight_style(&self.theme, focused);
 
         let list = List::new(items)
+            .style(self.theme.base_style())
             .block(block)
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always)
@@ -1025,14 +1027,15 @@ impl TuiApp {
             return;
         }
         let focused = self.focus == FocusPane::Tracks;
-        let border_style = pane_border_style(focused);
-        let title_style = pane_title_style(focused);
+        let border_style = self.theme.border_style(focused);
+        let title_style = self.theme.pane_title_style(focused);
 
         let context_label = self
             .selected_playlist_name()
             .unwrap_or_else(|| "[All Songs]".to_string());
         let block = Block::bordered()
             .border_type(border_type(ascii))
+            .style(self.theme.base_style())
             .border_style(border_style)
             .title(Span::styled(format!(" Tracks: {context_label} "), title_style));
 
@@ -1045,7 +1048,7 @@ impl TuiApp {
                 let empty = Paragraph::new(
                     "No tracks in this view.\nRun `tunr add <path>` to import music.",
                 )
-                .style(Style::new().fg(Color::DarkGray))
+                .style(self.theme.base_style().patch(self.theme.muted_style()))
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true });
                 frame.render_widget(empty, inner);
@@ -1088,16 +1091,16 @@ impl TuiApp {
                 };
 
                 let prefix_style = if is_active {
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    self.theme.playing_bold_style()
                 } else {
                     Style::new()
                 };
                 let text_style = if is_active {
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    self.theme.playing_bold_style()
                 } else {
                     Style::new()
                 };
-                let dur_style = Style::new().fg(Color::DarkGray);
+                let dur_style = self.theme.muted_style();
 
                 ListItem::new(Line::from(vec![
                     Span::styled(prefix, prefix_style),
@@ -1107,19 +1110,10 @@ impl TuiApp {
             })
             .collect();
 
-        let highlight_style = if focused {
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
-        };
+        let highlight_style = list_highlight_style(&self.theme, focused);
 
         let list = List::new(items)
+            .style(self.theme.base_style())
             .block(block)
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always)
@@ -1134,17 +1128,15 @@ impl TuiApp {
         }
         let mut block = Block::bordered()
             .border_type(border_type(ascii))
-            .border_style(Style::new().fg(Color::DarkGray))
-            .title(Span::styled(
-                " Now Playing ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
+            .style(self.theme.base_style())
+            .border_style(self.theme.border_style(false))
+            .title(Span::styled(" Now Playing ", self.theme.accent_bold_style()));
 
         if let Some(msg) = &self.status_message {
             let msg_style = if msg.is_error {
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                self.theme.error_bold_style()
             } else {
-                Style::new().fg(Color::Yellow)
+                self.theme.warning_style()
             };
             block = block.title_bottom(
                 Line::from(Span::styled(format!(" {} ", msg.text), msg_style)).right_aligned(),
@@ -1167,7 +1159,7 @@ impl TuiApp {
         let now_line = match (&self.status.state, &self.status.current_track) {
             (PlaybackState::Stopped, _) | (_, None) => Line::from(Span::styled(
                 "No track playing — press Enter on a track or p on a playlist",
-                Style::new().fg(Color::DarkGray),
+                self.theme.muted_style(),
             )),
             (state, Some(track)) => {
                 let icon = match state {
@@ -1197,19 +1189,22 @@ impl TuiApp {
                     String::new()
                 };
                 Line::from(vec![
-                    Span::styled(icon, Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(icon, self.theme.playing_bold_style()),
                     Span::styled(
                         format!("{}{}", track.title, artist),
-                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                        self.theme.emphasis_bold_style(),
                     ),
                     Span::styled(
                         format!("  [{playlist_ctx}]{queue_pos}"),
-                        Style::new().fg(Color::Cyan),
+                        self.theme.accent_style(),
                     ),
                 ])
             }
         };
-        frame.render_widget(Paragraph::new(now_line), now_area);
+        frame.render_widget(
+            Paragraph::new(now_line).style(self.theme.base_style()),
+            now_area,
+        );
 
         let total_secs = self.status.duration_secs.or_else(|| {
             self.status
@@ -1240,8 +1235,8 @@ impl TuiApp {
         let gauge = Gauge::default()
             .ratio(ratio)
             .label(gauge_label)
-            .style(Style::new().fg(Color::White).bg(Color::DarkGray))
-            .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray));
+            .style(self.theme.gauge_style())
+            .gauge_style(self.theme.gauge_fill_style());
         frame.render_widget(gauge, gauge_area);
 
         let help_text = if inner.width < 128 {
@@ -1255,8 +1250,11 @@ impl TuiApp {
         } else {
             "←/→/Tab:Pane ↑/↓/j/k:Nav Enter:Play p:PlayList Space:Pause n/b:Next/Prev [/]:±5s -/+:Vol s:Mode d:Del q:Quit Q:Stop+Quit"
         };
-        let help_line = Line::from(Span::styled(help_text, Style::new().fg(Color::Gray)));
-        frame.render_widget(Paragraph::new(help_line), help_area);
+        let help_line = Line::from(Span::styled(help_text, self.theme.secondary_style()));
+        frame.render_widget(
+            Paragraph::new(help_line).style(self.theme.base_style()),
+            help_area,
+        );
     }
 
     fn render_delete_modal(&self, frame: &mut Frame, area: Rect, modal: &ConfirmDelete, ascii: bool) {
@@ -1276,10 +1274,11 @@ impl TuiApp {
         };
         let block = Block::bordered()
             .border_type(modal_border)
-            .border_style(Style::new().fg(Color::Red))
+            .style(self.theme.base_style())
+            .border_style(self.theme.modal_border_style())
             .title(Span::styled(
                 " Confirm Delete ",
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                self.theme.error_bold_style(),
             ));
 
         let body = match modal.kind {
@@ -1294,6 +1293,7 @@ impl TuiApp {
         };
 
         let paragraph = Paragraph::new(body)
+            .style(self.theme.base_style())
             .block(block)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
@@ -1302,7 +1302,11 @@ impl TuiApp {
 }
 
 /// Launch the interactive ratatui TUI on the current terminal.
-pub async fn run_tui(paths: &AppPaths) -> Result<()> {
+pub async fn run_tui(
+    paths: &AppPaths,
+    theme: &Theme,
+    theme_warning: Option<String>,
+) -> Result<()> {
     let paths_for_load = paths.clone();
     let (library, library_stamp, initial_volume) = tokio::task::spawn_blocking(move || -> Result<_> {
         let library = Library::load(&paths_for_load.library_path)?;
@@ -1313,7 +1317,12 @@ pub async fn run_tui(paths: &AppPaths) -> Result<()> {
     .await
     .map_err(|err| TunrError::Async(format!("failed to load library: {err}")))??;
 
-    let mut app = TuiApp::from_loaded(library, library_stamp).with_volume(initial_volume);
+    let mut app = TuiApp::from_loaded(library, library_stamp)
+        .with_volume(initial_volume)
+        .with_theme(theme.clone());
+    if let Some(warning) = theme_warning {
+        app.set_message(warning, true);
+    }
     app.request_poll_status();
 
     let mut session = TerminalSession::enter()?;
@@ -1645,22 +1654,6 @@ fn execute_delete_blocking(
     Ok((library, stamp, outcome))
 }
 
-fn pane_border_style(focused: bool) -> Style {
-    if focused {
-        Style::new().fg(Color::Cyan)
-    } else {
-        Style::new().fg(Color::DarkGray)
-    }
-}
-
-fn pane_title_style(focused: bool) -> Style {
-    if focused {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(Color::Gray)
-    }
-}
-
 fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
@@ -1687,14 +1680,6 @@ fn is_daemon_offline_error(err: &TunrError) -> bool {
     }
 }
 
-fn border_type(ascii: bool) -> BorderType {
-    if ascii {
-        BorderType::Plain
-    } else {
-        BorderType::Rounded
-    }
-}
-
 fn format_time(secs: f64) -> String {
     let clamped = if secs.is_finite() && secs > 0.0 {
         secs.floor() as u64
@@ -1712,6 +1697,8 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
     use uuid::Uuid;
 
     use super::*;
@@ -2736,5 +2723,136 @@ mod tests {
                 "missing compact footer volume shortcut (ascii={ascii}):\n{screen}"
             );
         }
+    }
+
+    fn find_text_pos(buf: &Buffer, needle: &str) -> (u16, u16) {
+        let area = buf.area;
+        for y in area.y..area.bottom() {
+            let row: String = (area.x..area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            if let Some(byte_idx) = row.find(needle) {
+                let col_offset = row[..byte_idx].chars().count() as u16;
+                return (area.x + col_offset, y);
+            }
+        }
+        panic!("text '{needle}' not found in buffer:\n{buf:?}");
+    }
+
+    #[test]
+    fn tunr_dark_theme_preserves_default_styles() {
+        let lib = sample_library();
+        let active_song = lib.songs[1].clone();
+        let mut app = TuiApp::from_loaded(lib, None);
+        app.status = PlaybackStatus {
+            state: PlaybackState::Playing,
+            mode: PlayMode::Next,
+            current_track: Some(active_song),
+            position_secs: 30.0,
+            duration_secs: Some(200.0),
+            ..PlaybackStatus::default()
+        };
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let (title_x, title_y) = find_text_pos(buf, "Tunr v");
+        assert_eq!(buf[(title_x, title_y)].fg, Color::Cyan);
+        assert!(buf[(title_x, title_y)].modifier.contains(Modifier::BOLD));
+
+        let (mode_x, mode_y) = find_text_pos(buf, "[Mode: Next]");
+        assert_eq!(buf[(mode_x, mode_y)].fg, Color::Magenta);
+        assert!(buf[(mode_x, mode_y)].modifier.contains(Modifier::BOLD));
+
+        let (play_x, play_y) = find_text_pos(buf, "Playing");
+        assert_eq!(buf[(play_x, play_y)].fg, Color::Green);
+        assert!(buf[(play_x, play_y)].modifier.contains(Modifier::BOLD));
+
+        // Focused Playlists selection: Black on Cyan BOLD
+        let (pl_x, pl_y) = find_text_pos(buf, "[All Songs] (3)");
+        assert_eq!(buf[(pl_x, pl_y)].fg, Color::Black);
+        assert_eq!(buf[(pl_x, pl_y)].bg, Color::Cyan);
+        assert!(buf[(pl_x, pl_y)].modifier.contains(Modifier::BOLD));
+
+        // Unfocused Tracks selection: White on DarkGray BOLD
+        let (tr_x, tr_y) = find_text_pos(buf, "Alpha Dawn");
+        assert_eq!(buf[(tr_x, tr_y)].fg, Color::White);
+        assert_eq!(buf[(tr_x, tr_y)].bg, Color::DarkGray);
+
+        // Active track row (unselected): Green BOLD on Reset
+        let (act_x, act_y) = find_text_pos(buf, "Beta Drift");
+        assert_eq!(buf[(act_x, act_y)].fg, Color::Green);
+        assert_eq!(buf[(act_x, act_y)].bg, Color::Reset);
+        assert!(buf[(act_x, act_y)].modifier.contains(Modifier::BOLD));
+
+        // Empty cell preserves terminal Reset bg
+        assert_eq!(buf[(90, 1)].bg, Color::Reset);
+
+        // Delete modal title: Red BOLD
+        app.handle_key(press(KeyCode::Char('d')));
+        // Wait: [All Songs] cannot be deleted, move to Chill playlist first.
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Char('d')));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let modal_buf = terminal.backend().buffer();
+        let (mx, my) = find_text_pos(modal_buf, "Confirm Delete");
+        assert_eq!(modal_buf[(mx, my)].fg, Color::Red);
+        assert!(modal_buf[(mx, my)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tunr_light_theme_paints_explicit_bg_across_frame_and_modal() {
+        let light = Theme::tunr_light();
+        let expected_bg = light.bg.to_color();
+        let mut app = TuiApp::from_loaded(sample_library(), None).with_theme(light.clone());
+        app.status = PlaybackStatus {
+            state: PlaybackState::Playing,
+            mode: PlayMode::Next,
+            current_track: Some(app.library.songs[1].clone()),
+            position_secs: 60.0,
+            duration_secs: Some(200.0),
+            ..PlaybackStatus::default()
+        };
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Zero Color::Reset cells anywhere in the rendered frame.
+        for y in 0..24 {
+            for x in 0..100 {
+                assert_ne!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "dark terminal bg bleed-through at ({x}, {y})"
+                );
+            }
+        }
+        // Empty header space & normal track row use explicit light bg.
+        assert_eq!(buf[(90, 1)].bg, expected_bg);
+        let (act_x, act_y) = find_text_pos(buf, "Beta Drift");
+        assert_eq!(buf[(act_x, act_y)].bg, expected_bg);
+        assert_eq!(buf[(act_x, act_y)].fg, light.playing.to_color());
+
+        // Trigger delete modal on Chill playlist and verify no Color::Reset bleed-through after Clear.
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Char('d')));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let modal_buf = terminal.backend().buffer();
+        for y in 0..24 {
+            for x in 0..100 {
+                assert_ne!(
+                    modal_buf[(x, y)].bg,
+                    Color::Reset,
+                    "bleed-through after Clear at ({x}, {y})"
+                );
+            }
+        }
+        let (body_x, body_y) = find_text_pos(modal_buf, "Delete playlist");
+        assert_eq!(modal_buf[(body_x, body_y)].bg, expected_bg);
+        assert_eq!(modal_buf[(body_x, body_y)].fg, light.fg.to_color());
     }
 }

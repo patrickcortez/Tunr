@@ -12,6 +12,7 @@ pub mod platform;
 pub mod player;
 pub mod search;
 pub mod search_tui;
+pub mod theme;
 pub mod tui;
 pub mod tui_common;
 mod ytdlp;
