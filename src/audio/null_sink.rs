@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::audio::AudioSink;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 #[derive(Debug, Default)]
 struct NullSinkSpecState {
@@ -198,7 +198,7 @@ impl NullSink {
 impl AudioSink for NullSink {
     fn open(&mut self, sample_rate: u32, channels: u8) -> Result<()> {
         if sample_rate == 0 || channels == 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "invalid audio specification: {sample_rate} Hz, {channels} channels"
             )));
         }
@@ -218,7 +218,7 @@ impl AudioSink for NullSink {
 
     fn write_f32(&mut self, samples: &[f32]) -> Result<()> {
         if !self.stats.is_open() {
-            return Err(TermusicError::Audio(
+            return Err(TunrError::Audio(
                 "cannot write samples: null sink is not open".to_string(),
             ));
         }
@@ -266,7 +266,7 @@ mod tests {
     fn write_before_open_fails() {
         let mut sink = NullSink::new();
         let err = sink.write_f32(&[0.1, -0.1]).unwrap_err();
-        assert!(matches!(err, TermusicError::Audio(_)));
+        assert!(matches!(err, TunrError::Audio(_)));
     }
 
     #[test]
@@ -301,8 +301,8 @@ mod tests {
     #[test]
     fn invalid_spec_is_rejected() {
         let mut sink = NullSink::new();
-        assert!(matches!(sink.open(0, 2), Err(TermusicError::Audio(_))));
-        assert!(matches!(sink.open(44_100, 0), Err(TermusicError::Audio(_))));
+        assert!(matches!(sink.open(0, 2), Err(TunrError::Audio(_))));
+        assert!(matches!(sink.open(44_100, 0), Err(TunrError::Audio(_))));
     }
 
     #[test]

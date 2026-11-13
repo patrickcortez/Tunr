@@ -1,8 +1,8 @@
 use thiserror::Error;
 
-/// Unified error type for Termusic CLI, library, audio pipeline, IPC, and daemon.
+/// Unified error type for Tunr CLI, library, audio pipeline, IPC, and daemon.
 #[derive(Debug, Error)]
-pub enum TermusicError {
+pub enum TunrError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -43,4 +43,4 @@ pub enum TermusicError {
     Async(String),
 }
 
-pub type Result<T> = std::result::Result<T, TermusicError>;
+pub type Result<T> = std::result::Result<T, TunrError>;

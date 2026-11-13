@@ -3,7 +3,7 @@
 //! Used by platform backends (such as AAudio on Android) whose negotiated device
 //! stream format can differ from Symphonia's decoded `(sample_rate, channels)`.
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 /// Adapts interleaved `f32` PCM from source `(sample_rate, channels)` to destination
 /// `(sample_rate, channels)` with streaming continuity across consecutive chunks.
@@ -25,12 +25,12 @@ impl PcmAdapter {
     /// Creates a new adapter, validating non-zero rates and channel counts.
     pub fn new(src_rate: u32, src_channels: usize, dst_rate: u32, dst_channels: usize) -> Result<Self> {
         if src_rate == 0 || dst_rate == 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "invalid sample rate for PCM adapter: src={src_rate}, dst={dst_rate}"
             )));
         }
         if src_channels == 0 || dst_channels == 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "invalid channel count for PCM adapter: src={src_channels}, dst={dst_channels}"
             )));
         }
@@ -81,7 +81,7 @@ impl PcmAdapter {
             return Ok(());
         }
         if input.len() % self.src_channels != 0 {
-            return Err(TermusicError::Audio(format!(
+            return Err(TunrError::Audio(format!(
                 "PCM sample slice length {} is not divisible by {} source channels",
                 input.len(),
                 self.src_channels

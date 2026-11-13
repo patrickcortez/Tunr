@@ -31,22 +31,22 @@ update:
 	$(CARGO) install --path . --locked --force
 
 uninstall:
-	$(CARGO) uninstall termusic
+	$(CARGO) uninstall tunr
 
 clean:
 	$(CARGO) clean
 
 help:
-	@echo "Termusic Makefile targets:"
+	@echo "Tunr Makefile targets:"
 	@echo "  build       Build debug binary"
 	@echo "  release     Build optimized release binary"
 	@echo "  check       Type-check all targets with warnings denied (--locked)"
 	@echo "  test        Run unit and integration tests (--locked)"
 	@echo "  test-live   Run ignored live audio backend tests (--locked)"
 	@echo "  test-pulse  Alias for test-live (backward compatibility)"
-	@echo "  run         Launch Termusic TUI via cargo run"
-	@echo "  install     Install termusic binary via cargo install"
-	@echo "  update      Rebuild and reinstall termusic binary (--force)"
-	@echo "  uninstall   Uninstall termusic binary"
+	@echo "  run         Launch Tunr TUI via cargo run"
+	@echo "  install     Install tunr binary via cargo install"
+	@echo "  update      Rebuild and reinstall tunr binary (--force)"
+	@echo "  uninstall   Uninstall tunr binary"
 	@echo "  clean       Remove Cargo build artifacts"
 	@echo "  help        Show this help message"

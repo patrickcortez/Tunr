@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 /// Conditional expression parsed from one non-empty line in a `.link` file.
 ///
@@ -121,7 +121,7 @@ fn tokenize_line<'a>(
 
         match ch {
             '(' | ')' => {
-                return Err(TermusicError::InvalidArg(format_line_error(
+                return Err(TunrError::InvalidArg(format_line_error(
                     source,
                     line_num,
                     "parentheses are not supported in .link expressions",
@@ -130,7 +130,7 @@ fn tokenize_line<'a>(
             '&' => {
                 let count = bytes[i..].iter().take_while(|&&b| b == b'&').count();
                 if count >= 3 {
-                    return Err(TermusicError::InvalidArg(format_line_error(
+                    return Err(TunrError::InvalidArg(format_line_error(
                         source,
                         line_num,
                         "unexpected '&&&' (use '&&')",
@@ -151,7 +151,7 @@ fn tokenize_line<'a>(
                     .next()
                     .is_none_or(|next| next.is_whitespace() || matches!(next, '|' | '(' | ')'));
                 if atom_start.is_none() && next_is_sep {
-                    return Err(TermusicError::InvalidArg(format_line_error(
+                    return Err(TunrError::InvalidArg(format_line_error(
                         source,
                         line_num,
                         "unexpected single '&' (use '&&')",
@@ -163,7 +163,7 @@ fn tokenize_line<'a>(
             '|' => {
                 let count = bytes[i..].iter().take_while(|&&b| b == b'|').count();
                 if count >= 3 {
-                    return Err(TermusicError::InvalidArg(format_line_error(
+                    return Err(TunrError::InvalidArg(format_line_error(
                         source,
                         line_num,
                         "unexpected '|||' (use '||')",
@@ -177,7 +177,7 @@ fn tokenize_line<'a>(
                     i += 2;
                     continue;
                 }
-                return Err(TermusicError::InvalidArg(format_line_error(
+                return Err(TunrError::InvalidArg(format_line_error(
                     source,
                     line_num,
                     "unexpected single '|' (use '||')",
@@ -208,17 +208,17 @@ fn parse_primary(
             *pos += 1;
             Ok(LinkExpr::Url((*url).to_string()))
         }
-        Some(Token::And) => Err(TermusicError::InvalidArg(format_line_error(
+        Some(Token::And) => Err(TunrError::InvalidArg(format_line_error(
             source,
             line_num,
             "unexpected '&&'",
         ))),
-        Some(Token::Or) => Err(TermusicError::InvalidArg(format_line_error(
+        Some(Token::Or) => Err(TunrError::InvalidArg(format_line_error(
             source,
             line_num,
             "unexpected '||'",
         ))),
-        None => Err(TermusicError::InvalidArg(format_line_error(
+        None => Err(TunrError::InvalidArg(format_line_error(
             source,
             line_num,
             "expected URL after operator",
@@ -268,7 +268,7 @@ fn parse_line(line: &str, source: Option<&Path>, line_num: usize) -> Result<Link
             Token::And => "unexpected '&&'".to_string(),
             Token::Or => "unexpected '||'".to_string(),
         };
-        return Err(TermusicError::InvalidArg(format_line_error(
+        return Err(TunrError::InvalidArg(format_line_error(
             source, line_num, msg,
         )));
     }
@@ -306,16 +306,16 @@ pub fn parse_link_file(path: &Path) -> Result<Vec<LinkStatement>> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TermusicError::NotFound(format!(
+            return Err(TunrError::NotFound(format!(
                 ".link file not found: {}",
                 path.display()
             )));
         }
-        Err(err) => return Err(TermusicError::Io(err)),
+        Err(err) => return Err(TunrError::Io(err)),
     };
 
     if !meta.is_file() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             ".link path is not a file: {}",
             path.display()
         )));
@@ -324,7 +324,7 @@ pub fn parse_link_file(path: &Path) -> Result<Vec<LinkStatement>> {
     let content = std::fs::read_to_string(path)?;
     let statements = parse_link_str(&content, Some(path))?;
     if statements.is_empty() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             ".link file contains no download URLs: {}",
             path.display()
         )));
@@ -345,7 +345,7 @@ mod tests {
     impl TempDirGuard {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "termusic-link-test-{label}-{}",
+                "tunr-link-test-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(&path).expect("create temp test dir");
@@ -525,7 +525,7 @@ mod tests {
         for (input, expected_line, expected_substr) in cases {
             let err = parse_link_str(input, Some(src)).unwrap_err();
             match err {
-                TermusicError::InvalidArg(msg) => {
+                TunrError::InvalidArg(msg) => {
                     let prefix = format!("bad.link:{expected_line}:");
                     assert!(
                         msg.contains(&prefix) && msg.contains(expected_substr),
@@ -563,26 +563,26 @@ mod tests {
         let missing = dir.path().join("missing.link");
         assert!(matches!(
             parse_link_file(&missing),
-            Err(TermusicError::NotFound(_))
+            Err(TunrError::NotFound(_))
         ));
 
         let subdir = dir.path().join("dir.link");
         fs::create_dir_all(&subdir).unwrap();
         assert!(matches!(
             parse_link_file(&subdir),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         let empty = dir.path().join("empty.link");
         fs::write(&empty, "# only comments\n\n   # and blanks\n").unwrap();
         assert!(matches!(
             parse_link_file(&empty),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         let bad_utf8 = dir.path().join("bad-utf8.link");
         fs::write(&bad_utf8, [0xff_u8, 0xfe, 0x00]).unwrap();
-        assert!(matches!(parse_link_file(&bad_utf8), Err(TermusicError::Io(_))));
+        assert!(matches!(parse_link_file(&bad_utf8), Err(TunrError::Io(_))));
 
         let valid = dir.path().join("valid.link");
         fs::write(&valid, "https://a.com || https://b.com\n").unwrap();

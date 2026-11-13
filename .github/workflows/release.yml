@@ -102,14 +102,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/termusic-${VERSION}-${{ matrix.target }}.tar.gz" termusic
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/tunr-${VERSION}-${{ matrix.target }}.tar.gz" tunr
 
       - name: Package zip archive
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Force -Path "target/${{ matrix.target }}/release/termusic.exe" -DestinationPath "dist/termusic-${env:VERSION}-${{ matrix.target }}.zip"
+          Compress-Archive -Force -Path "target/${{ matrix.target }}/release/tunr.exe" -DestinationPath "dist/tunr-${env:VERSION}-${{ matrix.target }}.zip"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
@@ -132,7 +132,7 @@ jobs:
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum termusic-* | sort -k2 > SHA256SUMS
+          sha256sum tunr-* | sort -k2 > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload combined artifacts with SHA256SUMS
@@ -151,5 +151,5 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/termusic-*
+            dist/tunr-*
             dist/SHA256SUMS

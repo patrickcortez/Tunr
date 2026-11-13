@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Legacy bash wrapper for downloading audio with yt-dlp.
-# Deprecated: prefer the built-in cross-platform `termusic download` command,
+# Deprecated: prefer the built-in cross-platform `tunr download` command,
 # which works across Linux, macOS, Windows, and Termux without bash or jq.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/termusic"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tunr"
 DEST_CONFIG_FILE="$CONFIG_DIR/download-dest"
 
 FORMAT="mp3"
@@ -35,11 +35,11 @@ Options:
   -h, --help              Show this help message and exit
 
 Environment:
-  TERMUSIC_DEST           Fallback destination directory if -d/--dest is not passed
+  TUNR_DEST           Fallback destination directory if -d/--dest is not passed
   XDG_CONFIG_HOME         Base config directory for saved download-dest
 
 Examples:
-  $SCRIPT_NAME --set-dest ~/Music/termusic-workspace/music
+  $SCRIPT_NAME --set-dest ~/Music/tunr-workspace/music
   $SCRIPT_NAME "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
   $SCRIPT_NAME -d /tmp/songs -f flac "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 EOF
@@ -190,14 +190,14 @@ if [[ "$HAS_DEST_ARG" -eq 1 ]]; then
     DEST_DIR="$DEST_ARG"
 elif [[ "$HAS_SET_DEST_ARG" -eq 1 ]]; then
     DEST_DIR="$SET_DEST_ARG"
-elif [[ -n "${TERMUSIC_DEST:-}" ]]; then
-    DEST_DIR="$(trim "$TERMUSIC_DEST")"
+elif [[ -n "${TUNR_DEST:-}" ]]; then
+    DEST_DIR="$(trim "$TUNR_DEST")"
 elif saved_dest="$(read_saved_dest)"; then
     DEST_DIR="$saved_dest"
 fi
 
 if [[ -z "$DEST_DIR" ]]; then
-    die "download destination is not set. Pass -d <dir> / --dest <dir>, set TERMUSIC_DEST, or run --set-dest <dir>."
+    die "download destination is not set. Pass -d <dir> / --dest <dir>, set TUNR_DEST, or run --set-dest <dir>."
 fi
 
 DEST_DIR="$(resolve_abs_dir "$DEST_DIR")"

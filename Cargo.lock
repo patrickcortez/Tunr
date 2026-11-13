@@ -1861,7 +1861,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "termusic"
+name = "tunr"
 version = "1.0.0"
 dependencies = [
  "clap",

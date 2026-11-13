@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::download::DownloadFormat;
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 pub use crate::platform::canonicalize_clean as normalize_canonical_path;
 use crate::search::SearchProvider;
 
@@ -16,7 +16,7 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 
 const NOT_INITIALIZED_MSG: &str =
-    "Termusic is not initialized. Run `termusic init <working-directory-location>` first.";
+    "Tunr is not initialized. Run `tunr init <working-directory-location>` first.";
 
 #[cfg(target_os = "macos")]
 const UNIX_SOCKET_MAX_PATH_BYTES: usize = 104;
@@ -37,7 +37,7 @@ impl IpcEndpoint {
     pub fn from_override(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(TermusicError::InvalidArg(
+            return Err(TunrError::InvalidArg(
                 "--socket-path requires a non-empty endpoint".to_string(),
             ));
         }
@@ -54,7 +54,7 @@ impl IpcEndpoint {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\.\pipe\"))
             {
                 if trimmed.len() == 9 {
-                    return Err(TermusicError::InvalidArg(
+                    return Err(TunrError::InvalidArg(
                         "--socket-path named pipe name must not be empty".to_string(),
                     ));
                 }
@@ -113,13 +113,13 @@ pub struct WorkspaceConfig {
     pub search_format: Option<DownloadFormat>,
 }
 
-/// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/termusic/workspace.json` (or OS config dir).
+/// Bootstrap pointer persisted at `$XDG_CONFIG_HOME/tunr/workspace.json` (or OS config dir).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePointer {
     pub working_dir: PathBuf,
 }
 
-/// Resolved filesystem paths for Termusic workspace, library data, and daemon IPC runtime files.
+/// Resolved filesystem paths for Tunr workspace, library data, and daemon IPC runtime files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     pub working_dir: PathBuf,
@@ -138,7 +138,7 @@ impl AppPaths {
         let data_dir = data_dir.as_ref();
         let runtime_dir = runtime_dir.as_ref();
         #[cfg(unix)]
-        let ipc_endpoint = IpcEndpoint::UnixSocket(runtime_dir.join("termusic.sock"));
+        let ipc_endpoint = IpcEndpoint::UnixSocket(runtime_dir.join("tunr.sock"));
         #[cfg(windows)]
         let ipc_endpoint =
             IpcEndpoint::NamedPipe(named_pipe_for_seed(&runtime_dir.to_string_lossy()));
@@ -150,13 +150,13 @@ impl AppPaths {
             music_dir: data_dir.join("music"),
             library_path: data_dir.join("library.json"),
             ipc_endpoint,
-            pid_path: runtime_dir.join("termusic.pid"),
-            log_path: runtime_dir.join("termusic-daemon.log"),
+            pid_path: runtime_dir.join("tunr.pid"),
+            log_path: runtime_dir.join("tunr-daemon.log"),
         }
     }
 
     /// Resolve workspace and runtime paths for the current user environment.
-    /// Fails with `TermusicError::NotInitialized` if `termusic init` has not been run.
+    /// Fails with `TunrError::NotInitialized` if `tunr init` has not been run.
     pub fn resolve() -> Result<Self> {
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let home_dir = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
@@ -206,7 +206,7 @@ impl AppPaths {
             resolve_runtime_paths_with_env(xdg_runtime_dir, runtime_id, runtime_env);
         let cfg = with_file_lock(&lock_path_for(&pointer_path), false, || {
             if !pointer_path.exists() {
-                return Err(TermusicError::NotInitialized(
+                return Err(TunrError::NotInitialized(
                     NOT_INITIALIZED_MSG.to_string(),
                 ));
             }
@@ -215,7 +215,7 @@ impl AppPaths {
             let pointer: WorkspacePointer = serde_json::from_str(&pointer_raw)?;
             let config_path = pointer.working_dir.join("config").join("config.json");
             if !config_path.exists() {
-                return Err(TermusicError::NotInitialized(
+                return Err(TunrError::NotInitialized(
                     NOT_INITIALIZED_MSG.to_string(),
                 ));
             }
@@ -248,7 +248,7 @@ impl AppPaths {
                 if parent
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("termusic-"))
+                    .is_some_and(|n| n.starts_with("tunr-"))
                 {
                     crate::platform::ensure_private_dir(parent)?;
                 } else {
@@ -369,7 +369,7 @@ pub fn with_file_lock<T>(
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let _guard = acquire_file_lock(lock_path, exclusive, true)?.ok_or_else(|| {
-        TermusicError::Io(io::Error::other(format!(
+        TunrError::Io(io::Error::other(format!(
             "blocking file lock returned no handle for {}",
             lock_path.display()
         )))
@@ -377,7 +377,7 @@ pub fn with_file_lock<T>(
     f()
 }
 
-/// Initialize a Termusic working directory and persist the bootstrap workspace pointer.
+/// Initialize a Tunr working directory and persist the bootstrap workspace pointer.
 pub fn initialize_workspace(dir: &Path) -> Result<WorkspaceConfig> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
     let home_dir = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
@@ -404,7 +404,7 @@ fn initialize_workspace_with_env_and_os(
     os_config_dir: Option<PathBuf>,
 ) -> Result<WorkspaceConfig> {
     if dir.as_os_str().is_empty() || dir.to_str().is_some_and(|s| s.trim().is_empty()) {
-        return Err(TermusicError::InvalidArg(
+        return Err(TunrError::InvalidArg(
             "working directory path cannot be empty".to_string(),
         ));
     }
@@ -416,7 +416,7 @@ fn initialize_workspace_with_env_and_os(
     };
 
     if candidate.exists() && !candidate.is_dir() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             "working directory path exists and is not a directory: {}",
             candidate.display()
         )));
@@ -484,7 +484,7 @@ fn set_workspace_download_dest_with_cwd(
     current_dir: &Path,
 ) -> Result<PathBuf> {
     if dir.as_os_str().is_empty() || dir.to_str().is_some_and(|s| s.trim().is_empty()) {
-        return Err(TermusicError::InvalidArg(
+        return Err(TunrError::InvalidArg(
             "--set-dest requires a non-empty directory path".to_string(),
         ));
     }
@@ -496,7 +496,7 @@ fn set_workspace_download_dest_with_cwd(
     };
 
     if candidate.exists() && !candidate.is_dir() {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             "download destination exists and is not a directory: {}",
             candidate.display()
         )));
@@ -530,7 +530,7 @@ fn update_workspace_config<T>(
 /// Validate that a search result limit is within `1..=MAX_SEARCH_LIMIT`.
 pub fn validate_search_limit(limit: usize) -> Result<usize> {
     if limit == 0 || limit > MAX_SEARCH_LIMIT {
-        return Err(TermusicError::InvalidArg(format!(
+        return Err(TunrError::InvalidArg(format!(
             "search limit must be between 1 and {MAX_SEARCH_LIMIT}, got {limit}"
         )));
     }
@@ -583,7 +583,7 @@ fn resolve_workspace_pointer_path_with_os(
                 } else if let Some(home) = home_dir.filter(|p| !p.as_os_str().is_empty()) {
                     home.join(".config")
                 } else {
-                    return Err(TermusicError::Io(io::Error::new(
+                    return Err(TunrError::Io(io::Error::new(
                         io::ErrorKind::NotFound,
                         "could not determine XDG_CONFIG_HOME or home directory",
                     )));
@@ -596,7 +596,7 @@ fn resolve_workspace_pointer_path_with_os(
                     None => match os_config_dir.filter(|p| !p.as_os_str().is_empty()) {
                         Some(dir) => dir,
                         None => {
-                            return Err(TermusicError::Io(io::Error::new(
+                            return Err(TunrError::Io(io::Error::new(
                                 io::ErrorKind::NotFound,
                                 "could not determine XDG_CONFIG_HOME or home directory",
                             )));
@@ -606,7 +606,7 @@ fn resolve_workspace_pointer_path_with_os(
             }
         }
     };
-    Ok(config_root.join("termusic").join("workspace.json"))
+    Ok(config_root.join("tunr").join("workspace.json"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -702,7 +702,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(windows)]
 fn named_pipe_for_seed(seed: &str) -> String {
-    format!(r"\\.\pipe\termusic-{:016x}", fnv1a_64(seed.as_bytes()))
+    format!(r"\\.\pipe\tunr-{:016x}", fnv1a_64(seed.as_bytes()))
 }
 
 fn resolve_runtime_paths_with_env(
@@ -719,7 +719,7 @@ fn resolve_runtime_paths_with_env(
         } else {
             format!("{:016x}", fnv1a_64(safe_id.as_bytes()))
         };
-        let endpoint = IpcEndpoint::NamedPipe(format!(r"\\.\pipe\termusic-{pipe_suffix}"));
+        let endpoint = IpcEndpoint::NamedPipe(format!(r"\\.\pipe\tunr-{pipe_suffix}"));
 
         let run_dir = xdg_runtime_dir
             .filter(|v| !v.is_empty())
@@ -729,21 +729,21 @@ fn resolve_runtime_paths_with_env(
                     .local_app_data
                     .as_ref()
                     .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.join("termusic").join("run"))
+                    .map(|p| p.join("tunr").join("run"))
             })
             .or_else(|| {
                 runtime_env
                     .home_dir
                     .as_ref()
                     .filter(|p| !p.as_os_str().is_empty())
-                    .map(|h| h.join("AppData").join("Local").join("termusic").join("run"))
+                    .map(|h| h.join("AppData").join("Local").join("tunr").join("run"))
             })
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("termusic-{pipe_suffix}")));
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("tunr-{pipe_suffix}")));
 
         return (
             endpoint,
-            run_dir.join("termusic.pid"),
-            run_dir.join("termusic-daemon.log"),
+            run_dir.join("tunr.pid"),
+            run_dir.join("tunr-daemon.log"),
         );
     }
 
@@ -752,31 +752,31 @@ fn resolve_runtime_paths_with_env(
         let _ = runtime_env;
         if let Some(runtime_dir) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
             let dir = PathBuf::from(runtime_dir);
-            let sock = dir.join("termusic.sock");
+            let sock = dir.join("tunr.sock");
             if fits_unix_socket_limit(&sock) {
                 return (
                     IpcEndpoint::UnixSocket(sock),
-                    dir.join("termusic.pid"),
-                    dir.join("termusic-daemon.log"),
+                    dir.join("tunr.pid"),
+                    dir.join("tunr-daemon.log"),
                 );
             }
         }
 
-        let dir = PathBuf::from(format!("/tmp/termusic-{safe_id}"));
-        let sock = dir.join("termusic.sock");
+        let dir = PathBuf::from(format!("/tmp/tunr-{safe_id}"));
+        let sock = dir.join("tunr.sock");
         if fits_unix_socket_limit(&sock) {
             return (
                 IpcEndpoint::UnixSocket(sock),
-                dir.join("termusic.pid"),
-                dir.join("termusic-daemon.log"),
+                dir.join("tunr.pid"),
+                dir.join("tunr-daemon.log"),
             );
         }
 
-        let short = PathBuf::from("/tmp/termusic-user");
+        let short = PathBuf::from("/tmp/tunr-user");
         return (
-            IpcEndpoint::UnixSocket(short.join("termusic.sock")),
-            short.join("termusic.pid"),
-            short.join("termusic-daemon.log"),
+            IpcEndpoint::UnixSocket(short.join("tunr.sock")),
+            short.join("tunr.pid"),
+            short.join("tunr-daemon.log"),
         );
     }
 
@@ -786,9 +786,9 @@ fn resolve_runtime_paths_with_env(
             let mut candidates: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
             if let Some(dir) = xdg_runtime_dir.filter(|v| !v.is_empty()).map(PathBuf::from) {
                 candidates.push((
-                    dir.join("termusic.sock"),
-                    dir.join("termusic.pid"),
-                    dir.join("termusic-daemon.log"),
+                    dir.join("tunr.sock"),
+                    dir.join("tunr.pid"),
+                    dir.join("tunr-daemon.log"),
                 ));
             }
             if let Some(dir) = runtime_env
@@ -798,9 +798,9 @@ fn resolve_runtime_paths_with_env(
                 .map(PathBuf::from)
             {
                 candidates.push((
-                    dir.join(format!("termusic-{safe_id}.sock")),
-                    dir.join(format!("termusic-{safe_id}.pid")),
-                    dir.join(format!("termusic-{safe_id}-daemon.log")),
+                    dir.join(format!("tunr-{safe_id}.sock")),
+                    dir.join(format!("tunr-{safe_id}.pid")),
+                    dir.join(format!("tunr-{safe_id}-daemon.log")),
                 ));
             }
             if let Some(prefix) = runtime_env
@@ -811,15 +811,15 @@ fn resolve_runtime_paths_with_env(
             {
                 let var_run = prefix.join("var").join("run");
                 candidates.push((
-                    var_run.join("termusic.sock"),
-                    var_run.join("termusic.pid"),
-                    var_run.join("termusic-daemon.log"),
+                    var_run.join("tunr.sock"),
+                    var_run.join("tunr.pid"),
+                    var_run.join("tunr-daemon.log"),
                 ));
                 let prefix_tmp = prefix.join("tmp");
                 candidates.push((
-                    prefix_tmp.join(format!("termusic-{safe_id}.sock")),
-                    prefix_tmp.join(format!("termusic-{safe_id}.pid")),
-                    prefix_tmp.join(format!("termusic-{safe_id}-daemon.log")),
+                    prefix_tmp.join(format!("tunr-{safe_id}.sock")),
+                    prefix_tmp.join(format!("tunr-{safe_id}.pid")),
+                    prefix_tmp.join(format!("tunr-{safe_id}-daemon.log")),
                 ));
             }
             if let Some(home) = runtime_env
@@ -827,11 +827,11 @@ fn resolve_runtime_paths_with_env(
                 .as_ref()
                 .filter(|p| !p.as_os_str().is_empty())
             {
-                let cache_run = home.join(".cache").join("termusic").join("run");
+                let cache_run = home.join(".cache").join("tunr").join("run");
                 candidates.push((
-                    cache_run.join("termusic.sock"),
-                    cache_run.join("termusic.pid"),
-                    cache_run.join("termusic-daemon.log"),
+                    cache_run.join("tunr.sock"),
+                    cache_run.join("tunr.pid"),
+                    cache_run.join("tunr-daemon.log"),
                 ));
             }
 
@@ -844,17 +844,17 @@ fn resolve_runtime_paths_with_env(
         } else if let Some(runtime_dir) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
             let dir = PathBuf::from(runtime_dir);
             return (
-                IpcEndpoint::UnixSocket(dir.join("termusic.sock")),
-                dir.join("termusic.pid"),
-                dir.join("termusic-daemon.log"),
+                IpcEndpoint::UnixSocket(dir.join("tunr.sock")),
+                dir.join("tunr.pid"),
+                dir.join("tunr-daemon.log"),
             );
         }
 
         let tmp = PathBuf::from("/tmp");
         (
-            IpcEndpoint::UnixSocket(tmp.join(format!("termusic-{safe_id}.sock"))),
-            tmp.join(format!("termusic-{safe_id}.pid")),
-            tmp.join(format!("termusic-{safe_id}-daemon.log")),
+            IpcEndpoint::UnixSocket(tmp.join(format!("tunr-{safe_id}.sock"))),
+            tmp.join(format!("tunr-{safe_id}.pid")),
+            tmp.join(format!("tunr-{safe_id}-daemon.log")),
         )
     }
 }
@@ -909,7 +909,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "termusic-paths-test-{label}-{}",
+            "tunr-paths-test-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -918,38 +918,38 @@ mod tests {
 
     #[test]
     fn from_roots_places_expected_files() {
-        let paths = AppPaths::from_roots("/tmp/data/termusic", "/tmp/run");
+        let paths = AppPaths::from_roots("/tmp/data/tunr", "/tmp/run");
         assert_eq!(
             paths.working_dir,
-            PathBuf::from("/tmp/data/termusic")
+            PathBuf::from("/tmp/data/tunr")
         );
         assert_eq!(
             paths.config_path,
-            PathBuf::from("/tmp/data/termusic/config/config.json")
+            PathBuf::from("/tmp/data/tunr/config/config.json")
         );
         assert_eq!(
             paths.playlists_dir,
-            PathBuf::from("/tmp/data/termusic/playlists")
+            PathBuf::from("/tmp/data/tunr/playlists")
         );
-        assert_eq!(paths.music_dir, PathBuf::from("/tmp/data/termusic/music"));
+        assert_eq!(paths.music_dir, PathBuf::from("/tmp/data/tunr/music"));
         assert_eq!(
             paths.library_path,
-            PathBuf::from("/tmp/data/termusic/library.json")
+            PathBuf::from("/tmp/data/tunr/library.json")
         );
         #[cfg(unix)]
         assert_eq!(
             paths.ipc_endpoint,
-            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/run/termusic.sock"))
+            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/run/tunr.sock"))
         );
         #[cfg(windows)]
         assert!(matches!(
             paths.ipc_endpoint,
-            IpcEndpoint::NamedPipe(ref pipe) if pipe.starts_with(r"\\.\pipe\termusic-")
+            IpcEndpoint::NamedPipe(ref pipe) if pipe.starts_with(r"\\.\pipe\tunr-")
         ));
-        assert_eq!(paths.pid_path, PathBuf::from("/tmp/run/termusic.pid"));
+        assert_eq!(paths.pid_path, PathBuf::from("/tmp/run/tunr.pid"));
         assert_eq!(
             paths.log_path,
-            PathBuf::from("/tmp/run/termusic-daemon.log")
+            PathBuf::from("/tmp/run/tunr-daemon.log")
         );
     }
 
@@ -966,10 +966,10 @@ mod tests {
             "1000",
         )
         .unwrap_err();
-        assert!(matches!(err, TermusicError::NotInitialized(msg) if msg.contains("termusic init")));
+        assert!(matches!(err, TunrError::NotInitialized(msg) if msg.contains("tunr init")));
 
         // Pointer exists, but config/config.json does not exist -> also NotInitialized.
-        let pointer_path = cfg_home.join("termusic").join("workspace.json");
+        let pointer_path = cfg_home.join("tunr").join("workspace.json");
         write_json_atomic(
             &pointer_path,
             &WorkspacePointer {
@@ -985,7 +985,7 @@ mod tests {
             "1000",
         )
         .unwrap_err();
-        assert!(matches!(err2, TermusicError::NotInitialized(_)));
+        assert!(matches!(err2, TunrError::NotInitialized(_)));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1021,7 +1021,7 @@ mod tests {
         assert!(cfg.config_dir.join("config.json").exists());
         assert!(cfg.playlists_dir.is_dir());
         assert!(cfg.music_dir.is_dir());
-        assert!(cfg_home.join("termusic").join("workspace.json").exists());
+        assert!(cfg_home.join("tunr").join("workspace.json").exists());
 
         let paths = AppPaths::resolve_from_env(
             Some(cfg_home.into_os_string()),
@@ -1042,15 +1042,15 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             paths.ipc_endpoint,
-            IpcEndpoint::UnixSocket(run_dir.join("termusic.sock"))
+            IpcEndpoint::UnixSocket(run_dir.join("tunr.sock"))
         );
         #[cfg(windows)]
         assert_eq!(
             paths.ipc_endpoint,
-            IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-1000".to_string())
+            IpcEndpoint::NamedPipe(r"\\.\pipe\tunr-1000".to_string())
         );
-        assert_eq!(paths.pid_path, run_dir.join("termusic.pid"));
-        assert_eq!(paths.log_path, run_dir.join("termusic-daemon.log"));
+        assert_eq!(paths.pid_path, run_dir.join("tunr.pid"));
+        assert_eq!(paths.log_path, run_dir.join("tunr-daemon.log"));
 
         let _ = fs::remove_dir_all(&run_dir);
         let _ = fs::remove_dir_all(&root);
@@ -1071,7 +1071,7 @@ mod tests {
         .unwrap();
 
         let canonical_ws = normalize_canonical_path(&ws).unwrap();
-        assert!(home.join(".config/termusic/workspace.json").exists());
+        assert!(home.join(".config/tunr/workspace.json").exists());
 
         let paths = AppPaths::resolve_from_env(
             Some(OsString::from("")),
@@ -1090,65 +1090,65 @@ mod tests {
         {
             assert_eq!(
                 paths.ipc_endpoint,
-                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-1042.sock"))
+                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/tunr-1042.sock"))
             );
-            assert_eq!(paths.pid_path, PathBuf::from("/tmp/termusic-1042.pid"));
+            assert_eq!(paths.pid_path, PathBuf::from("/tmp/tunr-1042.pid"));
             assert_eq!(
                 paths.log_path,
-                PathBuf::from("/tmp/termusic-1042-daemon.log")
+                PathBuf::from("/tmp/tunr-1042-daemon.log")
             );
         }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(
                 paths.ipc_endpoint,
-                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-1042/termusic.sock"))
+                IpcEndpoint::UnixSocket(PathBuf::from("/tmp/tunr-1042/tunr.sock"))
             );
             assert_eq!(
                 paths.pid_path,
-                PathBuf::from("/tmp/termusic-1042/termusic.pid")
+                PathBuf::from("/tmp/tunr-1042/tunr.pid")
             );
             assert_eq!(
                 paths.log_path,
-                PathBuf::from("/tmp/termusic-1042/termusic-daemon.log")
+                PathBuf::from("/tmp/tunr-1042/tunr-daemon.log")
             );
         }
         #[cfg(target_os = "android")]
         {
             assert_eq!(
                 paths.ipc_endpoint,
-                IpcEndpoint::UnixSocket(home.join(".cache/termusic/run/termusic.sock"))
+                IpcEndpoint::UnixSocket(home.join(".cache/tunr/run/tunr.sock"))
             );
             assert_eq!(
                 paths.pid_path,
-                home.join(".cache/termusic/run/termusic.pid")
+                home.join(".cache/tunr/run/tunr.pid")
             );
             assert_eq!(
                 paths.log_path,
-                home.join(".cache/termusic/run/termusic-daemon.log")
+                home.join(".cache/tunr/run/tunr-daemon.log")
             );
         }
         #[cfg(windows)]
         {
             assert_eq!(
                 paths.ipc_endpoint,
-                IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-1042".to_string())
+                IpcEndpoint::NamedPipe(r"\\.\pipe\tunr-1042".to_string())
             );
             assert_eq!(
                 paths.pid_path,
                 home.join("AppData")
                     .join("Local")
-                    .join("termusic")
+                    .join("tunr")
                     .join("run")
-                    .join("termusic.pid")
+                    .join("tunr.pid")
             );
             assert_eq!(
                 paths.log_path,
                 home.join("AppData")
                     .join("Local")
-                    .join("termusic")
+                    .join("tunr")
                     .join("run")
-                    .join("termusic-daemon.log")
+                    .join("tunr-daemon.log")
             );
         }
 
@@ -1183,17 +1183,17 @@ mod tests {
         // Empty/whitespace and regular-file destinations are rejected.
         assert!(matches!(
             set_workspace_download_dest_with_cwd(&paths, Path::new(""), &root),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             set_workspace_download_dest_with_cwd(&paths, Path::new("   "), &root),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         let not_a_dir = root.join("regular-file.txt");
         fs::write(&not_a_dir, b"hi").unwrap();
         assert!(matches!(
             set_workspace_download_dest_with_cwd(&paths, &not_a_dir, &root),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         // Relative destination resolves against cwd, creates dir, canonicalizes, and persists.
@@ -1222,11 +1222,11 @@ mod tests {
         let paths = AppPaths::from_roots(root.join("data"), root.join("run"));
         assert_eq!(
             paths.daemon_lock_path(),
-            root.join("run").join("termusic.pid.daemon.lock")
+            root.join("run").join("tunr.pid.daemon.lock")
         );
         assert_eq!(
             paths.daemon_spawn_lock_path(),
-            root.join("run").join("termusic.pid.spawn.lock")
+            root.join("run").join("tunr.pid.spawn.lock")
         );
 
         let lock_path = lock_path_for(&target);
@@ -1480,7 +1480,7 @@ mod tests {
             }
         });
 
-        for dir in [cfg_home.join("termusic"), normalize_canonical_path(&ws).unwrap().join("config")] {
+        for dir in [cfg_home.join("tunr"), normalize_canonical_path(&ws).unwrap().join("config")] {
             let leftover_tmps: Vec<PathBuf> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok().map(|entry| entry.path()))
@@ -1500,7 +1500,7 @@ mod tests {
     fn ipc_endpoint_from_override_rejects_blank_and_maps_per_platform() {
         assert!(matches!(
             IpcEndpoint::from_override("   "),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
 
         #[cfg(unix)]
@@ -1512,15 +1512,15 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let explicit = IpcEndpoint::from_override(r"\\.\pipe\custom-termusic").unwrap();
+            let explicit = IpcEndpoint::from_override(r"\\.\pipe\custom-tunr").unwrap();
             assert_eq!(
                 explicit,
-                IpcEndpoint::NamedPipe(r"\\.\pipe\custom-termusic".to_string())
+                IpcEndpoint::NamedPipe(r"\\.\pipe\custom-tunr".to_string())
             );
             let mapped = IpcEndpoint::from_override(r"C:\tmp\custom.sock").unwrap();
             assert!(matches!(
                 mapped,
-                IpcEndpoint::NamedPipe(ref name) if name.starts_with(r"\\.\pipe\termusic-")
+                IpcEndpoint::NamedPipe(ref name) if name.starts_with(r"\\.\pipe\tunr-")
             ));
         }
     }
@@ -1529,7 +1529,7 @@ mod tests {
     fn ensure_dirs_creates_library_and_runtime_parents() {
         let root = temp_dir("ensure-dirs");
         let data_dir = root.join("data");
-        let run_dir = root.join("termusic-run");
+        let run_dir = root.join("tunr-run");
         let paths = AppPaths::from_roots(&data_dir, &run_dir);
         paths.ensure_dirs().unwrap();
         assert!(data_dir.is_dir());
@@ -1549,17 +1549,17 @@ mod tests {
             Some(os_cfg.clone()),
         )
         .unwrap();
-        assert_eq!(from_xdg, xdg.join("termusic").join("workspace.json"));
+        assert_eq!(from_xdg, xdg.join("tunr").join("workspace.json"));
 
         let without_xdg =
             resolve_workspace_pointer_path_with_os(None, Some(home.clone()), Some(os_cfg.clone()))
                 .unwrap();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        assert_eq!(without_xdg, os_cfg.join("termusic").join("workspace.json"));
+        assert_eq!(without_xdg, os_cfg.join("tunr").join("workspace.json"));
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(
             without_xdg,
-            home.join(".config").join("termusic").join("workspace.json")
+            home.join(".config").join("tunr").join("workspace.json")
         );
     }
 
@@ -1577,12 +1577,12 @@ mod tests {
         assert_eq!(
             ep1,
             IpcEndpoint::UnixSocket(PathBuf::from(
-                "/data/data/com.termux/files/usr/tmp/termusic-10234.sock"
+                "/data/data/com.termux/files/usr/tmp/tunr-10234.sock"
             ))
         );
         assert_eq!(
             pid1,
-            PathBuf::from("/data/data/com.termux/files/usr/tmp/termusic-10234.pid")
+            PathBuf::from("/data/data/com.termux/files/usr/tmp/tunr-10234.pid")
         );
 
         let no_tmpdir = RuntimeEnv {
@@ -1593,7 +1593,7 @@ mod tests {
         assert_eq!(
             ep2,
             IpcEndpoint::UnixSocket(PathBuf::from(
-                "/data/data/com.termux/files/usr/var/run/termusic.sock"
+                "/data/data/com.termux/files/usr/var/run/tunr.sock"
             ))
         );
 
@@ -1607,7 +1607,7 @@ mod tests {
         assert_eq!(
             ep3,
             IpcEndpoint::UnixSocket(PathBuf::from(
-                "/data/data/com.termux/files/home/.cache/termusic/run/termusic.sock"
+                "/data/data/com.termux/files/home/.cache/tunr/run/tunr.sock"
             ))
         );
     }
@@ -1623,9 +1623,9 @@ mod tests {
         );
         assert_eq!(
             ep,
-            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/termusic-501/termusic.sock"))
+            IpcEndpoint::UnixSocket(PathBuf::from("/tmp/tunr-501/tunr.sock"))
         );
-        assert_eq!(pid, PathBuf::from("/tmp/termusic-501/termusic.pid"));
+        assert_eq!(pid, PathBuf::from("/tmp/tunr-501/tunr.pid"));
     }
 
     #[cfg(windows)]
@@ -1638,15 +1638,15 @@ mod tests {
         let (ep, pid, log) = resolve_runtime_paths_with_env(None, "S-1-5-21-1001", &env);
         assert_eq!(
             ep,
-            IpcEndpoint::NamedPipe(r"\\.\pipe\termusic-S-1-5-21-1001".to_string())
+            IpcEndpoint::NamedPipe(r"\\.\pipe\tunr-S-1-5-21-1001".to_string())
         );
         assert_eq!(
             pid,
-            PathBuf::from(r"C:\Users\alice\AppData\Local\termusic\run\termusic.pid")
+            PathBuf::from(r"C:\Users\alice\AppData\Local\tunr\run\tunr.pid")
         );
         assert_eq!(
             log,
-            PathBuf::from(r"C:\Users\alice\AppData\Local\termusic\run\termusic-daemon.log")
+            PathBuf::from(r"C:\Users\alice\AppData\Local\tunr\run\tunr-daemon.log")
         );
     }
 
@@ -1726,11 +1726,11 @@ mod tests {
     fn validate_search_limit_enforces_bounds() {
         assert!(matches!(
             validate_search_limit(0),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             validate_search_limit(MAX_SEARCH_LIMIT + 1),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert_eq!(validate_search_limit(1).unwrap(), 1);
         assert_eq!(
@@ -1770,11 +1770,11 @@ mod tests {
 
         assert!(matches!(
             set_workspace_search_limit(&paths, 0),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert!(matches!(
             set_workspace_search_limit(&paths, MAX_SEARCH_LIMIT + 1),
-            Err(TermusicError::InvalidArg(_))
+            Err(TunrError::InvalidArg(_))
         ));
         assert_eq!(load_workspace_config(&paths).unwrap().search_limit, None);
 

@@ -9,7 +9,7 @@ use ratatui::text::Span;
 use ratatui::widgets::BorderType;
 use ratatui::{DefaultTerminal, Terminal};
 
-use crate::error::{Result, TermusicError};
+use crate::error::{Result, TunrError};
 
 static PANIC_HOOK_ONCE: Once = Once::new();
 
@@ -18,7 +18,7 @@ const ASCII_SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 
 /// Return whether UI chrome should fall back to pure ASCII glyphs.
 pub fn use_ascii_glyphs() -> bool {
-    std::env::var_os("TERMUSIC_ASCII")
+    std::env::var_os("TUNR_ASCII")
         .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"))
 }
 
@@ -83,7 +83,7 @@ impl TerminalSession {
     /// alternate screen, and initialize `ratatui`.
     pub fn enter() -> Result<Self> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Err(TermusicError::Io(io::Error::other(
+            return Err(TunrError::Io(io::Error::other(
                 "interactive TUI requires both stdin and stdout to be terminals",
             )));
         }
