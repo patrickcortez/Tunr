@@ -158,6 +158,7 @@ impl PlaybackEngine {
                 duration_secs: None,
                 queue: Vec::new(),
                 volume: self.volume,
+                protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
             };
         }
 
@@ -175,6 +176,7 @@ impl PlaybackEngine {
             duration_secs: self.duration_secs,
             queue: self.cached_ordered_queue.clone(),
             volume: self.volume,
+            protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
         }
     }
 
@@ -1985,6 +1987,35 @@ mod tests {
         assert!(null_stats.write_calls() > 0);
         h_null.send(EngineCommand::Shutdown).await.unwrap();
         join_engine(j_null).await;
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_reports_current_ipc_protocol_version() {
+        let dir = temp_workspace("protocol-version");
+        let song = make_song(&dir, "ProtoSong", 44_100, 1, 0.5);
+
+        let mut engine = PlaybackEngine::new(Box::new(NullSink::new()));
+        assert_eq!(engine.status().protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
+
+        let playing = engine
+            .execute(EngineCommand::LoadQueue {
+                queue: vec![song],
+                start_index: Some(0),
+                mode: PlayMode::Next,
+                playlist_name: None,
+                loop_playback: false,
+            })
+            .0
+            .unwrap();
+        assert_eq!(playing.protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
+
+        let paused = engine.execute(EngineCommand::SetPaused(true)).0.unwrap();
+        assert_eq!(paused.protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
+
+        let stopped = engine.execute(EngineCommand::Stop).0.unwrap();
+        assert_eq!(stopped.protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
 
         let _ = fs::remove_dir_all(&dir);
     }

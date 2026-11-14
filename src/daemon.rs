@@ -1016,4 +1016,39 @@ mod tests {
         daemon_task.await.unwrap().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn daemon_reports_ipc_protocol_version_on_get_status_and_set_volume() {
+        let dir = temp_workspace("protocol-version");
+        let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let daemon_paths = paths.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_daemon_with_sink(&daemon_paths, Box::new(NullSink::new()), Some(ready_tx), None)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("daemon should signal readiness")
+            .unwrap();
+
+        let status = ipc::send_request(&paths, &IpcRequest::GetStatus)
+            .await
+            .unwrap();
+        assert_eq!(status.protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
+
+        let updated = ipc::send_request(&paths, &IpcRequest::SetVolume(65))
+            .await
+            .unwrap();
+        assert_eq!(updated.protocol_version, crate::ipc::IPC_PROTOCOL_VERSION);
+        assert_eq!(updated.volume, 65);
+
+        ipc::send_request(&paths, &IpcRequest::Shutdown)
+            .await
+            .unwrap();
+        daemon_task.await.unwrap().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

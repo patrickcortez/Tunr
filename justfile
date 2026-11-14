@@ -36,16 +36,20 @@ android-check:
 run *args:
     {{cargo}} run --locked {{args}}
 
+# Stop any running tunr playback daemon before replacing or removing the binary
+_stop-daemon:
+    @{{ if os_family() == "windows" { "if (Get-Command tunr -ErrorAction SilentlyContinue) { try { tunr daemon stop } catch {} }; exit 0" } else { "if command -v tunr >/dev/null 2>&1; then tunr daemon stop || true; fi" } }}
+
 # Install tunr binary via cargo install
 install:
     {{cargo}} install --path . --locked
 
 # Rebuild and reinstall tunr binary (--force)
-update:
+update: _stop-daemon
     {{cargo}} install --path . --locked --force
 
 # Uninstall tunr binary
-uninstall:
+uninstall: _stop-daemon
     {{cargo}} uninstall tunr
 
 # Remove Cargo build artifacts

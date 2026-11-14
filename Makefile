@@ -24,13 +24,17 @@ test-pulse: test-live
 run:
 	$(CARGO) run
 
+STOP_DAEMON := @if command -v tunr >/dev/null 2>&1; then tunr daemon stop || true; fi
+
 install:
 	$(CARGO) install --path . --locked
 
 update:
+	$(STOP_DAEMON)
 	$(CARGO) install --path . --locked --force
 
 uninstall:
+	$(STOP_DAEMON)
 	$(CARGO) uninstall tunr
 
 clean:

@@ -1750,6 +1750,7 @@ mod tests {
                     duration_secs: queue.get(idx).and_then(|s| s.duration_secs),
                     queue: queue.clone(),
                     volume: self.next_status.as_ref().map_or(DEFAULT_VOLUME, |s| s.volume),
+                    protocol_version: ipc::IPC_PROTOCOL_VERSION,
                 };
                 self.next_status = Some(status.clone());
                 return Ok(status);
@@ -2675,6 +2676,63 @@ mod tests {
         assert!(outcome.is_none());
         let cfg = paths::load_workspace_config(&paths).unwrap();
         assert_eq!(paths::effective_volume(&cfg), 35);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn execute_set_volume_and_tui_surface_stale_daemon_error() {
+        let root = std::env::temp_dir().join(format!("tunr-tui-stale-vol-{}", Uuid::new_v4()));
+        let cfg_home = root.join("xdg_config");
+        let run_dir = root.join("run");
+        let ws = root.join("ws");
+
+        paths::initialize_workspace_with_env(
+            &ws,
+            &root,
+            Some(cfg_home.clone().into_os_string()),
+            Some(root.join("home")),
+        )
+        .unwrap();
+        let paths = AppPaths::resolve_from_env(
+            Some(cfg_home.into_os_string()),
+            Some(root.join("home")),
+            Some(run_dir.into_os_string()),
+            "1000",
+        )
+        .unwrap();
+        paths.ensure_dirs().unwrap();
+
+        let mut listener = ipc::IpcListener::bind(&paths.ipc_endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(&mut stream);
+            let _req: IpcRequest = ipc::read_message(&mut reader).await.unwrap().unwrap();
+            ipc::write_message(
+                &mut stream,
+                &ipc::IpcResponse::Err(
+                    "JSON error: unknown variant 'SetVolume', expected one of 'Play', 'GetStatus', 'Shutdown' at line 1 column 12"
+                        .to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = execute_set_volume(&paths, 40).await.unwrap_err();
+        assert!(ipc::is_stale_daemon_protocol_error(&err));
+        server.await.unwrap();
+
+        let mut app = TuiApp::from_loaded(sample_library(), None);
+        app.action_in_flight = 1;
+        app.apply_event(TuiEvent::VolumeUpdated {
+            generation: 1,
+            result: Err(err),
+        });
+        let status_msg = app.status_message.expect("expected stale daemon error banner");
+        assert!(status_msg.is_error);
+        assert!(status_msg.text.contains("Volume update failed:"));
+        assert!(status_msg.text.contains("tunr daemon stop"));
 
         let _ = fs::remove_dir_all(&root);
     }

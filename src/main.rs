@@ -382,23 +382,37 @@ async fn run() -> Result<()> {
                     Err(err) => Err(err),
                 }
             }
-            None => match ipc::send_request(&paths, &IpcRequest::GetStatus).await {
-                Ok(status) => {
-                    println!("Volume: {}%", status.volume);
-                    Ok(())
-                }
-                Err(TunrError::Ipc(_)) => {
+            None => {
+                let daemon_result = ipc::send_request(&paths, &IpcRequest::GetStatus).await;
+                let needs_fallback = matches!(
+                    &daemon_result,
+                    Ok(status) if status.protocol_version != ipc::IPC_PROTOCOL_VERSION
+                ) || matches!(&daemon_result, Err(TunrError::Ipc(_)));
+                let saved_vol = if needs_fallback {
                     let p = paths.clone();
-                    let vol = run_blocking(move || {
-                        let cfg = paths::load_workspace_config(&p)?;
-                        Ok(paths::effective_volume(&cfg))
-                    })
-                    .await?;
-                    println!("Volume: {vol}%");
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            },
+                    Some(
+                        run_blocking(move || {
+                            let cfg = paths::load_workspace_config(&p)?;
+                            Ok(paths::effective_volume(&cfg))
+                        })
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let mut stderr = std::io::stderr();
+                let vol = resolve_queried_volume(
+                    daemon_result,
+                    || {
+                        saved_vol.ok_or_else(|| {
+                            TunrError::Async("missing fallback workspace volume".to_string())
+                        })
+                    },
+                    &mut stderr,
+                )?;
+                println!("Volume: {vol}%");
+                Ok(())
+            }
         },
         Command::Delete { target, kind } => {
             let lib_path = paths.library_path.clone();
@@ -640,6 +654,26 @@ fn format_update_summary(summary: &UpdateSummary) -> String {
 fn print_playback_status(status: &PlaybackStatus) {
     let text = format_playback_status(status);
     println!("{text}");
+}
+
+fn resolve_queried_volume<F, W: Write>(
+    daemon_result: Result<PlaybackStatus>,
+    load_saved_volume: F,
+    err_out: &mut W,
+) -> Result<u8>
+where
+    F: FnOnce() -> Result<u8>,
+{
+    match daemon_result {
+        Ok(status) if status.protocol_version == ipc::IPC_PROTOCOL_VERSION => Ok(status.volume),
+        Ok(status) => {
+            let warning = ipc::format_stale_daemon_error(Some(status.protocol_version));
+            let _ = writeln!(err_out, "warning: {warning}");
+            load_saved_volume()
+        }
+        Err(TunrError::Ipc(_)) => load_saved_volume(),
+        Err(err) => Err(err),
+    }
 }
 
 fn format_playback_status(status: &PlaybackStatus) -> String {
@@ -1025,6 +1059,7 @@ Playlists (0):
             playlist_name: None,
             loop_playback: false,
             volume: 50,
+            protocol_version: ipc::IPC_PROTOCOL_VERSION,
             current_track: Some(track.clone()),
             queue_index: 0,
             queue_len: 2,
@@ -1341,5 +1376,51 @@ Playlists (0):
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "rose-pine\n");
+    }
+
+    #[test]
+    fn resolve_queried_volume_warns_and_falls_back_on_stale_daemon_protocol() {
+        let current = PlaybackStatus {
+            volume: 72,
+            ..PlaybackStatus::default()
+        };
+        let mut err_buf = Vec::new();
+        let vol = resolve_queried_volume(Ok(current), || Ok(15), &mut err_buf).unwrap();
+        assert_eq!(vol, 72);
+        assert!(err_buf.is_empty());
+
+        let stale = PlaybackStatus {
+            protocol_version: 0,
+            volume: 50,
+            ..PlaybackStatus::default()
+        };
+        let mut err_buf = Vec::new();
+        let vol = resolve_queried_volume(Ok(stale), || Ok(85), &mut err_buf).unwrap();
+        assert_eq!(vol, 85);
+        let warning = String::from_utf8(err_buf).unwrap();
+        assert!(warning.contains("warning:"), "expected warning prefix: {warning}");
+        assert!(
+            warning.contains("tunr daemon stop"),
+            "expected restart guidance: {warning}"
+        );
+
+        let mut err_buf = Vec::new();
+        let vol = resolve_queried_volume(
+            Err(TunrError::Ipc("playback daemon is not running".to_string())),
+            || Ok(30),
+            &mut err_buf,
+        )
+        .unwrap();
+        assert_eq!(vol, 30);
+        assert!(err_buf.is_empty());
+
+        let mut err_buf = Vec::new();
+        let err = resolve_queried_volume(
+            Err(TunrError::Daemon("unexpected daemon failure".to_string())),
+            || Ok(30),
+            &mut err_buf,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TunrError::Daemon(_)));
     }
 }

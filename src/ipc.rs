@@ -22,6 +22,8 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DAEMON_SPAWN_MAX_ATTEMPTS: usize = 80; // 80 * 25ms = 2.0s
 pub const MAX_IPC_MESSAGE_BYTES: usize = 1024 * 1024; // 1 MiB line frame limit
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+const STALE_DAEMON_ERROR_PREFIX: &str = "incompatible playback daemon";
 
 /// Queue playback ordering mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
@@ -124,6 +126,8 @@ pub struct PlaybackStatus {
     pub loop_playback: bool,
     #[serde(default = "default_volume")]
     pub volume: u8,
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 impl Default for PlaybackStatus {
@@ -140,6 +144,7 @@ impl Default for PlaybackStatus {
             queue: Vec::new(),
             loop_playback: false,
             volume: crate::paths::DEFAULT_VOLUME,
+            protocol_version: IPC_PROTOCOL_VERSION,
         }
     }
 }
@@ -617,17 +622,60 @@ async fn is_daemon_lock_held_async(lock_path: &Path) -> Result<bool> {
         .map_err(|err| TunrError::Async(format!("daemon lock check task failed: {err}")))?
 }
 
+fn is_serde_schema_mismatch_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("json error:")
+        && (lower.contains("unknown variant")
+            || lower.contains("missing field")
+            || lower.contains("unknown field"))
+}
+
+/// Return `true` when `err` indicates the connected daemon speaks an incompatible IPC protocol.
+pub fn is_stale_daemon_protocol_error(err: &TunrError) -> bool {
+    match err {
+        TunrError::Daemon(msg) => {
+            msg.starts_with(STALE_DAEMON_ERROR_PREFIX) || is_serde_schema_mismatch_message(msg)
+        }
+        TunrError::Json(json_err) => {
+            let msg = format!("JSON error: {json_err}");
+            is_serde_schema_mismatch_message(&msg)
+        }
+        _ => false,
+    }
+}
+
+/// Format an actionable [`TunrError::Daemon`] telling the user to stop an outdated daemon.
+pub fn format_stale_daemon_error(daemon_version: Option<u32>) -> TunrError {
+    let detail = match daemon_version {
+        Some(version) => format!(
+            "{STALE_DAEMON_ERROR_PREFIX} (daemon protocol v{version}, client expects v{IPC_PROTOCOL_VERSION})"
+        ),
+        None => format!(
+            "{STALE_DAEMON_ERROR_PREFIX} (client expects protocol v{IPC_PROTOCOL_VERSION})"
+        ),
+    };
+    TunrError::Daemon(format!("{detail}; run `tunr daemon stop` and retry"))
+}
+
 async fn exchange_on_stream(mut stream: IpcStream, req: &IpcRequest) -> Result<PlaybackStatus> {
     tokio::time::timeout(IPC_TIMEOUT, async {
         write_message(&mut stream, req).await?;
 
         let mut reader = BufReader::new(&mut stream);
-        match read_message::<_, IpcResponse>(&mut reader).await? {
-            Some(IpcResponse::Ok(status)) => Ok(status),
-            Some(IpcResponse::Err(msg)) => Err(TunrError::Daemon(msg)),
-            None => Err(TunrError::Ipc(
+        match read_message::<_, IpcResponse>(&mut reader).await {
+            Ok(Some(IpcResponse::Ok(status))) => Ok(status),
+            Ok(Some(IpcResponse::Err(msg))) => {
+                if is_serde_schema_mismatch_message(&msg) {
+                    Err(format_stale_daemon_error(None))
+                } else {
+                    Err(TunrError::Daemon(msg))
+                }
+            }
+            Ok(None) => Err(TunrError::Ipc(
                 "playback daemon closed connection without responding".to_string(),
             )),
+            Err(err) if is_stale_daemon_protocol_error(&err) => Err(format_stale_daemon_error(None)),
+            Err(err) => Err(err),
         }
     })
     .await
@@ -746,21 +794,61 @@ where
     Fut: Future<Output = Result<Option<Child>>>,
 {
     if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
-        return exchange_on_stream(stream, req).await;
+        match exchange_on_stream(stream, req).await {
+            Ok(status) if status.protocol_version == IPC_PROTOCOL_VERSION => return Ok(status),
+            Ok(_) => {}
+            Err(err) if is_stale_daemon_protocol_error(&err) => {}
+            Err(err) => return Err(err),
+        }
     }
 
     let spawn_guard = acquire_spawn_lock(paths).await?;
 
-    // Double-check after acquiring spawn lock in case a concurrent caller just started it.
+    // Double-check after acquiring spawn lock in case a concurrent caller just started or restarted it.
+    let mut restart_incompatible = false;
     if let Ok(stream) = IpcStream::connect(&paths.ipc_endpoint).await {
-        drop(spawn_guard);
-        return exchange_on_stream(stream, req).await;
+        match exchange_on_stream(stream, req).await {
+            Ok(status) if status.protocol_version == IPC_PROTOCOL_VERSION => {
+                drop(spawn_guard);
+                return Ok(status);
+            }
+            Ok(_) => {
+                restart_incompatible = true;
+            }
+            Err(err) if is_stale_daemon_protocol_error(&err) => {
+                restart_incompatible = true;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
-    let prep_paths = paths.clone();
-    let should_spawn = tokio::task::spawn_blocking(move || prepare_daemon_spawn(&prep_paths))
-        .await
-        .map_err(|err| TunrError::Async(format!("prepare daemon task failed: {err}")))??;
+    let should_spawn = if restart_incompatible {
+        let _ = send_request(paths, &IpcRequest::Shutdown).await;
+        let mut ready = false;
+        for _ in 0..DAEMON_SPAWN_MAX_ATTEMPTS {
+            let prep_paths = paths.clone();
+            if tokio::task::spawn_blocking(move || prepare_daemon_spawn(&prep_paths))
+                .await
+                .map_err(|err| TunrError::Async(format!("prepare daemon task failed: {err}")))??
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(DAEMON_SPAWN_POLL_INTERVAL).await;
+        }
+        if !ready {
+            return Err(TunrError::Daemon(format!(
+                "timed out waiting for incompatible playback daemon at {} to shut down; run `tunr daemon stop` and retry",
+                paths.ipc_endpoint
+            )));
+        }
+        true
+    } else {
+        let prep_paths = paths.clone();
+        tokio::task::spawn_blocking(move || prepare_daemon_spawn(&prep_paths))
+            .await
+            .map_err(|err| TunrError::Async(format!("prepare daemon task failed: {err}")))??
+    };
 
     if !should_spawn {
         drop(spawn_guard);
@@ -906,6 +994,7 @@ mod tests {
             queue: vec![song],
             loop_playback: false,
             volume: 75,
+            protocol_version: IPC_PROTOCOL_VERSION,
         };
         let resp = IpcResponse::Ok(status);
         let resp_json = serde_json::to_string(&resp).unwrap();
@@ -1245,5 +1334,165 @@ mod tests {
             inner.await.unwrap().unwrap();
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playback_status_protocol_version_round_trips_and_legacy_defaults_to_zero() {
+        let default_status = PlaybackStatus::default();
+        assert_eq!(default_status.protocol_version, IPC_PROTOCOL_VERSION);
+
+        let encoded = serde_json::to_string(&default_status).unwrap();
+        let decoded: PlaybackStatus = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.protocol_version, IPC_PROTOCOL_VERSION);
+
+        let legacy_json = r#"{"state":"playing","mode":"next","playlist_name":null,"current_track":null,"queue_index":0,"queue_len":0,"position_secs":0.0,"duration_secs":null,"queue":[],"loop_playback":false,"volume":50}"#;
+        let legacy: PlaybackStatus = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.protocol_version, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_daemon_serde_error_maps_to_actionable_protocol_error() {
+        let dir = temp_dir("stale-protocol-err");
+        let paths = AppPaths::from_roots(&dir, &dir);
+        let mut listener = IpcListener::bind(&paths.ipc_endpoint).unwrap();
+
+        let server = tokio::spawn(async move {
+            for msg in [
+                "JSON error: unknown variant 'SetVolume', expected one of 'Play', 'GetStatus', 'Shutdown' at line 1 column 12",
+                "JSON error: missing field `loop_playback` at line 1 column 42",
+                "JSON error: unknown field `loop_playback` at line 1 column 50",
+                "nothing queued",
+            ] {
+                let mut stream = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let _raw: serde_json::Value = read_message(&mut reader).await.unwrap().unwrap();
+                write_message(&mut stream, &IpcResponse::Err(msg.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for req in [
+            IpcRequest::SetVolume(50),
+            IpcRequest::GetStatus,
+            IpcRequest::Stop,
+        ] {
+            let err = send_request(&paths, &req).await.unwrap_err();
+            assert!(
+                is_stale_daemon_protocol_error(&err),
+                "expected stale protocol error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("tunr daemon stop"),
+                "expected actionable restart hint in {err}"
+            );
+        }
+
+        let normal_err = send_request(&paths, &IpcRequest::Next).await.unwrap_err();
+        assert!(!is_stale_daemon_protocol_error(&normal_err));
+        assert!(matches!(normal_err, TunrError::Daemon(ref m) if m == "nothing queued"));
+
+        assert!(is_stale_daemon_protocol_error(&format_stale_daemon_error(
+            Some(0)
+        )));
+        assert!(!is_stale_daemon_protocol_error(&TunrError::Ipc(
+            "playback daemon is not running".to_string()
+        )));
+
+        server.await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_and_send_restarts_incompatible_daemon() {
+        for reject_with_serde in [false, true] {
+            let dir = temp_dir("restart-incompatible");
+            let paths = AppPaths::from_roots(dir.join("data"), dir.join("run"));
+            paths.ensure_dirs().unwrap();
+
+            let mut old_listener = IpcListener::bind(&paths.ipc_endpoint).unwrap();
+            let old_paths = paths.clone();
+            let saw_shutdown = Arc::new(AtomicUsize::new(0));
+            let saw_shutdown_srv = Arc::clone(&saw_shutdown);
+
+            let old_server = tokio::spawn(async move {
+                loop {
+                    let mut stream = old_listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let req: IpcRequest = read_message(&mut reader).await.unwrap().unwrap();
+                    match req {
+                        IpcRequest::Shutdown => {
+                            saw_shutdown_srv.fetch_add(1, Ordering::SeqCst);
+                            let resp = IpcResponse::Ok(PlaybackStatus {
+                                protocol_version: 0,
+                                ..PlaybackStatus::default()
+                            });
+                            let _ = write_message(&mut stream, &resp).await;
+                            drop(old_listener);
+                            #[cfg(unix)]
+                            {
+                                let IpcEndpoint::UnixSocket(sock) = &old_paths.ipc_endpoint;
+                                let _ = fs::remove_file(sock);
+                            }
+                            break;
+                        }
+                        _ => {
+                            let resp = if reject_with_serde {
+                                IpcResponse::Err(
+                                    "JSON error: unknown variant 'SetVolume', expected one of 'Play', 'GetStatus', 'Shutdown' at line 1 column 12"
+                                        .to_string(),
+                                )
+                            } else {
+                                IpcResponse::Ok(PlaybackStatus {
+                                    protocol_version: 0,
+                                    ..PlaybackStatus::default()
+                                })
+                            };
+                            write_message(&mut stream, &resp).await.unwrap();
+                        }
+                    }
+                }
+            });
+
+            let spawn_count = Arc::new(AtomicUsize::new(0));
+            let new_daemon_handle = Arc::new(tokio::sync::Mutex::new(None));
+            let status = ensure_daemon_and_send_with(
+                &paths,
+                &IpcRequest::GetStatus,
+                |dp| {
+                    let count = Arc::clone(&spawn_count);
+                    let slot = Arc::clone(&new_daemon_handle);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let (ready_tx, ready_rx) = oneshot::channel();
+                        let join = tokio::spawn(async move {
+                            daemon::run_daemon_with_sink(
+                                &dp,
+                                Box::new(NullSink::new()),
+                                Some(ready_tx),
+                                None,
+                            )
+                            .await
+                        });
+                        ready_rx.await.expect("restarted daemon should bind");
+                        *slot.lock().await = Some(join);
+                        Ok(None)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            old_server.await.unwrap();
+            assert_eq!(saw_shutdown.load(Ordering::SeqCst), 1);
+            assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+            assert_eq!(status.protocol_version, IPC_PROTOCOL_VERSION);
+
+            send_request(&paths, &IpcRequest::Shutdown).await.unwrap();
+            if let Some(handle) = new_daemon_handle.lock().await.take() {
+                handle.await.unwrap().unwrap();
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
